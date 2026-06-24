@@ -1,0 +1,136 @@
+/*!
+ * \file gps_l1_ca_telemetry_decoder_gs.h
+ * \brief Interface of a NAV message demodulator block based on
+ * Kay Borre book MATLAB-based GPS receiver
+ * \author Javier Arribas, 2011. jarribas(at)cttc.es
+ * \author Carles Fernandez Prades, 2011-2026. cfernandez(at)cttc.es
+ *
+ * -----------------------------------------------------------------------------
+ *
+ * GNSS-SDR is a Global Navigation Satellite System software-defined receiver.
+ * This file is part of GNSS-SDR.
+ *
+ * Copyright (C) 2010-2026  (see AUTHORS file for a list of contributors)
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * -----------------------------------------------------------------------------
+ */
+
+#ifndef GNSS_SDR_GPS_L1_CA_TELEMETRY_DECODER_GS_H
+#define GNSS_SDR_GPS_L1_CA_TELEMETRY_DECODER_GS_H
+
+#include "GPS_L1_CA.h"
+#include "gnss_synchro.h"
+#include "gnss_time.h"  // for timetags produced by Tracking
+#include "gps_navigation_message.h"
+#include "nav_message_packet.h"
+#include "telemetry_impl_interface.h"
+#include "tlm_conf.h"
+#include <boost/circular_buffer.hpp>
+#include <gnuradio/types.h>  // for gr_vector_const_void_star
+#include <array>             // for array
+
+
+/** \addtogroup Telemetry_Decoder
+ * \{ */
+/** \addtogroup Telemetry_Decoder_gnuradio_blocks telemetry_decoder_gr_blocks
+ * GNU Radio blocks for the demodulation of GNSS navigation messages.
+ * \{ */
+
+enum class L1LnavSystem
+{
+    GPS,
+    QZSS
+};
+
+class gps_l1_ca_telemetry_decoder_gs;
+
+using gps_l1_ca_telemetry_decoder_gs_sptr = gnss_shared_ptr<gps_l1_ca_telemetry_decoder_gs>;
+
+gps_l1_ca_telemetry_decoder_gs_sptr gps_l1_ca_make_telemetry_decoder_gs(
+    const Gnss_Satellite &satellite,
+    const Tlm_Conf &conf,
+    L1LnavSystem system = L1LnavSystem::GPS);
+
+/*!
+ * \brief This class implements a block that decodes the NAV data defined in IS-GPS-200M
+ */
+class gps_l1_ca_telemetry_decoder_gs : public telemetry_impl_interface
+{
+public:
+    ~gps_l1_ca_telemetry_decoder_gs() override;
+    void set_satellite(const Gnss_Satellite &satellite) override;  //!< Set satellite PRN
+    void set_channel(int channel) override;                        //!< Set receiver's channel
+    void reset() override;
+
+    /*!
+     * \brief This is where all signal processing takes place
+     */
+    int general_work(int noutput_items, gr_vector_int &ninput_items,
+        gr_vector_const_void_star &input_items, gr_vector_void_star &output_items) override;
+
+private:
+    friend gps_l1_ca_telemetry_decoder_gs_sptr gps_l1_ca_make_telemetry_decoder_gs(
+        const Gnss_Satellite &satellite,
+        const Tlm_Conf &conf,
+        L1LnavSystem system);
+
+    gps_l1_ca_telemetry_decoder_gs(const Gnss_Satellite &satellite, const Tlm_Conf &conf, L1LnavSystem system);
+
+    void check_tlm_separation();
+    void frame_synchronization(const Gnss_Synchro &current_gs);
+    bool is_PLL_180_deg_phase_locked();
+    bool gps_word_parityCheck(uint32_t gpsword);
+    bool decode_subframe(double cn0, bool flag_invert);
+    bool is_tow_consistent(uint32_t decoded_tow_s);
+
+    L1LnavSystem d_system;
+    std::unique_ptr<Gps_Navigation_Message> d_nav;
+    Gnss_Satellite d_satellite;
+    Nav_Message_Packet d_nav_msg_packet;
+    std::unique_ptr<Tlm_CRC_Stats> d_Tlm_CRC_Stats;
+
+    std::array<int32_t, GPS_CA_PREAMBLE_LENGTH_BITS> d_preamble_samples{};
+
+    std::string d_dump_filename;
+    std::ofstream d_dump_file;
+
+    boost::circular_buffer<float> d_symbol_history;
+
+    uint64_t d_sample_counter;
+    uint64_t d_preamble_index;
+    uint64_t d_last_valid_preamble;
+
+    int32_t d_bits_per_preamble;
+    int32_t d_samples_per_preamble;
+    int32_t d_preamble_period_symbols;
+    int32_t d_CRC_error_counter;
+    int32_t d_channel;
+
+    uint32_t d_required_symbols;
+    uint32_t d_prev_GPS_frame_4bytes;
+    uint32_t d_max_symbols_without_valid_frame;
+    uint32_t d_stat;
+    uint32_t d_TOW_at_Preamble_ms;
+    uint32_t d_TOW_at_current_symbol_ms;
+    uint32_t d_last_decoded_tow_s;
+    uint64_t d_last_decoded_tow_sample_counter;
+
+    bool d_flag_frame_sync;
+    bool d_flag_preamble;
+    bool d_sent_tlm_failed_msg;
+    bool d_flag_PLL_180_deg_phase_locked;
+    bool d_flag_TOW_set;
+    bool d_dump;
+    bool d_dump_mat;
+    bool d_remove_dat;
+    bool d_enable_navdata_monitor;
+    bool d_dump_crc_stats;
+    bool d_tow_to_trk;
+    bool d_have_last_decoded_tow;
+};
+
+
+/** \} */
+/** \} */
+#endif  // GNSS_SDR_GPS_L1_CA_TELEMETRY_DECODER_GS_H

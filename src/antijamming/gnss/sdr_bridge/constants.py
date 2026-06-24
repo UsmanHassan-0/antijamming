@@ -1,0 +1,37 @@
+"""Runtime constants for the GNSS-SDR FIFO bridge."""
+
+# Keep GPS L1 explicit because the bridge validates capture bandwidth against
+# the receiver signal rendered into the GNSS-SDR config.
+GPS_L1_CA_FREQ_HZ = 1_575_420_000.0
+
+# GNSS-SDR tracking monitor UDP exposes current C/N0. The receiver view
+# qualifies non-PVT bars from decoded telemetry plus stable C/N0 history;
+# GNSS-SDR still decides actual loss of lock.
+PRN_CNO_STABILITY_WINDOW = 20
+PRN_CNO_MIN_STABLE_DB_HZ = 25.0
+PRN_CNO_MAX_STDEV_DB = 0.75
+PRN_CNO_MAX_PEAK_TO_PEAK_DB = 2.0
+PRN_CNO_REQUIRED_STABLE_WINDOWS = 1
+PRN_CARRIER_LOCK_THRESHOLD = 0.7
+SKY_GEOMETRY_TIMEOUT_S = 15.0
+USED_IN_FIX_TIMEOUT_S = 5.0
+PVT_ACCURACY_TIMEOUT_S = 5.0
+PVT_DEGRADED_PDOP_THRESHOLD = 6.0
+PVT_LOW_OBSERVATION_COUNT = 3
+PVT_LOW_USED_SATELLITE_COUNT = 3
+
+__all__ = [
+    "GPS_L1_CA_FREQ_HZ",
+    "PRN_CARRIER_LOCK_THRESHOLD",
+    "PRN_CNO_MAX_PEAK_TO_PEAK_DB",
+    "PRN_CNO_MAX_STDEV_DB",
+    "PRN_CNO_MIN_STABLE_DB_HZ",
+    "PRN_CNO_REQUIRED_STABLE_WINDOWS",
+    "PRN_CNO_STABILITY_WINDOW",
+    "PVT_ACCURACY_TIMEOUT_S",
+    "PVT_DEGRADED_PDOP_THRESHOLD",
+    "PVT_LOW_OBSERVATION_COUNT",
+    "PVT_LOW_USED_SATELLITE_COUNT",
+    "SKY_GEOMETRY_TIMEOUT_S",
+    "USED_IN_FIX_TIMEOUT_S",
+]

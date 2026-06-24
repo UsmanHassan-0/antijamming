@@ -1,0 +1,262 @@
+{
+  "created_utc": "2026-06-16T12:11:52.242907+00:00",
+  "purpose": "USRP/TwinRX conducted phase offset calibration",
+  "reference_channel": 0,
+  "center_freq_hz": 1575420000.0,
+  "synth_freq_hz": 1575520000.0,
+  "synth_offset_hz": 100000.0,
+  "synth_power_dbm": -42.0,
+  "synth_reference": "internal_27_mhz",
+  "sample_rate_hz": 4000000.0,
+  "channels": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "gain_db": 45.0,
+  "twinrx_lo_sharing": true,
+  "rx_lo_sources_by_channel": [
+    "internal",
+    "companion",
+    "reimport",
+    "reimport"
+  ],
+  "rx_lo_exports_by_channel": [
+    true,
+    false,
+    true,
+    false
+  ],
+  "rx_dc_correction_mode": "default",
+  "phase_estimator": "tone_bin_demod",
+  "phase_offsets_deg": [
+    0.0,
+    170.1548584434398,
+    49.281226198378405,
+    78.02071034339754
+  ],
+  "phase_offsets_std_deg": [
+    0.0,
+    0.005400173931649314,
+    0.0049241736120198484,
+    0.0055451882634153914
+  ],
+  "correction_convention": "x_corrected[ch] = correction_vector[ch] * x_raw[ch]",
+  "correction_type": "phase_only",
+  "correction_vector": [
+    {
+      "real": 1.0,
+      "imag": -0.0
+    },
+    {
+      "real": -0.9852734899052924,
+      "imag": -0.1709858183880923
+    },
+    {
+      "real": 0.652346782642955,
+      "imag": -0.7579206259070835
+    },
+    {
+      "real": 0.2075581124101872,
+      "imag": -0.9782226893569378
+    }
+  ],
+  "complex_gain_phase_correction_vector": [
+    {
+      "real": 1.0,
+      "imag": 0.0
+    },
+    {
+      "real": -1.1324311157128522,
+      "imag": -0.19652376995994245
+    },
+    {
+      "real": 0.5658295525047341,
+      "imag": -0.6574017029072136
+    },
+    {
+      "real": 0.23557620671625443,
+      "imag": -1.1102721493898904
+    }
+  ],
+  "complex_gain_phase_correction_gain": [
+    1.0,
+    1.1493571350950598,
+    0.8673753982405842,
+    1.1349891606890643
+  ],
+  "complex_gain_phase_correction_phase_deg": [
+    0.0,
+    -170.1548584639046,
+    -49.28122601371136,
+    -78.02071039925448
+  ],
+  "time_domain_phase_offsets_deg": [
+    0.0,
+    170.15495531223303,
+    49.28122159460571,
+    78.02070244459179
+  ],
+  "time_domain_phase_offsets_std_deg": [
+    0.0,
+    0.005398832713100759,
+    0.004951755773039729,
+    0.005572714670663882
+  ],
+  "rms": [
+    0.24521475684924887,
+    0.21334925887391307,
+    0.2827086265777789,
+    0.2160496634201869
+  ],
+  "peak_abs_max": [
+    0.2518105399492305,
+    0.2192113304807678,
+    0.2908171653894509,
+    0.2215141345961823
+  ],
+  "clip_count_total": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "clip_count_max_per_chunk": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "clip_count_total_all_channels": 0,
+  "clipping_detected": false,
+  "relative_power_db": [
+    0.0,
+    -1.20910927211942,
+    1.235849171975501,
+    -1.0998601619352801
+  ],
+  "tone_snr_db": [
+    36.69188867594566,
+    36.73518058024807,
+    36.73275531025942,
+    36.81394285670558
+  ],
+  "dc_power": [
+    1.590847282242147e-10,
+    9.846919825244463e-11,
+    5.04992444720769e-10,
+    6.941366387799734e-10
+  ],
+  "dc_to_non_dc_db": [
+    -85.77464712826256,
+    -86.6488187432062,
+    -81.99393238171275,
+    -78.27662213201637
+  ],
+  "dc_spur_bin_power": [
+    0.00020183034555356987,
+    0.0001249186649738175,
+    0.0002398242536029037,
+    0.00013729982902380803
+  ],
+  "dc_spur_vs_tone_dbc": [
+    -24.74013726436095,
+    -25.614628512715232,
+    -25.22692876947663,
+    -25.313467549953774
+  ],
+  "near_dc_psd_mean": [
+    0.00025105774658608934,
+    0.00016263883064429886,
+    0.0003017955348776935,
+    0.00018197438479326087
+  ],
+  "reference_100k_psd_mean": [
+    8.798716440977431e-05,
+    6.254172784195992e-05,
+    0.00012428604017995735,
+    6.280948756947447e-05
+  ],
+  "near_dc_minus_100k_db": [
+    4.553543046382767,
+    4.150543677728603,
+    3.8529045863493536,
+    4.619850095893014
+  ],
+  "estimated_ref_peak_normalized_freq": 0.012281617616645483,
+  "samples_analyzed": 196608,
+  "chunks_analyzed": 24,
+  "trace_stride": 6,
+  "trace_rows_kept": 4,
+  "spectral_metrics_every": 8,
+  "phase_trace_summary": {
+    "duration_s": 0.036864,
+    "unwrapped_delta_deg": {
+      "phi01_deg": 0.004321584119821864,
+      "phi02_deg": 0.007268403355865871,
+      "phi03_deg": -0.0003523056039398398,
+      "phi23_deg": -0.007620708959802158
+    },
+    "drift_rate_deg_per_s": {
+      "phi01_deg": 0.11723047200037609,
+      "phi02_deg": 0.1971680597836879,
+      "phi03_deg": -0.009556901148541661,
+      "phi23_deg": -0.2067249609321332
+    },
+    "unwrapped_std_deg": {
+      "phi01_deg": 0.005753183398320822,
+      "phi02_deg": 0.0033019808860477694,
+      "phi03_deg": 0.004023891812488773,
+      "phi23_deg": 0.003327380541734661
+    }
+  },
+  "corrected_phase_trace_summary": {
+    "duration_s": 0.036864,
+    "unwrapped_delta_deg": {
+      "corr_phi01_deg": 0.004321584119849395,
+      "corr_phi02_deg": 0.007268403355863787,
+      "corr_phi03_deg": -0.0003523056039425672,
+      "corr_phi23_deg": -0.007620708959804528
+    },
+    "drift_rate_deg_per_s": {
+      "corr_phi01_deg": 0.11723047200112291,
+      "corr_phi02_deg": 0.19716805978363136,
+      "corr_phi03_deg": -0.009556901148615647,
+      "corr_phi23_deg": -0.20672496093219747
+    },
+    "unwrapped_std_deg": {
+      "corr_phi01_deg": 0.005753183398326884,
+      "corr_phi02_deg": 0.0033019808860459137,
+      "corr_phi03_deg": 0.004023891812492574,
+      "corr_phi23_deg": 0.00332738054173572
+    }
+  },
+  "aligned_phase_trace_summary": {
+    "duration_s": 0.036864,
+    "unwrapped_delta_deg": {
+      "aligned_phase_ch0_deg": 3.734865842021265e-15,
+      "aligned_phase_ch1_deg": -0.004321584119845496,
+      "aligned_phase_ch2_deg": -0.007268403355857469,
+      "aligned_phase_ch3_deg": 0.0003523056039466761
+    },
+    "drift_rate_deg_per_s": {
+      "aligned_phase_ch0_deg": 1.0131472010691366e-13,
+      "aligned_phase_ch1_deg": -0.11723047200101715,
+      "aligned_phase_ch2_deg": -0.19716805978345997,
+      "aligned_phase_ch3_deg": 0.009556901148727108
+    },
+    "unwrapped_std_deg": {
+      "aligned_phase_ch0_deg": 4.974906159596341e-15,
+      "aligned_phase_ch1_deg": 0.005753183398321752,
+      "aligned_phase_ch2_deg": 0.0033019808860440137,
+      "aligned_phase_ch3_deg": 0.004023891812490521
+    }
+  },
+  "quality_pass": true,
+  "quality_max_phase_std_deg": 3.0,
+  "quality_min_tone_snr_db": 10.0,
+  "quality_phase_std_pass": true,
+  "quality_tone_snr_pass": true,
+  "notes": "Correction vector maps raw USRP/TwinRX channel samples to phase-aligned channel samples for this splitter-tone calibration. Calibration source path: SynthUSB3 -> splitter -> four RX inputs."
+}

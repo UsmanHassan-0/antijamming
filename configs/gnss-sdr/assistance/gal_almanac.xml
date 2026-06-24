@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<!DOCTYPE boost_serialization>
+<boost_serialization signature="serialization::archive" version="19">
+<GNSS-SDR_gal_almanac_map class_id="0" tracking_level="0" version="0">
+	<count>2</count>
+	<item_version>0</item_version>
+	<item class_id="1" tracking_level="0" version="0">
+		<first>12</first>
+		<second class_id="2" tracking_level="0" version="0">
+			<PRN>12</PRN>
+			<delta_i>4.63867187500000000e-03</delta_i>
+			<toa>555000</toa>
+			<WNa>2</WNa>
+			<M_0>-9.74212646484375000e-01</M_0>
+			<ecc>3.96728515625000000e-04</ecc>
+			<sqrtA>5.44061750036899957e+03</sqrtA>
+			<OMEGA_0>7.21069335937500000e-01</OMEGA_0>
+			<omega>1.48162841796875000e-01</omega>
+			<OMEGAdot>-1.74622982740402201e-09</OMEGAdot>
+			<af0>5.15174865722656250e-03</af0>
+			<af1>-1.81898940354585648e-11</af1>
+			<IODa>4</IODa>
+			<E5b_HS>0</E5b_HS>
+			<E1B_HS>0</E1B_HS>
+			<E5a_HS>0</E5a_HS>
+		</second>
+	</item>
+	<item>
+		<first>13</first>
+		<second>
+			<PRN>13</PRN>
+			<delta_i>5.67626953125000000e-03</delta_i>
+			<toa>555000</toa>
+			<WNa>2</WNa>
+			<M_0>-2.09167480468750000e-01</M_0>
+			<ecc>1.37329101562500000e-04</ecc>
+			<sqrtA>5.44061359411899957e+03</sqrtA>
+			<OMEGA_0>7.20001220703125000e-01</OMEGA_0>
+			<omega>1.31530761718750000e-01</omega>
+			<OMEGAdot>-1.74622982740402201e-09</OMEGAdot>
+			<af0>4.17709350585937500e-04</af0>
+			<af1>0.00000000000000000e+00</af1>
+			<IODa>4</IODa>
+			<E5b_HS>0</E5b_HS>
+			<E1B_HS>0</E1B_HS>
+			<E5a_HS>0</E5a_HS>
+		</second>
+	</item>
+</GNSS-SDR_gal_almanac_map>
+</boost_serialization>
+

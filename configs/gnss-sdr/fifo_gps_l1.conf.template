@@ -1,0 +1,244 @@
+; Repo-local GNSS-SDR config for GPS L1 C/A + Galileo E1B FIFO input.
+; The anti-jamming app renders this template into logs/gnss-sdr/runtime/.
+; USRP tune/rate/RF bandwidth are owned by the backend; GNSS-SDR reads baseband IQ here.
+; Receiver blocks are rendered for the runtime sample rate after SignalSource.
+
+[GNSS-SDR]
+
+; =============================================================================
+; Global Runtime
+; =============================================================================
+
+; internal_fs_sps must match the IQ rate written into the FIFO by the backend.
+; tow_to_trk forwards decoded time-of-week toward tracking when GNSS-SDR supports it.
+GNSS-SDR.internal_fs_sps={internal_fs_sps}
+ControlThread.wait_for_flowgraph=false
+GNSS-SDR.tow_to_trk={tow_to_trk}
+
+; =============================================================================
+; UDP Monitor Streams
+; =============================================================================
+
+; PVT monitor emits MonitorPvt protobuf packets.
+; The GUI uses this for position, fix type, DOP, receiver time, and satellites used in PVT.
+PVT.enable_monitor={pvt_monitor_enable}
+PVT.monitor_client_addresses={pvt_monitor_client_addresses}
+PVT.monitor_udp_port={pvt_monitor_udp_port}
+PVT.enable_protobuf={pvt_monitor_enable_protobuf}
+
+; Main GNSS-Synchro monitor is connected after observables.
+; The GUI uses this for observable-level state. High rates can be heavy, so decimation is explicit.
+Monitor.enable_monitor={monitor_enable}
+Monitor.enable_protobuf={monitor_enable_protobuf}
+Monitor.client_addresses={monitor_client_addresses}
+Monitor.udp_port={monitor_udp_port}
+Monitor.decimation_factor={monitor_decimation_factor}
+
+; Tracking monitor emits GNSS-Synchro packets directly from tracking blocks.
+; The GUI uses this for PRN stability and C/N0-style live tracking display.
+TrackingMonitor.enable_monitor={tracking_monitor_enable}
+TrackingMonitor.enable_protobuf={tracking_monitor_enable_protobuf}
+TrackingMonitor.client_addresses={tracking_monitor_client_addresses}
+TrackingMonitor.udp_port={tracking_monitor_udp_port}
+TrackingMonitor.decimation_factor={tracking_monitor_decimation_factor}
+
+; =============================================================================
+; SUPL Assistance
+; =============================================================================
+
+; These are intentionally off for cold-start style testing unless explicitly enabled in app config.
+GNSS-SDR.SUPL_gps_enabled=false
+GNSS-SDR.SUPL_read_gps_assistance_xml=false
+GNSS-SDR.SUPL_gps_ephemeris_server=supl.google.com
+GNSS-SDR.SUPL_gps_ephemeris_port=7275
+GNSS-SDR.SUPL_gps_acquisition_server=supl.google.com
+GNSS-SDR.SUPL_gps_acquisition_port=7275
+GNSS-SDR.SUPL_MCC=244
+GNSS-SDR.SUPL_MNC=5
+GNSS-SDR.SUPL_LAC=0x59e2
+GNSS-SDR.SUPL_CI=0x31b0
+
+; Optional local assistance XML paths. AGNSS_XML_enabled controls whether they are used.
+GNSS-SDR.AGNSS_XML_enabled={agnss_xml_enable}
+GNSS-SDR.AGNSS_gps_ephemeris_xml={agnss_gps_ephemeris_xml}
+GNSS-SDR.AGNSS_gal_ephemeris_xml={agnss_gal_ephemeris_xml}
+GNSS-SDR.AGNSS_gal_utc_model_xml={agnss_gal_utc_model_xml}
+GNSS-SDR.AGNSS_gal_almanac_xml={agnss_gal_almanac_xml}
+GNSS-SDR.AGNSS_ref_location={agnss_ref_location}
+GNSS-SDR.AGNSS_ref_utc_time={agnss_ref_utc_time}
+
+; =============================================================================
+; FIFO Signal Source
+; =============================================================================
+
+; GNSS-SDR reads the already selected/beamformed/pass-through complex IQ from this FIFO.
+SignalSource.implementation=Fifo_Signal_Source
+SignalSource.filename={fifo_path}
+SignalSource.sample_type={sample_type}
+SignalSource.dump=false
+SignalSource.dump_filename={signal_source_dump_path}
+
+; Signal conditioner is rendered by the backend. It keeps the GNSS-SDR block graph explicit
+; even when the runtime path is effectively pass-through at the configured sample rate.
+{signal_conditioner_config}
+
+; =============================================================================
+; GPS L1 C/A + Galileo E1B Channels
+; =============================================================================
+
+; 1C = GPS L1 C/A channels. 1B = Galileo E1B channels.
+; Channels.in_acquisition is the maximum number of channels allowed to acquire at once.
+Channels_1C.count={channels_1c_count}
+Channels_1B.count={channels_1b_count}
+Channels.in_acquisition={channels_in_acquisition}
+Channel.signal=1C
+{channel_signal_config}
+
+; =============================================================================
+; GPS L1 C/A Acquisition
+; =============================================================================
+
+; GPS L1 C/A coarse/acquisition search over code phase and Doppler.
+; doppler_max is the +/- Hz carrier search span; doppler_step is the bin spacing in Hz.
+; max_dwells is the retry/dwell count per acquisition request.
+Acquisition_1C.implementation=GPS_L1_CA_PCPS_Acquisition
+Acquisition_1C.item_type=gr_complex
+Acquisition_1C.coherent_integration_time_ms={acquisition_coherent_integration_ms}
+Acquisition_1C.pfa={acquisition_pfa}
+Acquisition_1C.doppler_max={acquisition_doppler_max_hz}
+Acquisition_1C.doppler_step={acquisition_doppler_step_hz}
+Acquisition_1C.bit_transition_flag={acquisition_bit_transition_flag}
+Acquisition_1C.max_dwells={acquisition_max_dwells}
+Acquisition_1C.dump=false
+Acquisition_1C.dump_filename={acquisition_dump_path}
+
+; =============================================================================
+; Galileo E1B Acquisition
+; =============================================================================
+
+; Galileo E1 acquisition uses a separate implementation and fixed Galileo-specific defaults here.
+Acquisition_1B.implementation=Galileo_E1_PCPS_Ambiguous_Acquisition
+Acquisition_1B.item_type=gr_complex
+Acquisition_1B.coherent_integration_time_ms=4
+Acquisition_1B.pfa={acquisition_pfa}
+Acquisition_1B.doppler_max=5000
+Acquisition_1B.doppler_step=125
+Acquisition_1B.dump=false
+Acquisition_1B.dump_filename={acquisition_dump_path}
+
+; =============================================================================
+; GPS L1 C/A Tracking
+; =============================================================================
+
+; GPS tracking turns acquisition hits into continuous carrier/code tracking and NAV bits.
+; PLL controls carrier phase/frequency tracking; DLL controls code delay tracking.
+; FLL pull-in can help initial carrier convergence before PLL-only tracking.
+Tracking_1C.implementation=GPS_L1_CA_DLL_PLL_Tracking
+Tracking_1C.item_type=gr_complex
+Tracking_1C.pll_bw_hz={tracking_1c_pll_bw_hz}
+Tracking_1C.dll_bw_hz={tracking_1c_dll_bw_hz}
+Tracking_1C.pll_filter_order={tracking_1c_pll_filter_order}
+Tracking_1C.dll_filter_order={tracking_1c_dll_filter_order}
+Tracking_1C.early_late_space_chips={tracking_1c_early_late_space_chips}
+Tracking_1C.early_late_space_narrow_chips={tracking_1c_early_late_space_narrow_chips}
+Tracking_1C.pll_bw_narrow_hz={tracking_1c_pll_bw_narrow_hz}
+Tracking_1C.dll_bw_narrow_hz={tracking_1c_dll_bw_narrow_hz}
+Tracking_1C.extend_correlation_symbols={tracking_1c_extend_correlation_symbols}
+Tracking_1C.enable_fll_pull_in={tracking_1c_enable_fll_pull_in}
+Tracking_1C.enable_fll_steady_state={tracking_1c_enable_fll_steady_state}
+Tracking_1C.fll_bw_hz={tracking_1c_fll_bw_hz}
+Tracking_1C.pull_in_time_s={tracking_1c_pull_in_time_s}
+Tracking_1C.bit_synchronization_time_limit_s={tracking_1c_bit_synchronization_time_limit_s}
+Tracking_1C.cn0_min=25
+
+; Dumps are disabled; the GUI reads TrackingMonitor UDP, not dump files.
+Tracking_1C.dump=false
+Tracking_1C.dump_mat=false
+Tracking_1C.dump_filename={tracking_output_prefix}
+
+; =============================================================================
+; Galileo E1B Tracking
+; =============================================================================
+
+; Galileo E1B tracking is independent from GPS 1C tracking and has its own loop settings.
+; VEML uses very-early/early/prompt/late/very-late correlators for Galileo code tracking.
+Tracking_1B.implementation=Galileo_E1_DLL_PLL_VEML_Tracking
+Tracking_1B.item_type=gr_complex
+Tracking_1B.pll_bw_hz={tracking_1b_pll_bw_hz}
+Tracking_1B.dll_bw_hz={tracking_1b_dll_bw_hz}
+Tracking_1B.pll_filter_order={tracking_1b_pll_filter_order}
+Tracking_1B.dll_filter_order={tracking_1b_dll_filter_order}
+Tracking_1B.early_late_space_chips={tracking_1b_early_late_space_chips}
+Tracking_1B.very_early_late_space_chips={tracking_1b_very_early_late_space_chips}
+Tracking_1B.extend_correlation_symbols={tracking_1b_extend_correlation_symbols}
+Tracking_1B.enable_fll_pull_in={tracking_1b_enable_fll_pull_in}
+Tracking_1B.enable_fll_steady_state={tracking_1b_enable_fll_steady_state}
+Tracking_1B.fll_bw_hz={tracking_1b_fll_bw_hz}
+Tracking_1B.pull_in_time_s={tracking_1b_pull_in_time_s}
+Tracking_1B.bit_synchronization_time_limit_s={tracking_1b_bit_synchronization_time_limit_s}
+Tracking_1B.cn0_min=25
+
+; Dumps are disabled; the GUI reads TrackingMonitor UDP, not dump files.
+Tracking_1B.dump=false
+Tracking_1B.dump_mat=false
+Tracking_1B.dump_filename={tracking_output_prefix}
+
+; =============================================================================
+; Navigation Message Decoding
+; =============================================================================
+
+; GPS telemetry decoder must produce valid ephemeris/subframes before GPS can support PVT.
+TelemetryDecoder_1C.implementation=GPS_L1_CA_Telemetry_Decoder
+TelemetryDecoder_1C.dump=false
+TelemetryDecoder_1C.dump_filename={telemetry_dump_prefix}
+
+; Galileo telemetry decoder settings are separate from GPS. Reduced CED affects Galileo only.
+TelemetryDecoder_1B.implementation=Galileo_E1B_Telemetry_Decoder
+TelemetryDecoder_1B.use_reduced_ced={telemetry_1b_use_reduced_ced}
+TelemetryDecoder_1B.enable_reed_solomon={telemetry_1b_enable_reed_solomon}
+TelemetryDecoder_1B.dump=false
+TelemetryDecoder_1B.dump_filename=./outputs/telemetry/telemetry_decoder_1B.dat
+
+; =============================================================================
+; Observables
+; =============================================================================
+
+; Hybrid_Observables forms pseudorange/carrier observables consumed by RTKLIB_PVT.
+Observables.implementation=Hybrid_Observables
+Observables.dump=false
+Observables.dump_filename={observables_dump_path}
+
+; =============================================================================
+; PVT Output
+; =============================================================================
+
+; RTKLIB_PVT solves the receiver position from decoded navigation data plus observables.
+; positioning_mode remains app-configured; current live config uses PPP_Static.
+PVT.implementation=RTKLIB_PVT
+PVT.positioning_mode={pvt_positioning_mode}
+PVT.output_rate_ms=100
+PVT.display_rate_ms=500
+PVT.iono_model=Broadcast
+PVT.trop_model=Saastamoinen
+; Logs RTKLIB per-satellite residuals once per second so beamformed PVT errors
+; can be tied to the actual measurements RTKLIB used or rejected.
+PVT.log_rtklib_residuals=true
+PVT.rtklib_residual_log_period_ms=1000
+PVT.output_path=./outputs/pvt
+PVT.rinex_output_path=./outputs/pvt
+PVT.gpx_output_path=./outputs/pvt
+PVT.geojson_output_path=./outputs/pvt
+PVT.kml_output_path=./outputs/pvt
+PVT.xml_output_path=./outputs/pvt
+PVT.nmea_output_file_path=./outputs/pvt
+PVT.nmea_output_file_enabled={pvt_nmea_output_file_enable}
+PVT.nmea_rate_ms={pvt_nmea_rate_ms}
+PVT.flag_nmea_tty_port={pvt_nmea_tty_enable}
+PVT.nmea_dump_devname={pvt_nmea_tty_devname}
+PVT.flag_rtcm_server=false
+PVT.flag_rtcm_tty_port=false
+PVT.rtcm_dump_devname=/dev/pts/1
+PVT.dump=false
+PVT.dump_mat=false
+PVT.dump_filename={pvt_dump_prefix}
+PVT.nmea_dump_filename={pvt_nmea_path}

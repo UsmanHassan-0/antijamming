@@ -1,0 +1,133 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Length 1844 >>
+stream
+BT
+/F1 10 Tf
+50 780 Td
+14 TL
+(TwinRX Getting Started Guides) Tj
+T* () Tj
+T* (Source:) Tj
+T* (https://kb.ettus.com/index.php?action=pdfbook&format=single&title=TwinRX_Getting_Started_Guides) Tj
+T* (Note: Direct terminal download was blocked by Cloudflare HTTP 403, so this local PDF was) Tj
+T* (regenerated from the official Ettus KB content.) Tj
+T* (Generated UTC: 2026-04-28T11:27:17.039017+00:00) Tj
+T* () Tj
+T* (Contents) Tj
+T* (1. Kit Contents) Tj
+T* (2. USRP Compatibility) Tj
+T* (3. Hardware Setup) Tj
+T* (4. Local Oscillator Connectors) Tj
+T* (5. Software Setup) Tj
+T* (6. Test and Verify the Operation of the USRP) Tj
+T* (7. Proper Care and Handling) Tj
+T* (8. Technical Support and Community Knowledge Base) Tj
+T* (9. Legal Considerations) Tj
+T* (10. Sales and Ordering Support) Tj
+T* (11. Terms and Conditions of Sale) Tj
+T* () Tj
+T* (Kit Contents) Tj
+T* (- TwinRX Daughterboard) Tj
+T* (- Two front panel cables: 1.4 inch SMA bulkhead female to MMCX right-angle male) Tj
+T* (- Two front panel washer and bolts) Tj
+T* (- Two LO sharing cables: 5 inch MMCX right-angle male to MMCX right-angle male) Tj
+T* (- Screw kit) Tj
+T* (- Hardware installation guide) Tj
+T* (- Getting started guide) Tj
+T* () Tj
+T* (USRP Compatibility) Tj
+T* (- USRP X300/X310) Tj
+T* () Tj
+T* (Hardware Setup) Tj
+T* (For complete step-by-step instructions to install a daughterboard, see the TwinRX Module) Tj
+T* (Installation Guide or the USRP X Series Quick Start daughterboard installation guide.) Tj
+T* () Tj
+T* (Local Oscillator Connectors) Tj
+T* (LO sharing cables are not required for a single TwinRX setup. LO sharing cables are required) Tj
+T* (with two TwinRX daughterboards in a single USRP X300/X310.) Tj
+T* () Tj
+T* (Connector table) Tj
+T* (J1: LO2 Export, min 0 dBm, nominal 0 dBm, output only) Tj
+T* (J2: LO2 Input, min 0 dBm, damage +20 dBm) Tj
+ET
+endstream
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 3 0 R >>
+endobj
+5 0 obj
+<< /Length 2141 >>
+stream
+BT
+/F1 10 Tf
+50 780 Td
+14 TL
+(J3: LO1 Export, min -12 dBm, nominal +5 dBm, output only) Tj
+T* (J4: LO1 Input, min -10 dBm, nominal -5 dBm, damage +10 dBm) Tj
+T* () Tj
+T* (LO Sharing with Neighbour TwinRXs) Tj
+T* (TwinRX A slot J1 LO2 Export -> TwinRX B slot J2 LO2 Input) Tj
+T* (TwinRX A slot J2 LO2 Input  <- TwinRX B slot J1 LO2 Export) Tj
+T* (TwinRX A slot J3 LO1 Export -> TwinRX B slot J4 LO1 Input) Tj
+T* (TwinRX A slot J4 LO1 Input  <- TwinRX B slot J3 LO1 Export) Tj
+T* () Tj
+T* (Software Setup) Tj
+T* (- UHD minimum version: 3.10.0.0) Tj
+T* (- GNU Radio minimum version: 3.7.10) Tj
+T* (Install and configure the UHD/GNU Radio toolchain before using the TwinRX. Use a current) Tj
+T* (stable UHD where possible.) Tj
+T* () Tj
+T* (Test and Verify Operation) Tj
+T* (The UHD driver includes example programs that can verify receiver operation.) Tj
+T* () Tj
+T* (Example RX1 command:) Tj
+T* (/usr/local/lib/uhd/examples/rx_ascii_art_dft --freq 88.1e6 --rate 1e6 --gain 70 --ref-lvl) Tj
+T* (-30 --subdev "A:0" --ant RX1) Tj
+T* () Tj
+T* (To test RX2, change the antenna flag to RX2 and the subdevice spec to A:1.) Tj
+T* (Type Q or Ctrl-C to stop rx_ascii_art_dft.) Tj
+T* () Tj
+T* (GNU Radio GUI example:) Tj
+T* (uhd_fft -s 1e6 -g 70 -f 88.1e6 --spec "A:0" -A RX1) Tj
+T* () Tj
+T* (Proper Care and Handling) Tj
+T* (- Never allow metal objects to touch the circuit board while powered.) Tj
+T* (- Always handle the board with proper anti-static methods.) Tj
+T* (- Never allow the board to directly or indirectly contact voltage spikes.) Tj
+T* (- Never allow water or condensing moisture to contact the boards.) Tj
+T* (- Always use caution with FPGA, firmware, or software modifications.) Tj
+T* (- Never apply more than +10 dBm of power into any RF input.) Tj
+T* (- Always use at least 30 dB attenuation if operating in loopback configuration.) Tj
+T* () Tj
+T* (Support and Legal) Tj
+T* (Technical support: support@ettus.com) Tj
+T* (Community mailing list: usrp-users) Tj
+T* (Users are responsible for complying with applicable radio laws and regulations.) Tj
+T* (Terms and conditions: http://www.ettus.com/legal/terms-and-conditions-of-sale) Tj
+ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 5 0 R >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000121 00000 n 
+0000002017 00000 n 
+0000002192 00000 n 
+0000004385 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+4560
+%%EOF
