@@ -1,0 +1,10 @@
+numpy>=1.26
+h5py>=3.10
+scipy>=1.11
+matplotlib>=3.6
+pyqtgraph>=0.13
+pytest>=8.0
+pytest-qt>=4.4
+pyserial>=3.5
+protobuf>=3.21
+threadpoolctl>=3.5
