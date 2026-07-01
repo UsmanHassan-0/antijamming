@@ -1,0 +1,79 @@
+/*!
+ * \file sensor_data_file.h
+ * \brief  Provides a simple abstraction for reading contiguous binary data from a file
+ * \author Victor Castillo, 2024. victorcastilloaguero(at)gmail.com
+ *
+ * -----------------------------------------------------------------------------
+ *
+ * GNSS-SDR is a Global Navigation Satellite System software-defined receiver.
+ * This file is part of GNSS-SDR.
+ *
+ * Copyright (C) 2024-2025  (see AUTHORS file for a list of contributors)
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * -----------------------------------------------------------------------------
+ */
+
+
+#ifndef GNSS_SDR_SENSOR_DATA_FILE_H
+#define GNSS_SDR_SENSOR_DATA_FILE_H
+
+#include <cstddef>  // for size_t
+#include <cstdint>
+#include <fstream>
+#include <gnss_block_interface.h>
+#include <memory>
+#include <string>
+#include <vector>
+
+/** \addtogroup Algorithms_Library
+ * \{ */
+/** \addtogroup Algorithm_libs algorithms_libs
+ * \{ */
+
+
+class SensorDataFile
+{
+public:
+    using sptr = gnss_shared_ptr<SensorDataFile>;
+    using id_type = std::size_t;
+
+    SensorDataFile(
+        const std::string& path,
+        const std::size_t& sample_delay,
+        const std::size_t& sample_period,
+        const std::size_t& offset_in_file,
+        const std::size_t& item_size,
+        const bool& repeat);
+
+    void reset();
+
+    bool read_until_sample(std::size_t end_sample, std::size_t& sample_stamp, std::vector<uint8_t>& buffer);
+
+    std::size_t get_chunks_read() const;
+
+private:
+    bool read_item(std::vector<uint8_t>& buffer);
+
+    void read_into_io_buffer();
+
+    void read_into_item_buffer(std::vector<uint8_t>& item_buf);
+
+    std::string path_;
+    std::ifstream file_;
+    std::size_t sample_period_;
+    std::size_t offset_in_file_;
+    std::size_t item_size_;
+
+    std::size_t chunks_read_;
+    std::size_t next_sample_stamp_;
+    std::vector<uint8_t> io_buffer_;
+    std::size_t io_buffer_size_;
+    std::size_t offset_in_io_buffer_;
+    bool repeat_;
+    bool done_;
+};
+
+/** \} */
+/** \} */
+#endif  // GNSS_SDR_SENSOR_DATA_FILE_H
