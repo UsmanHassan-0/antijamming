@@ -1,7 +1,6 @@
 {
   "created_utc": "2026-06-16T12:11:52.242907+00:00",
   "purpose": "USRP/TwinRX conducted phase offset calibration",
-  "reference_channel": 0,
   "center_freq_hz": 1575420000.0,
   "synth_freq_hz": 1575520000.0,
   "synth_offset_hz": 100000.0,
@@ -235,19 +234,16 @@
   "aligned_phase_trace_summary": {
     "duration_s": 0.036864,
     "unwrapped_delta_deg": {
-      "aligned_phase_ch0_deg": 3.734865842021265e-15,
       "aligned_phase_ch1_deg": -0.004321584119845496,
       "aligned_phase_ch2_deg": -0.007268403355857469,
       "aligned_phase_ch3_deg": 0.0003523056039466761
     },
     "drift_rate_deg_per_s": {
-      "aligned_phase_ch0_deg": 1.0131472010691366e-13,
       "aligned_phase_ch1_deg": -0.11723047200101715,
       "aligned_phase_ch2_deg": -0.19716805978345997,
       "aligned_phase_ch3_deg": 0.009556901148727108
     },
     "unwrapped_std_deg": {
-      "aligned_phase_ch0_deg": 4.974906159596341e-15,
       "aligned_phase_ch1_deg": 0.005753183398321752,
       "aligned_phase_ch2_deg": 0.0033019808860440137,
       "aligned_phase_ch3_deg": 0.004023891812490521

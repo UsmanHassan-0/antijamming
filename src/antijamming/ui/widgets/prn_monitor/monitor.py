@@ -1,4 +1,4 @@
-"""PRN C/N0 monitor showing stable tracked satellites as solid bars."""
+"""PRN C/N0 monitor showing qualified GNSS-SDR tracking measurements."""
 
 from __future__ import annotations
 
@@ -82,9 +82,9 @@ def _solid_pen(color: str, width: float) -> QPen:
 # Snapshot Parsing Helpers
 # =============================================================================
 
-# PRN Monitor displays entries that pass the bridge's tracking-monitor stability
-# gate. Observables C/N0 may be present as a fallback value elsewhere, but valid
-# pseudorange alone is not treated as C/N0 stability.
+# PRN Monitor admission follows GNSS-SDR's tracking state only. Stability,
+# telemetry decoding, and PVT use are separate qualifications displayed
+# elsewhere; none of them is allowed to hide a currently tracked satellite.
 
 def _entry_prn(entry: dict[str, object]) -> int | None:
     try:
@@ -200,14 +200,12 @@ class PocketPrnMonitor(QWidget):
             prn = _entry_prn(entry)
             if prn is None:
                 continue
-            if self._visual_state(str(entry.get("state", "idle")).lower()) == "idle":
+            if str(entry.get("state", "idle")).lower() != "tracking":
                 continue
             if _entry_cno(entry) is None:
                 self._pending_tracking_prns.append(prn)
                 self._pending_tracking_reasons[prn] = "missing_cno"
-                continue
-            stable = _entry_stable(entry)
-            if not stable:
+            elif not _entry_stable(entry):
                 reason = str(entry.get("cno_unstable_reason", "not_stable"))
                 if reason in {
                     "missing_cno",
@@ -220,7 +218,10 @@ class PocketPrnMonitor(QWidget):
                 else:
                     self._unstable_tracking_prns.append(prn)
                     self._unstable_tracking_reasons[prn] = reason
-                continue
+            # Once GNSS-SDR says this PRN is tracking, always render it. A real
+            # tracking C/N0 supplies the bar height when present; otherwise the
+            # state-height placeholder and "--" label keep the tracked PRN
+            # visible without inventing a signal-strength measurement.
             satellite_label = satellite_id(entry)
             entries_by_satellite[satellite_label] = (prn, entry)
         self._pending_tracking_prns.sort()

@@ -1,7 +1,6 @@
 {
   "created_utc": "2026-05-04T06:19:33.658880+00:00",
   "purpose": "USRP/TwinRX conducted phase offset calibration",
-  "reference_channel": 0,
   "center_freq_hz": 1575420000.0,
   "synth_freq_hz": 1575520000.0,
   "synth_offset_hz": 100000.0,
@@ -215,19 +214,16 @@
   "aligned_phase_trace_summary": {
     "duration_s": 1.3312,
     "unwrapped_delta_deg": {
-      "aligned_phase_ch0_deg": 3.8820722834800496e-15,
       "aligned_phase_ch1_deg": -0.05741592184398854,
       "aligned_phase_ch2_deg": -0.20149380890309276,
       "aligned_phase_ch3_deg": -0.09571898602512906
     },
     "drift_rate_deg_per_s": {
-      "aligned_phase_ch0_deg": 2.9162201648738354e-15,
       "aligned_phase_ch1_deg": -0.04313095090443851,
       "aligned_phase_ch2_deg": -0.15136253673609734,
       "aligned_phase_ch3_deg": -0.07190428637705008
     },
     "unwrapped_std_deg": {
-      "aligned_phase_ch0_deg": 7.516566043679347e-15,
       "aligned_phase_ch1_deg": 0.018454082898558582,
       "aligned_phase_ch2_deg": 0.058448306750143626,
       "aligned_phase_ch3_deg": 0.02914762317457614
@@ -238,5 +234,5 @@
   "quality_min_tone_snr_db": 10.0,
   "quality_phase_std_pass": true,
   "quality_tone_snr_pass": true,
-  "notes": "Apply correction_vector or -phase_offsets_deg before DoA. Calibration source path: SynthUSB3 -> splitter -> four RX inputs."
+  "notes": "Apply correction_vector or -phase_offsets_deg before DoA and the uniform GNSS combiner. Calibration source path: SynthUSB3 -> splitter -> four RX inputs."
 }

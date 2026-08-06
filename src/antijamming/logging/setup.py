@@ -18,12 +18,20 @@ LOGGER_DEFS: dict[str, tuple[str, str]] = {
     "handoff": ("antijamming.gnss_handoff", "gnss_handoff.log"),
     "phase": ("antijamming.phase_alignment", "phase_alignment.log"),
     "doa": ("antijamming.doa", "doa.log"),
-    "jammer": ("antijamming.jammer_detection", "jammer_detection.log"),
+    "lcmv": ("antijamming.lcmv", "lcmv.log"),
+    "analysis": ("antijamming.analysis", "analysis.log"),
+    "lcmv_pattern": ("antijamming.lcmv_pattern", "lcmv_pattern_absolute.jsonl"),
+    "spatial_vector": (
+        "antijamming.spatial_vector",
+        "spatial_vector_diagnostics.jsonl",
+    ),
     "gnss": ("antijamming.gnss_sdr", "gnss_sdr.log"),
     "health": ("antijamming.stream_health", "stream_health.log"),
     "ui": ("antijamming.ui", "ui_health.log"),
     "errors": ("antijamming.errors", "errors.log"),
 }
+
+SESSION_AUXILIARY_LOGS = ("operator_events.log",)
 
 
 # =============================================================================
@@ -78,10 +86,16 @@ def reset_session_logs(log_dir: Path, loggers: dict[str, logging.Logger]) -> Non
     """
     Start a new streaming session with clean logs.
 
-    We reset by closing existing handlers and reopening named handlers with mode="w"
-    so truncation happens safely at open time (no fighting with already-open file handles).
+    We reset by closing existing handlers and reopening only the known runtime
+    logs with mode="w" so truncation happens safely at open time. Helper logs
+    under logs/remote_gui_access and GNSS-SDR artifacts are left intact.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
+    for file_name in SESSION_AUXILIARY_LOGS:
+        try:
+            (log_dir / file_name).write_text("", encoding="utf-8")
+        except Exception:
+            pass
     for logger in loggers.values():
         for handler in list(logger.handlers):
             try:
@@ -91,16 +105,8 @@ def reset_session_logs(log_dir: Path, loggers: dict[str, logging.Logger]) -> Non
                 pass
         logger.handlers.clear()
 
-    for log_path in log_dir.rglob("*.log"):
-        try:
-            if log_path.is_file() or log_path.is_symlink():
-                log_path.write_text("", encoding="utf-8")
-        except Exception:
-            pass
     for key, (_logger_name, file_name) in LOGGER_DEFS.items():
         logger = loggers.get(key)
-        if logger is None:
-            continue
         log_path = log_dir / file_name
         # Ensure the file is actually truncated on session start, even if a handler
         # implementation or filesystem caching behaves unexpectedly.
@@ -116,6 +122,8 @@ def reset_session_logs(log_dir: Path, loggers: dict[str, logging.Logger]) -> Non
                 continue
             except Exception:
                 pass
+        if logger is None:
+            continue
         logger.propagate = False
         logger.setLevel(logging.INFO)
         logger.addHandler(_build_file_handler(log_path, mode="w"))

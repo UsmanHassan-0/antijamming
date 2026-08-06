@@ -1,4 +1,4 @@
-"""UHD address helpers for the fixed X300/XG product profile."""
+"""UHD address helpers for the fixed X300/HG Port-1 product profile."""
 
 from __future__ import annotations
 

@@ -42,11 +42,8 @@ class StreamWorker(QThread):
     def stop(self, reason: str = "normal stop") -> None:
         self._backend.stop(reason)
 
-    def set_doa_method(self, method: str) -> None:
-        self._backend.set_doa_method(method)
-
     def set_expected_sources(self, count: int) -> None:
         self._backend.set_expected_sources(count)
 
-    def set_jammer_detection_enabled(self, enabled: bool) -> None:
-        self._backend.set_jammer_detection_enabled(enabled)
+    def set_lcmv_test_enabled(self, enabled: bool) -> None:
+        self._backend.set_lcmv_test_enabled(enabled)

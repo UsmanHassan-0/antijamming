@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import logging
 from pathlib import Path
@@ -151,7 +152,6 @@ def _monitor_pvt_message(
     message.vel_n = 0.5
     message.vel_u = 0.6
     message.cog = 45.0
-    message.galhas_status = 2
     message.geohash = "testhash"
     return message
 
@@ -277,13 +277,149 @@ def test_bridge_launch_args_capture_gnss_sdr_logs_on_stable_console(tmp_path: Pa
     bridge = GnssSdrBridge(cfg, _loggers())
 
     args = bridge._gnss_sdr_launch_args(Path("/repo/gnss-sdr/install/gnss-sdr"))
+    command_args = bridge._gnss_sdr_command_args(Path("/repo/gnss-sdr/install/gnss-sdr"))
 
-    assert "/repo/gnss-sdr/install/gnss-sdr" in args
-    if args[0].endswith("stdbuf"):
-        assert args[1:3] == ["-oL", "-eL"]
-    assert f"--config_file={bridge._config_path}" in args
-    assert "--logtostderr=1" in args
-    assert all(not arg.startswith("--log_dir=") for arg in args)
+    assert "/repo/gnss-sdr/install/gnss-sdr" in command_args
+    if command_args[0].endswith("stdbuf"):
+        assert command_args[1:3] == ["-oL", "-eL"]
+    assert f"--config_file={bridge._config_path}" in command_args
+    assert "--logtostderr=1" in command_args
+    assert "--minloglevel=1" in command_args
+    assert all(not arg.startswith("--log_dir=") for arg in command_args)
+    assert "antijamming.gnss.sdr_bridge.parent_guard" in args
+    assert "--parent-pid" in args
+    assert args[-len(command_args):] == command_args
+
+
+def test_fifo_startup_without_deadline_waits_while_process_is_alive(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = StreamConfig(
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+        gnss_sdr_startup_timeout_s=0.0,
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    class LiveProcess:
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    bridge._proc = LiveProcess()  # type: ignore[assignment]
+    outcomes: list[OSError | int] = [
+        OSError(errno.ENXIO, "reader not ready"),
+        OSError(errno.ENXIO, "reader not ready"),
+        73,
+    ]
+
+    def fake_open(_path: Path, _flags: int) -> int:
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, OSError):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("antijamming.gnss.sdr_bridge.fifo.os.open", fake_open)
+    monkeypatch.setattr("antijamming.gnss.sdr_bridge.fifo.os.set_blocking", lambda *_: None)
+    monkeypatch.setattr("antijamming.gnss.sdr_bridge.fifo.time.sleep", lambda *_: None)
+    monkeypatch.setattr(bridge, "_configure_pipe", lambda _fd: None)
+
+    assert bridge._open_fifo_writer(cfg.gnss_sdr_startup_timeout_s) == 73
+    assert outcomes == []
+
+
+def test_fifo_startup_finite_deadline_reports_cold_fftw_hint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    class LiveProcess:
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    bridge._proc = LiveProcess()  # type: ignore[assignment]
+    monotonic_values = iter([100.0, 100.0, 101.1])
+
+    def reader_not_ready(_path: Path, _flags: int) -> int:
+        raise OSError(errno.ENXIO, "reader not ready")
+
+    monkeypatch.setattr("antijamming.gnss.sdr_bridge.fifo.os.open", reader_not_ready)
+    monkeypatch.setattr(
+        "antijamming.gnss.sdr_bridge.fifo.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr("antijamming.gnss.sdr_bridge.fifo.time.sleep", lambda *_: None)
+
+    with pytest.raises(RuntimeError, match="cold FFTW plan"):
+        bridge._open_fifo_writer(timeout_s=1.0)
+
+
+def test_fifo_startup_reports_cold_cache_progress_and_completion_to_console(
+    tmp_path: Path,
+    monkeypatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    class LiveProcess:
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    bridge._proc = LiveProcess()  # type: ignore[assignment]
+    outcomes: list[OSError | int] = [
+        OSError(errno.ENXIO, "reader not ready"),
+        73,
+    ]
+    monotonic_values = iter([100.0, 111.0, 112.0])
+
+    def fake_open(_path: Path, _flags: int) -> int:
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, OSError):
+            raise outcome
+        return outcome
+
+    monkeypatch.setenv("ANTIJAM_GNSS_STARTUP_CONSOLE", "1")
+    monkeypatch.setattr("antijamming.gnss.sdr_bridge.fifo.os.open", fake_open)
+    monkeypatch.setattr("antijamming.gnss.sdr_bridge.fifo.os.set_blocking", lambda *_: None)
+    monkeypatch.setattr("antijamming.gnss.sdr_bridge.fifo.time.sleep", lambda *_: None)
+    monkeypatch.setattr(
+        "antijamming.gnss.sdr_bridge.fifo.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(bridge, "_configure_pipe", lambda _fd: None)
+
+    assert bridge._open_fifo_writer(timeout_s=0.0) == 73
+    output = capsys.readouterr().out
+    assert "FFTW is measuring missing plans" in output
+    assert "one-time cache build" in output
+    assert "GNSS-SDR ready after 12.0s" in output
+    assert ".gr_fftw_wisdom" in output
+
+
+def test_parent_guard_execs_requested_command(monkeypatch) -> None:
+    from antijamming.gnss.sdr_bridge import parent_guard
+
+    executed: dict[str, object] = {}
+
+    monkeypatch.setattr(parent_guard, "_set_parent_death_signal", lambda _signum: None)
+    monkeypatch.setattr(parent_guard.os, "getppid", lambda: 1234)
+
+    def fake_execvp(program: str, args: list[str]) -> None:
+        executed["program"] = program
+        executed["args"] = list(args)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(parent_guard.os, "execvp", fake_execvp)
+
+    with pytest.raises(SystemExit):
+        parent_guard.main(["--parent-pid", "1234", "--", "/bin/echo", "ok"])
+
+    assert executed == {"program": "/bin/echo", "args": ["/bin/echo", "ok"]}
 
 
 def test_bridge_detects_only_matching_gnss_sdr_runtime_processes(tmp_path: Path) -> None:
@@ -514,10 +650,9 @@ def test_bridge_renders_fifo_config_with_runtime_paths(tmp_path: Path) -> None:
     assert f"SignalSource.sample_type={cfg.gnss_sdr_sample_type}" in rendered
 
 
-def test_bridge_fifo_config_matches_realtime_4mhz_conditioner(tmp_path: Path) -> None:
+def test_bridge_fifo_config_derives_gps_l1_filter_at_4mhz(tmp_path: Path) -> None:
     cfg = StreamConfig(
         sample_rate=4e6,
-        gnss_sdr_if_bandwidth_hz=2.1e6,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
     )
     bridge = GnssSdrBridge(cfg, _loggers())
@@ -530,37 +665,91 @@ def test_bridge_fifo_config_matches_realtime_4mhz_conditioner(tmp_path: Path) ->
     assert "SignalConditioner.implementation=Signal_Conditioner" in rendered
     assert "DataTypeAdapter.implementation=Pass_Through" in rendered
     assert "DataTypeAdapter.item_type=gr_complex" in rendered
-    assert "InputFilter.implementation=Fir_Filter" in rendered
-    assert "InputFilter.number_of_taps=11" in rendered
+    assert "InputFilter.implementation=Freq_Xlating_Fir_Filter" in rendered
+    assert "InputFilter.number_of_taps=" not in rendered
     assert "InputFilter.dump_filename=./outputs/signal_conditioner/input_filter.dat" in rendered
-    assert "InputFilter.band1_end=0.525000" in rendered
-    assert "InputFilter.band2_begin=0.625000" in rendered
+    assert "InputFilter.filter_type=lowpass" in rendered
+    assert "InputFilter.bw=1385000" in rendered
+    assert "InputFilter.tw=175000" in rendered
+    assert "InputFilter.IF=0" in rendered
+    assert "InputFilter.decimation_factor=1" in rendered
     assert "Resampler.sample_freq_in=4000000" in rendered
     assert "Resampler.dump_filename=./outputs/signal_conditioner/resampler.dat" in rendered
     assert "PVT.output_path=./outputs/pvt" in rendered
-    assert "PVT.dump_filename=./outputs/pvt/pvt" in rendered
+    assert "PVT.dump_filename=pvt" in rendered
+    assert bridge.input_filter_bandwidth_hz == 2_600_000.0
 
 
-def test_bridge_fifo_filter_stays_enabled_by_default(tmp_path: Path) -> None:
+def test_bridge_gps_l1_filter_keeps_physical_bandwidth_when_rate_changes(tmp_path: Path) -> None:
     cfg = StreamConfig(
-        gnss_sdr_if_bandwidth_hz=0.0,
+        sample_rate=8e6,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
     )
     bridge = GnssSdrBridge(cfg, _loggers())
 
     rendered = bridge._render_config()
 
-    assert "SignalConditioner.implementation=Signal_Conditioner" in rendered
-    assert "InputFilter.implementation=Fir_Filter" in rendered
-    assert "InputFilter.band1_end=0.48" in rendered
-    assert "InputFilter.band2_begin=0.52" in rendered
+    assert "InputFilter.number_of_taps=" not in rendered
+    assert "InputFilter.bw=1385000" in rendered
+    assert "InputFilter.tw=175000" in rendered
+    assert bridge.input_filter_bandwidth_hz == 2_600_000.0
+
+
+def test_bridge_gps_l1_filter_rejects_rate_below_stopband(tmp_path: Path) -> None:
+    cfg = StreamConfig(
+        sample_rate=3e6,
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    with pytest.raises(ValueError, match="cannot place the GPS L1 input-filter stopband"):
+        bridge._render_config()
+
+
+def test_bridge_gps_l1_filter_auto_design_meets_response_limits() -> None:
+    from gnuradio.filter import firdes
+
+    from antijamming.gnss.sdr_bridge.constants import (
+        GNSS_INPUT_FILTER_CUTOFF_HZ,
+        GNSS_INPUT_FILTER_PASSBAND_RIPPLE_DB,
+        GNSS_INPUT_FILTER_STOPBAND_ATTENUATION_DB,
+        GNSS_INPUT_FILTER_TRANSITION_WIDTH_HZ,
+        GPS_L1_CA_PROCESSING_BANDWIDTH_HZ,
+    )
+
+    sample_rate_hz = 4_000_000.0
+    coefficients = np.asarray(
+        firdes.low_pass(
+            1.0,
+            sample_rate_hz,
+            GNSS_INPUT_FILTER_CUTOFF_HZ,
+            GNSS_INPUT_FILTER_TRANSITION_WIDTH_HZ,
+        )
+    )
+    response = np.fft.rfft(coefficients, n=1 << 20)
+    frequency_hz = np.linspace(0.0, sample_rate_hz / 2.0, response.size)
+    response_db = 20.0 * np.log10(np.maximum(np.abs(response), 1e-15))
+    passband = response_db[
+        frequency_hz <= GPS_L1_CA_PROCESSING_BANDWIDTH_HZ / 2.0
+    ]
+    stopband = response_db[frequency_hz >= 1_500_000.0]
+    ripple_db = float(np.ptp(passband))
+    stopband_max_db = float(np.max(stopband))
+
+    # GNSS-SDR authors only bw/tw; GNU Radio chooses this length. Verify the
+    # exact generated response rather than supplying an explicit tap count.
+    assert len(coefficients) == 55
+    assert ripple_db == pytest.approx(0.443464, abs=1e-5)
+    assert stopband_max_db == pytest.approx(-43.702208, abs=1e-5)
+    assert ripple_db <= GNSS_INPUT_FILTER_PASSBAND_RIPPLE_DB
+    assert stopband_max_db <= -GNSS_INPUT_FILTER_STOPBAND_ATTENUATION_DB
 
 
 def test_bridge_renders_default_gps_l1_baseline_settings(tmp_path: Path) -> None:
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_1c_channel_count=10,
-        gnss_channels_in_acquisition=10,
+        gnss_channels_in_acquisition=30,
         gnss_acquisition_pfa=0.01,
         gnss_acquisition_doppler_max_hz=5000,
         gnss_acquisition_doppler_step_hz=500,
@@ -587,7 +776,7 @@ def test_bridge_renders_default_gps_l1_baseline_settings(tmp_path: Path) -> None
     )
     assert "PVT.dump=false" in rendered
     assert "PVT.dump_mat=false" in rendered
-    assert "PVT.dump_filename=./outputs/pvt/pvt" in rendered
+    assert "PVT.dump_filename=pvt" in rendered
     assert "PVT.enable_monitor=true" in rendered
     assert "PVT.monitor_client_addresses=127.0.0.1" in rendered
     assert "PVT.monitor_udp_port=1111" in rendered
@@ -654,7 +843,67 @@ def test_bridge_forces_gnss_sdr_dumps_off(tmp_path: Path) -> None:
     assert "Tracking_1C.carrier_lock_th=" not in rendered
 
 
-def test_bridge_tracks_supported_constellations_from_logs_and_nmea(tmp_path: Path) -> None:
+def test_bridge_tracks_gps_and_beidou_prns_without_number_collision(tmp_path: Path) -> None:
+    cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    bridge._handle_runtime_line(
+        "Tracking of GPS L1 C/A signal started on channel 0 for satellite GPS PRN 12"
+    )
+    bridge._handle_runtime_line(
+        "Tracking of BeiDou B1 signal started on channel 10 for satellite BeiDou PRN C12"
+    )
+    bridge._handle_runtime_line(
+        "New BeiDou B1 NAV message received in channel 10 from satellite "
+        "BeiDou PRN C12 with CN0=39.5 dB-Hz"
+    )
+    bridge._handle_nmea_line("$GPGSV,1,1,01,12,30,010,37*00")
+    bridge._handle_nmea_line("$GBGSV,1,1,01,12,40,020,38*00")
+    bridge._handle_nmea_line("$GBGSA,A,3,12,,,,,,,,,,,,1.0,1.0,1.0*00")
+
+    snapshot = bridge.snapshot()
+
+    assert [entry.get("satellite_id", f"G{entry['prn']:02d}") for entry in snapshot["prns"]] == [
+        "G12",
+        "C12",
+    ]
+    assert [entry.get("satellite_id", f"G{entry['prn']:02d}") for entry in snapshot["sky_prns"]] == [
+        "G12",
+        "C12",
+    ]
+    beidou = snapshot["sky_prns"][1]
+    assert beidou["constellation"] == "beidou"
+    assert beidou["used_in_fix"] is True
+    assert snapshot["prns"][1]["cno_db_hz"] == 39.5
+    assert snapshot["used_in_fix_prns"] == [12]
+    assert snapshot["used_in_fix_satellites"] == ["C12"]
+
+
+def test_bridge_reports_constellation_labels_for_duplicate_used_pvt_prns(tmp_path: Path) -> None:
+    cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    bridge._handle_runtime_line(
+        "Tracking of GPS L1 C/A signal started on channel 0 for satellite GPS PRN 05"
+    )
+    bridge._handle_runtime_line(
+        "Tracking of BeiDou B1 signal started on channel 10 for satellite BeiDou PRN C05"
+    )
+    bridge._handle_nmea_line("$GPGSA,A,3,05,,,,,,,,,,,,1.0,1.0,1.0*00")
+    bridge._handle_nmea_line("$GBGSA,A,3,05,,,,,,,,,,,,1.0,1.0,1.0*00")
+
+    snapshot = bridge.snapshot()
+
+    assert snapshot["used_in_fix_count"] == 2
+    assert snapshot["used_in_fix_prns"] == [5, 5]
+    assert snapshot["used_in_fix_satellites"] == ["G05", "C05"]
+    assert [
+        (entry.get("satellite_id", f"G{entry['prn']:02d}"), entry["used_in_fix"])
+        for entry in snapshot["prns"]
+    ] == [("G05", True), ("C05", True)]
+
+
+def test_bridge_tracks_supported_non_gps_constellations_from_logs_and_nmea(tmp_path: Path) -> None:
     cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
     bridge = GnssSdrBridge(cfg, _loggers())
 
@@ -1405,10 +1654,9 @@ def test_bridge_reads_pvt_monitor_udp_for_accuracy_and_valid_sat_count(tmp_path:
     assert "three_d_uncertainty_1sigma_m" not in accuracy
     assert accuracy["pvt_solution"]["ecef_x_m"] == pytest.approx(1.0)
     assert accuracy["pvt_solution"]["rx_time_s"] == pytest.approx(123.0)
-    assert accuracy["pvt_solution"]["galhas_status"] == pytest.approx(2)
+    assert accuracy["pvt_solution"]["utc_time"] == "2026-06-18T07:00:00Z"
     assert accuracy["pvt_solution"]["geohash"] == "testhash"
     assert accuracy["pvt_solution"]["monitor_pvt"]["geohash"] == "testhash"
-    assert accuracy["pvt_solution"]["monitor_pvt"]["galhas_status"] == 2
 
     bridge._handle_monitor_pvt_message(
         _monitor_pvt_message(
@@ -1546,6 +1794,42 @@ def test_bridge_reset_runtime_dir_clears_runtime_and_separate_glog_dir(tmp_path:
     assert not (runtime_dir / "console.log").exists()
     assert not (runtime_dir / "fifo_gps_l1.conf").exists()
     assert list(log_dir.iterdir()) == []
+
+
+def test_bridge_reset_runtime_dir_falls_back_after_root_owned_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured_runtime = tmp_path / "configured" / "runtime"
+    configured_log = tmp_path / "configured" / "glog"
+    fallback_runtime = tmp_path / "user-runtime"
+    bridge = GnssSdrBridge(
+        StreamConfig(
+            gnss_sdr_runtime_dir=configured_runtime,
+            gnss_sdr_log_dir=configured_log,
+        ),
+        _loggers(),
+    )
+    original_clear = bridge._clear_dir
+
+    def reject_configured_runtime(path: Path) -> None:
+        if path == configured_runtime.resolve():
+            raise PermissionError(errno.EACCES, "Permission denied", str(path / "tracking"))
+        original_clear(path)
+
+    monkeypatch.setattr(bridge, "_clear_dir", reject_configured_runtime)
+    monkeypatch.setattr(bridge, "_runtime_fallback_dir", lambda: fallback_runtime)
+
+    bridge._reset_runtime_dir()
+
+    assert bridge._runtime_dir == fallback_runtime.resolve()
+    assert bridge._log_dir == (fallback_runtime / "glog").resolve()
+    assert bridge._fifo_path == fallback_runtime.resolve() / "gnss_iq.fifo"
+    assert bridge._config_path == fallback_runtime.resolve() / "fifo_gps_l1.conf"
+    assert bridge._outputs_dir == fallback_runtime.resolve() / "outputs"
+    assert bridge._tracking_outputs_dir == fallback_runtime.resolve() / "outputs" / "tracking"
+    assert bridge._receiver_log_path == (fallback_runtime / "glog" / "receiver.log").resolve()
+    assert fallback_runtime.is_dir()
+    assert (fallback_runtime / "glog").is_dir()
 
 
 def test_bridge_session_glog_scan_uses_log_dir(tmp_path: Path) -> None:

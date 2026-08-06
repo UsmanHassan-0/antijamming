@@ -68,15 +68,15 @@ GNSS-SDR.AGNSS_ref_utc_time={agnss_ref_utc_time}
 ; FIFO Signal Source
 ; =============================================================================
 
-; GNSS-SDR reads the already selected/beamformed/pass-through complex IQ from this FIFO.
+; GNSS-SDR reads the runtime-produced uniform-combined complex IQ from this FIFO.
 SignalSource.implementation=Fifo_Signal_Source
 SignalSource.filename={fifo_path}
 SignalSource.sample_type={sample_type}
 SignalSource.dump=false
 SignalSource.dump_filename={signal_source_dump_path}
 
-; Signal conditioner is rendered by the backend. It keeps the GNSS-SDR block graph explicit
-; even when the runtime path is effectively pass-through at the configured sample rate.
+; Signal conditioner is rendered by the backend so the GNSS-SDR block graph stays explicit
+; at the configured sample rate.
 {signal_conditioner_config}
 
 ; =============================================================================
@@ -168,7 +168,7 @@ PVT.output_rate_ms=100
 PVT.display_rate_ms=500
 PVT.iono_model=Broadcast
 PVT.trop_model=Saastamoinen
-; Logs RTKLIB per-satellite residuals once per second so beamformed PVT errors
+; Logs RTKLIB per-satellite residuals once per second so combined-IQ PVT errors
 ; can be tied to the actual measurements RTKLIB used or rejected.
 PVT.log_rtklib_residuals=true
 PVT.rtklib_residual_log_period_ms=1000

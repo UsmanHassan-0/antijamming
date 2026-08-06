@@ -204,8 +204,6 @@ def test_ui_spacing_and_dimensions_follow_8_point_grid() -> None:
         "PRN_PLOT_MIN_HEIGHT",
         "SCROLLBAR_HANDLE_MIN_LENGTH",
         "SCROLLBAR_THICKNESS",
-        "SKYPLOT_MARKER_SIZE",
-        "SKYPLOT_MAX_SIZE",
         "SKYPLOT_MIN_SIZE",
         "SUMMARY_CARD_MAX_WIDTH",
         "SUMMARY_CARD_MIN_WIDTH",

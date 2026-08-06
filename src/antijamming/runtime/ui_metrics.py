@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
 @dataclass(frozen=True, slots=True)
 class RuntimeUiMetrics:
     """Structured payload emitted from the backend to the GUI."""
@@ -19,12 +18,10 @@ class RuntimeUiMetrics:
     complex_samples_raw: np.ndarray
     complex_samples_calibrated: np.ndarray
     doa_raw_spectrum: np.ndarray
-    doa_spectrum: np.ndarray
-    music_spectrum: np.ndarray
     doa_deg: float
     doa_display_deg: float
+    lcmv_test: dict[str, object]
     rx_signal_health: dict[str, object]
-    jammer: dict[str, object]
     gnss_snapshot: dict[str, object]
 
     def to_dict(self) -> dict[str, object]:
@@ -39,12 +36,10 @@ class RuntimeUiMetrics:
             "complex_samples_raw": self.complex_samples_raw,
             "complex_samples_calibrated": self.complex_samples_calibrated,
             "doa_raw_spectrum": self.doa_raw_spectrum,
-            "doa_spectrum": self.doa_spectrum,
-            "music_spectrum": self.music_spectrum,
             "doa_deg": self.doa_deg,
             "doa_display_deg": self.doa_display_deg,
+            "lcmv_test": self.lcmv_test,
             "rx_signal_health": self.rx_signal_health,
-            "jammer": self.jammer,
             "gnss_snapshot": self.gnss_snapshot,
         }
 

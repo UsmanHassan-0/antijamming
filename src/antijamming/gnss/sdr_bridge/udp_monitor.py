@@ -188,6 +188,7 @@ class UdpMonitorMixin:
         if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             return None
         point: dict[str, object] = {
+            "utc_time": str(message.utc_time),
             "latitude": lat,
             "longitude": lon,
             "altitude": height,
@@ -221,7 +222,6 @@ class UdpMonitorMixin:
             "valid_sats": float(message.valid_sats),
             "solution_status": float(message.solution_status),
             "solution_type": float(message.solution_type),
-            "galhas_status": float(message.galhas_status),
         }
         point["height"] = height
         if message.utc_time:
@@ -349,7 +349,10 @@ class UdpMonitorMixin:
             return fields
         for field in descriptor.fields:
             value = getattr(message, field.name)
-            if field.label == field.LABEL_REPEATED:
+            is_repeated = bool(getattr(field, "is_repeated", False))
+            if not is_repeated and hasattr(field, "label") and hasattr(field, "LABEL_REPEATED"):
+                is_repeated = field.label == field.LABEL_REPEATED
+            if is_repeated:
                 fields[field.name] = list(value)
             else:
                 fields[field.name] = value

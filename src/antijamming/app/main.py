@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import math
+import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
 from threadpoolctl import threadpool_info, threadpool_limits
 
-from antijamming.dsp.phase import load_phase_correction_vector
-
-from antijamming.config import REPO_ROOT, StreamConfig, default_stream_config
+from antijamming.app.runtime_config import build_runtime_config
+from antijamming.config import REPO_ROOT, StreamConfig
 from antijamming.logging import setup_logging
-from antijamming.radio.usrp import usrp_arg_int, with_usrp_frame_sizes
 from antijamming.radio.usrp.uhd_events import UhdConsoleMarkerMonitor
 
 _NUMERIC_THREAD_LIMIT = 1
@@ -54,39 +53,7 @@ def parse_args() -> argparse.Namespace:
 def _runtime_config() -> StreamConfig:
     """Build the fixed product runtime configuration."""
 
-    cfg = default_stream_config()
-    cfg.usrp_addr = with_usrp_frame_sizes(
-        cfg.usrp_addr,
-        recv_frame_size=int(cfg.recv_frame_size),
-        send_frame_size=int(cfg.send_frame_size),
-        recv_buff_size=int(cfg.recv_buff_size),
-        num_recv_frames=int(cfg.num_recv_frames),
-    )
-    cfg.recv_frame_size = usrp_arg_int(cfg.usrp_addr, "recv_frame_size", int(cfg.recv_frame_size))
-    cfg.send_frame_size = usrp_arg_int(cfg.usrp_addr, "send_frame_size", int(cfg.send_frame_size))
-    cfg.process_every_n_chunks = max(1, int(cfg.process_every_n_chunks))
-    cfg.ui_update_interval_s = max(0.05, float(cfg.ui_update_interval_s))
-    cfg.dsp_update_interval_s = max(0.02, float(cfg.dsp_update_interval_s))
-    cfg.ui_points = max(32, int(cfg.ui_points))
-    cfg.startup_grace_s = max(0.0, float(cfg.startup_grace_s))
-    cfg.min_sample_rate = max(1e5, float(cfg.min_sample_rate))
-    cfg.max_overflow_streak = max(1, int(cfg.max_overflow_streak))
-    cfg.max_total_overflow = max(1, int(cfg.max_total_overflow))
-
-    channel_count = max(1, len(cfg.channels))
-    if channel_count > 1 and float(cfg.array_spacing_m) > 0.0:
-        cfg.uca_radius_m = float(cfg.array_spacing_m) / (
-            2.0 * math.sin(math.pi / channel_count)
-        )
-
-    if cfg.phase_calibration_file is not None:
-        calibration_file = Path(cfg.phase_calibration_file).expanduser()
-        if not calibration_file.is_absolute():
-            calibration_file = (REPO_ROOT / calibration_file).resolve()
-        cfg.phase_calibration_file = calibration_file
-        cfg.phase_correction_vector = tuple(load_phase_correction_vector(calibration_file))
-
-    return cfg
+    return build_runtime_config()
 
 
 def _run_gui(
@@ -100,7 +67,7 @@ def _run_gui(
     from PyQt6.QtWidgets import QApplication
 
     from antijamming.ui.main_window import MainWindow
-    from antijamming.runtime import StreamWorker
+    from antijamming.runtime.remote_worker import RemoteStreamWorker
 
     app = QApplication(sys.argv[:1])
     loggers = setup_logging(cfg.log_dir)
@@ -122,7 +89,35 @@ def _run_gui(
         )
         or "no native pool reported",
     )
-    worker = StreamWorker(cfg, loggers=loggers)
+    socket_path = Path("/tmp") / f"antijamming-gui-{os.getpid()}.sock"
+    backend_process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "antijamming.app.headless",
+            "--socket",
+            str(socket_path),
+        ],
+        cwd=str(REPO_ROOT),
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    worker = RemoteStreamWorker(socket_path)
+    try:
+        worker.connect_service(timeout_s=8.0)
+    except Exception:
+        try:
+            os.killpg(backend_process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            backend_process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(backend_process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        raise
     win = MainWindow(cfg, worker)
     shutdown_requested = {"value": False}
 
@@ -132,6 +127,25 @@ def _run_gui(
             worker.stop()
             if not worker.wait(10000):
                 loggers["errors"].error("GUI worker did not stop within 10 seconds.")
+        worker.shutdown_service("standalone GUI exit")
+        try:
+            backend_process.wait(timeout=18.0)
+        except subprocess.TimeoutExpired:
+            loggers["errors"].error(
+                "Headless backend service did not exit within 18 seconds; sending SIGTERM."
+            )
+            try:
+                os.killpg(backend_process.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                backend_process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(backend_process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        worker.close()
 
     def _request_shutdown(reason: str) -> None:
         if shutdown_requested["value"]:
@@ -142,7 +156,10 @@ def _run_gui(
         QTimer.singleShot(100, app.quit)
 
     def _handle_signal(signum: int, _frame: object) -> None:
-        QTimer.singleShot(0, lambda: _request_shutdown(f"signal {signum}"))
+        # Python delivers these handlers on the main thread, so request the Qt
+        # shutdown immediately. Deferring through a zero-delay timer can lose
+        # the request when the launcher exits during signal handling.
+        _request_shutdown(f"signal {signum}")
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -162,15 +179,16 @@ def _run_gui(
         bool(quit_after_stop),
     )
 
-    def _show_window() -> None:
+    def _show_window(*, focus: bool = False) -> None:
         win.maximize_to_available_screen()
-        win.showMaximized()
-        win.raise_()
-        win.activateWindow()
+        if not win.isVisible():
+            win.showMaximized()
+        if focus:
+            win.raise_()
+            win.activateWindow()
 
-    _show_window()
+    _show_window(focus=True)
     QTimer.singleShot(250, _show_window)
-    QTimer.singleShot(1000, _show_window)
     if auto_start:
         QTimer.singleShot(1500, win.start_stream)
     if auto_stop_after_s is not None:

@@ -33,7 +33,6 @@ PLOT_AXIS_LEFT_WIDTH = grid(10)
 PLOT_AXIS_BOTTOM_HEIGHT = grid(8)
 PLOT_LEGEND_OFFSET = grid_tuple(2, 2)
 PLOT_LEGEND_SAMPLE_WIDTH = grid(2)
-SKYPLOT_MARKER_SIZE = grid(4)
 PLOT_GRID_ALPHA_PERCENT = 35
 PLOT_DENSE_GRID_ALPHA_PERCENT = 30
 
@@ -64,8 +63,6 @@ PRN_PLOT_MIN_HEIGHT = grid(34)
 PRN_PLOT_AXIS_BOTTOM_HEIGHT = grid(4)
 PRN_PLOT_COMPACT_MIN_HEIGHT = grid(8)
 SKYPLOT_MIN_SIZE = grid(40)
-SKYPLOT_MAX_SIZE = grid(80)
-SKYPLOT_COMPACT_MIN_SIZE = grid(14)
 
 # =============================================================================
 # Realtime Plot Defaults

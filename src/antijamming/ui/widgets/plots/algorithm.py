@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import weakref
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
-from PyQt6.QtWidgets import QSizePolicy
+from PyQt6.QtWidgets import QGraphicsEllipseItem, QSizePolicy
+import numpy as np
 import pyqtgraph as pg
 
 from antijamming.ui.theme import (
@@ -36,8 +38,14 @@ from antijamming.ui.specs import (
 
 # Axis ranges are centralized so plots that show the same physical quantity stay
 # visually comparable across tabs.
-DOA_Y_RANGE = (0.0, 1.02)
 PRN_Y_RANGE = (0.0, 55.0)
+POLAR_RING_RADII = (0.25, 0.5, 0.75, 1.0)
+POLAR_MAJOR_SPOKE_DEG = 90
+POLAR_SPOKE_STEP_DEG = 30
+POLAR_LABEL_RADIUS = 1.16
+POLAR_VIEW_EDGE_MARGIN_PX = 8
+POLAR_DATA_RADIUS_ATTR = "_antijam_polar_data_radius"
+POLAR_RADIAL_LABELS_ATTR = "_antijam_polar_radial_labels"
 
 
 # =============================================================================
@@ -72,6 +80,16 @@ class _LegendItemProxy:
 
     def setVisible(self, visible: bool) -> None:
         self._item.setVisible(visible)
+
+
+class _PolarPlotWidget(pg.PlotWidget):
+    """PlotWidget that keeps polar labels visible as the box aspect changes."""
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        _apply_polar_view_range(self)
+        plot_ref = weakref.ref(self)
+        QTimer.singleShot(0, lambda: _apply_polar_view_range_if_alive(plot_ref))
 
 
 # =============================================================================
@@ -236,14 +254,274 @@ def build_azimuth_response_plot(
     return plot, curve, marker
 
 
-def build_doa_plot(doa_min_deg: float, doa_max_deg: float) -> tuple[pg.PlotWidget, pg.PlotDataItem, pg.InfiniteLine]:
-    """Build the MUSIC DoA spectrum plot."""
-    return build_azimuth_response_plot(
-        bottom_label="Bearing (deg)",
-        left_label="Normalized spatial spectrum",
+def _polar_xy(radius: float, bearing_deg: float) -> tuple[float, float]:
+    bearing_rad = np.deg2rad(float(bearing_deg))
+    return float(radius * np.sin(bearing_rad)), float(radius * np.cos(bearing_rad))
+
+
+def _polar_view_limits_for_plot(plot: pg.PlotWidget) -> tuple[float, float]:
+    data_radius = max(0.0, float(getattr(plot, POLAR_DATA_RADIUS_ATTR, 1.0)))
+    try:
+        plot_item = plot.getPlotItem()
+    except RuntimeError:
+        return _polar_view_limits_for_box(
+            float(plot.width()),
+            float(plot.height()),
+            data_radius=data_radius,
+        )
+    if plot_item is None:
+        return _polar_view_limits_for_box(
+            float(plot.width()),
+            float(plot.height()),
+            data_radius=data_radius,
+        )
+    view_box = plot_item.getViewBox()
+    try:
+        rect = view_box.sceneBoundingRect()
+    except RuntimeError:
+        return _polar_view_limits_for_box(
+            float(plot.width()),
+            float(plot.height()),
+            data_radius=data_radius,
+        )
+    width = float(rect.width()) if rect.width() > 0 else float(plot.width())
+    height = float(rect.height()) if rect.height() > 0 else float(plot.height())
+    return _polar_view_limits_for_box(width, height, data_radius=data_radius)
+
+
+def _polar_view_limits_for_box(
+    width_px: float,
+    height_px: float,
+    *,
+    data_radius: float = 1.0,
+) -> tuple[float, float]:
+    width = max(float(width_px), 1.0)
+    height = max(float(height_px), 1.0)
+    required_x = max(max(float(radius) for radius in POLAR_RING_RADII), float(data_radius))
+    required_y = required_x
+    for bearing_deg in range(0, 360, POLAR_SPOKE_STEP_DEG):
+        x, y = _polar_xy(POLAR_LABEL_RADIUS, bearing_deg)
+        font = _polar_label_font(bearing_deg)
+        width_label_px, height_label_px = _text_item_size_px(f"{bearing_deg}°", font)
+        required_x = max(
+            required_x,
+            _plot_label_axis_limit(
+                center=float(x),
+                text_px=width_label_px,
+                axis_px=width,
+                margin_px=POLAR_VIEW_EDGE_MARGIN_PX,
+            ),
+        )
+        required_y = max(
+            required_y,
+            _plot_label_axis_limit(
+                center=float(y),
+                text_px=height_label_px,
+                axis_px=height,
+                margin_px=POLAR_VIEW_EDGE_MARGIN_PX,
+            ),
+        )
+    data_per_px = max(required_x / width, required_y / height)
+    return float(data_per_px * width), float(data_per_px * height)
+
+
+def _plot_label_axis_limit(
+    *,
+    center: float,
+    text_px: float,
+    axis_px: float,
+    margin_px: float,
+) -> float:
+    occupied_fraction = min(
+        0.95,
+        max(0.0, (float(text_px) + 2.0 * float(margin_px)) / max(float(axis_px), 1.0)),
+    )
+    return float(abs(center)) / max(1.0 - occupied_fraction, 1e-9)
+
+
+def _text_item_size_px(text: str, font: QFont) -> tuple[int, int]:
+    item = pg.TextItem(text=text, anchor=(0.5, 0.5))
+    item.setFont(font)
+    rect = item.boundingRect()
+    return int(np.ceil(rect.width())), int(np.ceil(rect.height()))
+
+
+def _polar_label_font(bearing_deg: int) -> QFont:
+    font = QFont()
+    if int(bearing_deg) % POLAR_MAJOR_SPOKE_DEG == 0:
+        font.setPointSize(FONT_POINT_SIZE_PLOT)
+        font.setBold(True)
+    else:
+        font.setPointSize(max(1, FONT_POINT_SIZE_PLOT - 1))
+    return font
+
+
+def _apply_polar_view_range(plot: pg.PlotWidget) -> None:
+    try:
+        plot_item = plot.getPlotItem()
+    except RuntimeError:
+        return
+    if plot_item is None:
+        return
+    x_limit, y_limit = _polar_view_limits_for_plot(plot)
+    try:
+        plot_item.setRange(
+            xRange=(-x_limit, x_limit),
+            yRange=(-y_limit, y_limit),
+            padding=0.0,
+            disableAutoRange=True,
+        )
+        plot.setLimits(
+            xMin=-x_limit,
+            xMax=x_limit,
+            yMin=-y_limit,
+            yMax=y_limit,
+        )
+    except RuntimeError:
+        return
+
+
+def _apply_polar_view_range_if_alive(
+    plot_ref: weakref.ReferenceType[pg.PlotWidget],
+) -> None:
+    plot = plot_ref()
+    if plot is None:
+        return
+    _apply_polar_view_range(plot)
+
+
+def set_polar_data_radius(plot: pg.PlotWidget, radius: float) -> None:
+    """Resize the polar view so the current unnormalized trace remains visible."""
+    try:
+        value = float(radius)
+    except (TypeError, ValueError):
+        value = 1.0
+    if not np.isfinite(value):
+        value = 1.0
+    setattr(plot, POLAR_DATA_RADIUS_ATTR, max(1.0, abs(value)))
+    _apply_polar_view_range(plot)
+
+
+def _format_polar_scale_value(value: float, suffix: str) -> str:
+    if not np.isfinite(value):
+        value = 0.0
+    if suffix.strip() == "dB":
+        return f"{value:.0f} {suffix.strip()}"
+    value_abs = abs(float(value))
+    if value_abs >= 100.0:
+        text = f"{value:.0f}"
+    elif value_abs >= 10.0:
+        text = f"{value:.1f}"
+    elif value_abs >= 1.0:
+        text = f"{value:.2f}"
+    else:
+        text = f"{value:.3g}"
+    return f"{text}{suffix}"
+
+
+def set_polar_radial_scale(
+    plot: pg.PlotWidget,
+    *,
+    radial_min: float,
+    radial_max: float,
+    suffix: str = "",
+) -> None:
+    """Update radial ring labels for the current value-to-radius scale."""
+    labels = getattr(plot, POLAR_RADIAL_LABELS_ATTR, ())
+    span = max(float(radial_max) - float(radial_min), 1e-12)
+    for radius, label in zip(POLAR_RING_RADII, labels, strict=False):
+        value = float(radial_min) + span * float(radius)
+        label.setText(_format_polar_scale_value(value, suffix))
+
+
+def _add_polar_grid(plot: pg.PlotWidget) -> None:
+    """Draw static polar axes for top-zero clockwise bearing coordinates."""
+
+    grid_pen = pg.mkPen(FG_MUTED, width=0.75)
+    major_pen = pg.mkPen(FG_MUTED, width=1.15)
+    radial_labels: list[pg.TextItem] = []
+    for radius in POLAR_RING_RADII:
+        ring = QGraphicsEllipseItem(-radius, -radius, 2.0 * radius, 2.0 * radius)
+        ring.setPen(major_pen if radius == 1.0 else grid_pen)
+        ring.setBrush(pg.mkBrush(255, 255, 255, 0))
+        plot.addItem(ring)
+        label_x, label_y = _polar_xy(radius, 75.0)
+        label = pg.TextItem(
+            text="",
+            color=FG_MUTED,
+            anchor=(0.0, 0.5),
+            fill=pg.mkBrush(255, 255, 255, 0),
+            border=None,
+        )
+        font = QFont()
+        font.setPointSize(max(1, FONT_POINT_SIZE_PLOT - 1))
+        label.setFont(font)
+        label.setPos(label_x, label_y)
+        plot.addItem(label)
+        radial_labels.append(label)
+    setattr(plot, POLAR_RADIAL_LABELS_ATTR, tuple(radial_labels))
+
+    for bearing_deg in range(0, 360, POLAR_SPOKE_STEP_DEG):
+        x, y = _polar_xy(1.0, bearing_deg)
+        pen = (
+            major_pen
+            if bearing_deg % POLAR_MAJOR_SPOKE_DEG == 0
+            else grid_pen
+        )
+        spoke = pg.PlotDataItem([0.0, x], [0.0, y], pen=pen)
+        spoke.setClipToView(False)
+        spoke.setDownsampling(auto=False)
+        plot.addItem(spoke)
+
+        label_x, label_y = _polar_xy(POLAR_LABEL_RADIUS, bearing_deg)
+        label = pg.TextItem(
+            text=f"{bearing_deg}°",
+            color=FG_TEXT if bearing_deg % POLAR_MAJOR_SPOKE_DEG == 0 else FG_MUTED,
+            anchor=(0.5, 0.5),
+            fill=pg.mkBrush(255, 255, 255, 0),
+            border=None,
+        )
+        label.setFont(_polar_label_font(bearing_deg))
+        label.setPos(label_x, label_y)
+        plot.addItem(label)
+
+
+def build_doa_polar_plot() -> tuple[pg.PlotWidget, pg.PlotDataItem, pg.PlotDataItem]:
+    """Build a polar MUSIC response plot using display bearing coordinates."""
+
+    plot = _PolarPlotWidget()
+    style_plot(plot)
+    plot.setClipToView(False)
+    plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    plot.setAspectLocked(True, ratio=1.0)
+    plot.hideAxis("left")
+    plot.hideAxis("bottom")
+    plot.getPlotItem().getViewBox().setDefaultPadding(0.0)
+    _apply_polar_view_range(plot)
+    plot.showGrid(x=False, y=False)
+    _add_polar_grid(plot)
+
+    curve = plot.plot(pen=pg.mkPen(DOA_COLOR, width=2.0))
+    marker = plot.plot(pen=pg.mkPen(WARNING, width=2.0))
+    return plot, curve, marker
+
+
+def build_lcmv_response_plot(
+    *,
+    doa_min_deg: float,
+    doa_max_deg: float,
+) -> tuple[pg.PlotWidget, pg.PlotDataItem, pg.InfiniteLine]:
+    """Build the LCMV angular response plot using display bearing coordinates."""
+    plot, curve, marker = build_azimuth_response_plot(
+        bottom_label="DoA bearing (deg)",
+        left_label="Ideal steering-vector model response dB",
         response_color=DOA_COLOR,
-        y_range=DOA_Y_RANGE,
+        y_range=(-80.0, 5.0),
         doa_min_deg=doa_min_deg,
         doa_max_deg=doa_max_deg,
     )
-
+    plot.setTitle(
+        "Active LCMV ideal steering-vector model response",
+        color=FG_TEXT,
+    )
+    return plot, curve, marker

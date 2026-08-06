@@ -6,12 +6,14 @@ import re
 
 import numpy as np
 import pytest
+import pyqtgraph as pg
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QGuiApplication
-from PyQt6.QtWidgets import QLabel, QScrollArea, QSizePolicy
+from PyQt6.QtGui import QCloseEvent, QFont, QFontMetrics, QGuiApplication
+from PyQt6.QtWidgets import QLabel, QCheckBox, QScrollArea, QSizePolicy, QSpinBox
 
 from antijamming.config import StreamConfig
 from antijamming.ui.main_window import MainWindow
+from antijamming.ui.specs import PRN_STATE_BAR_HEIGHT, SKYPLOT_MIN_SIZE
 from antijamming.ui.widgets.prn_monitor import (
     PRN_BAR_GAP,
     PRN_BAR_OUTER_MARGIN,
@@ -22,12 +24,15 @@ from antijamming.ui.widgets.prn_monitor import (
 )
 from antijamming.ui.widgets.skyplot import (
     SkyplotMonitor,
+    _skyplot_marker_font_size_for_side,
+    _skyplot_marker_size_for_side,
     _skyplot_view_limit_for_side,
     _skyplot_view_range_for_side,
     _skyplot_xy,
 )
 from antijamming.ui.theme import (
     ALERT,
+    BEIDOU_TRACKING,
     BEIDOU_TRACKING_FIX,
     BG_APP,
     BG_PANEL,
@@ -53,7 +58,8 @@ class DummyWorker(QObject):
         self.started = False
         self.stopped = False
         self.stop_reasons: list[str] = []
-        self.jammer_detection_enabled = False
+        self.expected_sources = 1
+        self.lcmv_test_enabled = False
 
     def start(self) -> None:
         self.started = True
@@ -64,11 +70,13 @@ class DummyWorker(QObject):
         self.stop_reasons.append(reason)
         self.status.emit("USRP stream stopped")
 
-    def set_jammer_detection_enabled(self, enabled: bool) -> None:
-        self.jammer_detection_enabled = bool(enabled)
-        self.status.emit(
-            "Jammer detection enabled" if enabled else "Jammer detection disabled"
-        )
+    def set_expected_sources(self, count: int) -> None:
+        self.expected_sources = int(count)
+        self.status.emit(f"MUSIC sources: {int(count)}")
+
+    def set_lcmv_test_enabled(self, enabled: bool) -> None:
+        self.lcmv_test_enabled = bool(enabled)
+        self.status.emit(f"LCMV Test Nulling: {'ON' if enabled else 'OFF'}")
 
 
 class SlowFinishWorker(DummyWorker):
@@ -155,7 +163,8 @@ def test_skyplot_coordinate_mapping_and_static_labels(qtbot) -> None:
         assert rect.height() / 2.0 == pytest.approx(radius)
 
 
-def test_skyplot_view_range_tightens_as_plot_gets_larger() -> None:
+def test_skyplot_view_range_tightens_as_plot_gets_larger(qtbot) -> None:
+    del qtbot
     compact = _skyplot_view_range_for_side(112)
     large = _skyplot_view_range_for_side(640)
     compact_limit = _skyplot_view_limit_for_side(112)
@@ -180,6 +189,85 @@ def test_skyplot_refresh_layout_uses_window_scaled_size(qtbot) -> None:
     assert skyplot.plot_widget.height() == 640
     limit = _skyplot_view_limit_for_side(640)
     assert skyplot._view_range == pytest.approx((-limit, limit, -limit, limit))
+
+
+@pytest.mark.parametrize(
+    "side_px",
+    (
+        SKYPLOT_MIN_SIZE,
+        SKYPLOT_MIN_SIZE * 2,
+        SKYPLOT_MIN_SIZE * 3,
+    ),
+)
+def test_skyplot_static_labels_fit_inside_viewbox(qtbot, side_px: int) -> None:
+    skyplot = SkyplotMonitor()
+    qtbot.addWidget(skyplot)
+    skyplot.set_plot_side(side_px)
+    skyplot.update_snapshot(
+        [
+            {"prn": 5, "state": "tracking", "az_deg": 0.0, "el_deg": 0.0},
+        ]
+    )
+    skyplot.show()
+    qtbot.waitUntil(
+        lambda: all(
+            skyplot.plot_widget.getPlotItem()
+            .getViewBox()
+            .sceneBoundingRect()
+            .contains(item.mapRectToScene(item.boundingRect()))
+            for item in skyplot._static_label_items
+        ),
+        timeout=1000,
+    )
+
+    view_box = skyplot.plot_widget.getPlotItem().getViewBox()
+    scene_rect = view_box.sceneBoundingRect()
+    limit = _skyplot_view_limit_for_side(side_px)
+    assert view_box.viewRange()[0] == pytest.approx([-limit, limit])
+    assert all(
+        scene_rect.contains(item.mapRectToScene(item.boundingRect()))
+        for item in skyplot._static_label_items
+    )
+
+
+def test_skyplot_marker_size_and_text_follow_plot_size(qtbot) -> None:
+    compact_side = SKYPLOT_MIN_SIZE
+    large_side = SKYPLOT_MIN_SIZE * 3
+
+    assert _skyplot_marker_size_for_side(compact_side) < _skyplot_marker_size_for_side(large_side)
+    assert _skyplot_marker_font_size_for_side(compact_side) < _skyplot_marker_font_size_for_side(large_side)
+    compact_horizon_px = compact_side / _skyplot_view_limit_for_side(compact_side)
+    large_horizon_px = large_side / _skyplot_view_limit_for_side(large_side)
+    compact_marker_ratio = _skyplot_marker_size_for_side(compact_side) / compact_horizon_px
+    large_marker_ratio = _skyplot_marker_size_for_side(large_side) / large_horizon_px
+    assert compact_marker_ratio >= large_marker_ratio
+    assert large_marker_ratio >= 0.11
+    for side in (compact_side, large_side):
+        font = QFont()
+        font.setPointSize(_skyplot_marker_font_size_for_side(side))
+        font.setBold(True)
+        metrics = QFontMetrics(font)
+        assert _skyplot_marker_size_for_side(side) > metrics.horizontalAdvance("G05")
+        assert _skyplot_marker_size_for_side(side) > metrics.height()
+
+    skyplot = SkyplotMonitor()
+    qtbot.addWidget(skyplot)
+    skyplot.set_plot_side(compact_side)
+    skyplot.update_snapshot(
+        [
+            {"prn": 5, "state": "tracking", "az_deg": 45.0, "el_deg": 50.0},
+        ]
+    )
+
+    marker = skyplot._marker_items[0]
+    label = skyplot._marker_label_items[0]
+    assert marker.opts["size"] == pytest.approx(_skyplot_marker_size_for_side(compact_side))
+    assert label.textItem.font().pointSize() == _skyplot_marker_font_size_for_side(compact_side)
+
+    skyplot.set_plot_side(large_side)
+
+    assert marker.opts["size"] == pytest.approx(_skyplot_marker_size_for_side(large_side))
+    assert label.textItem.font().pointSize() == _skyplot_marker_font_size_for_side(large_side)
 
 
 def test_skyplot_skips_missing_geometry_and_tracks_unplaced_prns(qtbot) -> None:
@@ -251,6 +339,13 @@ def test_prn_chart_labels_bars_with_cno_and_axis_with_satellites(qtbot) -> None:
     monitor.update_snapshot(
         [
             {
+                "prn": 12,
+                "constellation": "glonass",
+                "state": "tracking",
+                "cno_db_hz": 36.7,
+                "cno_stable": True,
+            },
+            {
                 "prn": 5,
                 "state": "tracking",
                 "cno_db_hz": 42.4,
@@ -267,25 +362,28 @@ def test_prn_chart_labels_bars_with_cno_and_axis_with_satellites(qtbot) -> None:
         ]
     )
 
-    assert monitor._displayed_prns == [5, 7]
-    assert monitor._x_tick_labels == ["G05", "C07"]
+    assert monitor._displayed_prns == [5, 7, 12]
+    assert monitor._x_tick_labels == ["G05", "C07", "R12"]
     assert [label.toPlainText() for label in monitor._label_items] == [
         "42.4",
         "38.1",
+        "36.7",
     ]
-    assert monitor._bar_colors == [GPS_TRACKING, BEIDOU_TRACKING_FIX]
+    assert monitor._bar_colors == [GPS_TRACKING, BEIDOU_TRACKING_FIX, GLONASS_TRACKING]
     assert monitor._plot.getPlotItem().getAxis("bottom").labelText == ""
     assert [(label.anchor.x(), label.anchor.y()) for label in monitor._label_items] == [
+        (0.5, 1.25),
         (0.5, 1.25),
         (0.5, 1.25),
     ]
     assert [label.color.name().upper() for label in monitor._label_items] == [
         FG_TEXT.upper(),
         FG_TEXT.upper(),
+        FG_TEXT.upper(),
     ]
 
 
-def test_prn_chart_does_not_treat_observable_validity_as_cno_stability(qtbot) -> None:
+def test_prn_chart_renders_tracked_prn_without_treating_it_as_stable(qtbot) -> None:
     monitor = PocketPrnMonitor()
     qtbot.addWidget(monitor)
 
@@ -300,8 +398,10 @@ def test_prn_chart_does_not_treat_observable_validity_as_cno_stability(qtbot) ->
         ]
     )
 
-    assert monitor._displayed_prns == []
+    assert monitor._displayed_prns == [9]
     assert monitor._unstable_tracking_prns == [9]
+    assert monitor._bar_heights == [43.25]
+    assert [label.toPlainText() for label in monitor._label_items] == ["43.2"]
 
 
 def test_gui_single_run_button_toggles_start_stop(qtbot) -> None:
@@ -317,8 +417,11 @@ def test_gui_single_run_button_toggles_start_stop(qtbot) -> None:
     assert not hasattr(window, "_gnss_feed_status_label")
     assert not hasattr(window, "_tabs")
     assert not hasattr(window, "_main_scroll")
-    assert window.centralWidget().findChildren(QScrollArea) == []
-    assert _plain_text(window._output_path_label) == "Output: GNSS IQ -> GNSS-SDR"
+    scroll_areas = window.centralWidget().findChildren(QScrollArea)
+    assert [scroll.objectName() for scroll in scroll_areas] == ["antijamScrollArea"]
+    assert scroll_areas[0].verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+    assert scroll_areas[0].horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert _plain_text(window._output_path_label) == "Output: Uniform Array IQ -> GNSS-SDR"
     assert _plain_text(window._system_health_label) == "System health: Idle"
 
     window._run_btn.click()
@@ -423,13 +526,13 @@ def test_gui_coalesces_live_metrics_to_latest_refresh(qtbot) -> None:
     assert window._metrics_coalesced_drop_count == 1
 
 
-def test_gui_metrics_timer_follows_configured_ui_interval(qtbot) -> None:
+def test_gui_metrics_timer_clamps_aggressive_ui_interval(qtbot) -> None:
     worker = DummyWorker()
     cfg = StreamConfig(ui_update_interval_s=0.05)
     window = MainWindow(cfg, worker)  # type: ignore[arg-type]
     qtbot.addWidget(window)
 
-    assert window._metrics_timer.interval() == 50
+    assert window._metrics_timer.interval() == 100
 
 
 def test_gnss_operator_widgets_have_independent_display_throttles(qtbot, monkeypatch) -> None:
@@ -449,11 +552,12 @@ def test_gnss_operator_widgets_have_independent_display_throttles(qtbot, monkeyp
         lambda: now,
     )
 
-    def metrics(prn: int, cno: float, az_deg: float) -> dict[str, object]:
+    def metrics(prn: int, cno: float, az_deg: float, receiver_time_s: int) -> dict[str, object]:
         return {
             "gnss_snapshot": {
                 "pvt_output_seen": True,
                 "pvt_current": False,
+                "receiver_time_s": receiver_time_s,
                 "prns": [
                     {
                         "prn": prn,
@@ -475,28 +579,32 @@ def test_gnss_operator_widgets_have_independent_display_throttles(qtbot, monkeyp
             }
         }
 
-    window._refresh_gnss_monitors(metrics(5, 41.0, 20.0))
+    window._refresh_gnss_monitors(metrics(5, 41.0, 20.0, 101))
     assert window._prn_monitor._displayed_prns == [5]
     assert window._prn_monitor._bar_heights == [41.0]
     assert window._skyplot_monitor._plotted_prns == [5]
+    assert _plain_text(window._receiver_time_label) == "Time: 00:01:41"
 
     now = 10.1
-    window._refresh_gnss_monitors(metrics(5, 35.0, 80.0))
+    window._refresh_gnss_monitors(metrics(5, 35.0, 80.0, 102))
     assert window._prn_monitor._displayed_prns == [5]
     assert window._prn_monitor._bar_heights == [41.0]
     assert window._skyplot_monitor._plotted_prns == [5]
+    assert _plain_text(window._receiver_time_label) == "Time: 00:01:41"
 
     now = 10.25
-    window._refresh_gnss_monitors(metrics(9, 35.0, 80.0))
+    window._refresh_gnss_monitors(metrics(9, 35.0, 80.0, 103))
     assert window._prn_monitor._displayed_prns == [5]
     assert window._prn_monitor._bar_heights == [41.0]
     assert window._skyplot_monitor._plotted_prns == [9]
+    assert _plain_text(window._receiver_time_label) == "Time: 00:01:43"
 
     now = 10.55
-    window._refresh_gnss_monitors(metrics(5, 35.0, 80.0))
+    window._refresh_gnss_monitors(metrics(5, 35.0, 80.0, 104))
     assert window._prn_monitor._displayed_prns == [5]
     assert window._prn_monitor._bar_heights == [35.0]
     assert window._skyplot_monitor._plotted_prns == [5]
+    assert _plain_text(window._receiver_time_label) == "Time: 00:01:44"
 
 
 def test_gui_logs_ui_health_heartbeat(qtbot) -> None:
@@ -549,13 +657,13 @@ def test_gui_shows_output_path_and_system_feed_info(qtbot) -> None:
     assert not hasattr(window, "_gnss_source_combo")
     assert not hasattr(window, "_gnss_source_label")
     assert not hasattr(window, "_doa_angle_combo")
-    assert window._jammer_detection_checkbox.isChecked() is False
-    assert _plain_text(window._output_path_label) == "Output: GNSS IQ -> GNSS-SDR"
+    assert not hasattr(window, "_jammer_detection_checkbox")
+    assert _plain_text(window._output_path_label) == "Output: Uniform Array IQ -> GNSS-SDR"
     assert not _is_descendant(window._output_path_label, window._main_view)
     assert not _is_descendant(window._output_path_label, window._receiver_card)
     assert "GNSS feed:" not in _plain_text(window._system_info_label)
     assert "Input feed:" not in _plain_text(window._system_info_label)
-    assert "GNSS-SDR handoff: GNSS Uniform Array IQ" in (
+    assert "GNSS-SDR handoff: Uniform Array IQ" in (
         _plain_text(window._system_info_label)
     )
 
@@ -572,37 +680,63 @@ def test_gui_has_fixed_uniform_gnss_handoff(qtbot) -> None:
 
     assert not hasattr(window, "_gnss_source_combo")
     assert not hasattr(window, "_gnss_source_label")
-    assert _plain_text(window._jammer_chip) == "Idle"
-    assert _plain_text(window._jammer_state_label) == "Jammer status: Idle"
-    assert "GNSS combiner: Uniform array sum" in _plain_text(window._system_info_label)
-    assert "GNSS-SDR handoff: GNSS Uniform Array IQ" in _plain_text(
+    assert "MUSIC sources:" in _plain_text(window._system_info_label)
+    assert "GNSS-SDR handoff: Uniform Array IQ" in _plain_text(
         window._system_info_label
     )
 
     window._refresh_system_info()
-    assert "GNSS combiner: Uniform array sum" in _plain_text(window._system_info_label)
-    assert "GNSS-SDR handoff: GNSS Uniform Array IQ" in _plain_text(
+    assert "MUSIC sources:" in _plain_text(window._system_info_label)
+    assert "GNSS-SDR handoff: Uniform Array IQ" in _plain_text(
         window._system_info_label
     )
 
 
-def test_gui_jammer_detection_toggle_is_opt_in(qtbot) -> None:
-    cfg = StreamConfig()
+def test_gui_expected_sources_control_updates_runtime(qtbot) -> None:
+    cfg = StreamConfig(expected_sources=1)
     worker = DummyWorker()
     window = MainWindow(cfg, worker)  # type: ignore[arg-type]
     qtbot.addWidget(window)
     window.show()
 
-    assert cfg.jammer_detection_enabled is False
-    assert worker.jammer_detection_enabled is False
-    assert window._jammer_detection_checkbox.isChecked() is False
+    assert isinstance(window._expected_sources_spin, QSpinBox)
+    assert window._expected_sources_spin.minimum() == 1
+    assert window._expected_sources_spin.maximum() == len(cfg.channels) - 1
+    assert _is_descendant(window._expected_sources_control, window._antijam_tab)
+    assert not _is_descendant(window._expected_sources_control, window._receiver_card)
 
-    window._jammer_detection_checkbox.setChecked(True)
+    window._expected_sources_spin.setValue(3)
 
-    assert cfg.jammer_detection_enabled is True
-    assert worker.jammer_detection_enabled is True
-    assert _is_descendant(window._jammer_detection_checkbox, window._receiver_card)
-    assert not _is_descendant(window._jammer_detection_checkbox, window._operator_header)
+    assert cfg.expected_sources == 3
+    assert worker.expected_sources == 3
+
+
+def test_gui_lcmv_test_toggle_defaults_off_and_updates_runtime(qtbot) -> None:
+    cfg = StreamConfig(lcmv_test_enabled=False)
+    worker = DummyWorker()
+    window = MainWindow(cfg, worker)  # type: ignore[arg-type]
+    qtbot.addWidget(window)
+    window.show()
+
+    assert isinstance(window._lcmv_test_checkbox, QCheckBox)
+    assert window._lcmv_test_checkbox.isChecked() is False
+    assert cfg.lcmv_test_enabled is False
+    assert _is_descendant(window._lcmv_test_control, window._antijam_tab)
+    assert _plain_text(window._lcmv_test_status_label) == (
+        "LCMV Test Nulling: OFF: Uniform beamformer"
+    )
+    assert _plain_text(window._lcmv_null_bearing_label) == (
+        "Null bearing / MUSIC peak: --"
+    )
+
+    window._lcmv_test_checkbox.setChecked(True)
+
+    assert cfg.lcmv_test_enabled is True
+    assert worker.lcmv_test_enabled is True
+    assert "LCMV Test IQ" in _plain_text(window._system_info_label)
+    assert _plain_text(window._lcmv_test_status_label) == (
+        "LCMV Test Nulling: FALLBACK: Uniform fallback, waiting for music peak"
+    )
 
 
 def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
@@ -617,23 +751,26 @@ def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     assert window._gnss_chip.isHidden() is True
     assert _is_descendant(window._operator_title_label, window._operator_header)
     assert _is_descendant(window._run_btn, window._operator_header)
-    assert not _is_descendant(window._jammer_detection_checkbox, window._operator_header)
+    assert not hasattr(window, "_jammer_detection_checkbox")
     assert not _is_descendant(window._run_btn, window._operator_tabs)
     assert window._operator_tabs.tabText(0) == "Receiver"
     assert window._operator_tabs.tabText(1) == "Anti-Jam"
     assert _is_descendant(window._receiver_card, window._receiver_tab)
     assert not hasattr(window, "_receiver_status_card")
-    assert _is_descendant(window._jammer_state_label, window._receiver_card)
+    assert not _is_descendant(window._doa_status_label, window._receiver_card)
+    assert _is_descendant(window._doa_status_label, window._antijam_tab)
     assert _is_descendant(window._position_status_label, window._receiver_card)
-    assert not _is_descendant(window._jammer_state_label, window._antijam_tab)
     assert _is_descendant(window._skyplot_monitor, window._receiver_card)
+    receiver_status_layout = window._receiver_status_section.layout()
+    assert receiver_status_layout.itemAt(0).spacerItem() is not None
+    assert (
+        receiver_status_layout.itemAt(receiver_status_layout.count() - 1).spacerItem()
+        is not None
+    )
     assert not _is_descendant(window._receiver_summary_label, window._receiver_card)
     assert not hasattr(window, "_stream_card")
     assert not hasattr(window, "_skyplot_card")
     assert not _is_descendant(window._stream_summary_label, window._main_view)
-    assert not _is_descendant(window._jammer_chip, window._operator_tabs)
-    assert not hasattr(window, "_null_chip")
-    assert not hasattr(window, "_suppression_chip")
     assert _plain_text(window._fix_chip) == "NO FIX"
     assert _plain_text(window._accuracy_chip) == "--"
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
@@ -648,8 +785,9 @@ def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     assert "Fix:" not in _plain_text(window._receiver_summary_label)
     operator_text = "\n".join(_plain_text(label) for label in window._main_view.findChildren(QLabel))
     all_visible_text = "\n".join(_plain_text(label) for label in window.findChildren(QLabel))
-    assert "Receiver Overview" in operator_text
+    assert "Receiver Overview" not in operator_text
     assert "Satellite Sky View" in operator_text
+    assert "Legend:" not in operator_text
     assert "Receiver Status" not in operator_text
     assert "Anti-Jam Status" not in operator_text
     assert "Anti-Jam" in operator_text
@@ -678,16 +816,19 @@ def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     assert "horizontal 2D:" not in operator_text
     assert "3D displacement:" not in operator_text
     assert "C/N0 used for PVT:" not in operator_text
-    assert "Jammer status:" in operator_text
-    assert "Direction candidate:" in operator_text
-    assert "Power rise:" in operator_text
+    assert "DoA:" in operator_text
+    assert "MUSIC sources:" in operator_text
     assert "Detector confidence:" not in operator_text
-    assert "Raw IQ power:" in operator_text
+    assert "Jammer status:" not in operator_text
+    assert "Direction candidate:" not in operator_text
+    assert "Power rise:" not in operator_text
+    assert "Raw IQ power:" not in operator_text
     assert "RX clipping:" in operator_text
     assert "IQ peak:" in operator_text
     assert "IQ RMS:" in operator_text
     assert "Near full scale:" in operator_text
-    assert "Nulling:" not in operator_text
+    assert "LCMV Test Nulling:" in operator_text
+    assert "Nulling strongest MUSIC peak" not in operator_text
     assert "System health:" in operator_text
     assert "Reason:" not in operator_text
     assert "PVT 6" not in operator_text
@@ -699,7 +840,7 @@ def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     assert not hasattr(window, "_accuracy_summary_label")
     assert _is_descendant(window._status_chip, window._operator_header)
     assert ALERT in window._position_status_label.text()
-    assert WARNING in window._jammer_state_label.text()
+    assert INFO in window._doa_status_label.text()
 
 
 def test_receiver_tab_uses_one_content_height_overview_and_expanding_prn_card(
@@ -725,6 +866,15 @@ def test_receiver_tab_uses_one_content_height_overview_and_expanding_prn_card(
         window._prn_card.sizePolicy().verticalPolicy()
         == QSizePolicy.Policy.Expanding
     )
+    assert (
+        window._antijam_tab.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert (
+        window._algorithm_plots_container.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert window._doa_polar_db_tile.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Expanding
     assert window._receiver_card.maximumHeight() < 16777215
     assert window._prn_card.maximumHeight() == 16777215
     receiver_layout = window._receiver_tab.layout()
@@ -877,21 +1027,49 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     assert window._skyplot_monitor.isHidden() is False
     assert _is_descendant(window._skyplot_monitor, window._main_view)
     assert _is_descendant(window._prn_monitor, window._main_view)
-    assert _is_descendant(window._doa_plot, window._main_view)
+    assert not hasattr(window, "_doa_plot")
+    assert not hasattr(window, "_doa_curve")
+    assert not hasattr(window, "_doa_marker")
     assert not hasattr(window, "_doa_raw_plot")
+    assert not hasattr(window, "_doa_raw_curve")
+    assert not hasattr(window, "_doa_raw_marker")
+    assert not hasattr(window, "_doa_raw_tile")
+    assert not hasattr(window, "_doa_polar_plot")
+    assert not hasattr(window, "_doa_polar_curve")
+    assert not hasattr(window, "_doa_polar_marker")
+    assert not hasattr(window, "_doa_polar_tile")
+    assert _is_descendant(window._doa_polar_db_plot, window._main_view)
     assert not hasattr(window, "_doa_compass_plot")
     assert not hasattr(window, "_rf_spectrum_plot")
     assert not hasattr(window, "_gnss_quality_plot")
     assert _is_descendant(window._skyplot_monitor, window._receiver_card)
-    assert _is_descendant(window._jammer_state_label, window._receiver_card)
+    assert not _is_descendant(window._doa_status_label, window._receiver_card)
+    assert _is_descendant(window._doa_status_label, window._antijam_tab)
     assert _is_descendant(window._position_status_label, window._receiver_card)
-    assert not _is_descendant(window._jammer_state_label, window._antijam_tab)
     main_layout = window._main_view.layout()
     assert main_layout is not None
     assert main_layout.indexOf(window._operator_header) >= 0
     assert main_layout.indexOf(window._operator_tabs) >= 0
     assert main_layout.indexOf(window._operator_header) < main_layout.indexOf(window._operator_tabs)
     assert _is_descendant(window._algorithm_plots_container, window._antijam_tab)
+    assert _is_descendant(window._antijam_status_card, window._antijam_tab)
+    assert _is_descendant(window._lcmv_response_container, window._antijam_tab)
+    assert _is_descendant(window._lcmv_response_container, window._algorithm_plots_container)
+    assert _is_descendant(window._doa_polar_db_tile, window._algorithm_plots_container)
+    assert _is_descendant(window._lcmv_response_plot, window._lcmv_response_container)
+    assert not hasattr(window, "_lcmv_rms_plot")
+    assert not hasattr(window, "_lcmv_rms_bars")
+    assert _is_descendant(window._doa_polar_db_plot, window._antijam_tab)
+    polar_text_items = [
+        item.toPlainText()
+        for item in window._doa_polar_db_plot.getPlotItem().items
+        if isinstance(item, pg.TextItem)
+    ]
+    for label in ("0°", "90°", "180°", "270°", "330°"):
+        assert label in polar_text_items
+    for label in ("0.25", "0.5", "0.75"):
+        assert label not in polar_text_items
+    window._operator_tabs.setCurrentIndex(0)
     assert _is_descendant(window._prn_card, window._receiver_tab)
     assert not _is_descendant(window._prn_card, window._antijam_tab)
     assert not _is_descendant(window._prn_card, window._receiver_card)
@@ -958,6 +1136,7 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
                         "cno_peak_to_peak_db": 0.5,
                         "cno_stable": False,
                         "cno_unstable_reason": "awaiting_nav",
+                        "cno_history_stable": True,
                     },
                 ],
                 "sky_prns": [
@@ -986,7 +1165,7 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
         }
     )
 
-    assert window._prn_monitor._displayed_prns == [5, 9]
+    assert window._prn_monitor._displayed_prns == [5, 9, 12, 13, 14]
     assert window._prn_monitor._pending_tracking_prns == [12, 14]
     assert window._prn_monitor._pending_tracking_reasons == {
         12: "too_few_samples",
@@ -999,17 +1178,23 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
         [
             _bar_position_for_index(0),
             _bar_position_for_index(1),
+            _bar_position_for_index(2),
+            _bar_position_for_index(3),
+            _bar_position_for_index(4),
         ]
     )
-    assert window._prn_monitor._bar_heights == [42.4, 36.4]
+    assert window._prn_monitor._bar_heights == [42.4, 36.4, 34.0, 34.5, 39.0]
     assert window._prn_monitor._bar_colors == [
         GPS_TRACKING,
         GPS_TRACKING_FIX,
+        GPS_TRACKING,
+        GPS_TRACKING,
+        GPS_TRACKING,
     ]
     assert _plain_text(window._stable_prns_chip) == "2"
     assert _plain_text(window._used_in_pvt_chip) == "1"
     assert _plain_text(window._position_status_label) == "PVT fix: DEGRADED"
-    assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 2"
+    assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 5"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 1 (G09)"
     assert _plain_text(window._position_error_label) == "PVT accuracy: --"
     assert window._prn_monitor._bar_width == pytest.approx(PRN_SINGLE_BAR_WIDTH)
@@ -1056,7 +1241,7 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     assert [
         brush.color().alpha()
         for brush in window._prn_monitor._bar_item.opts["brushes"]
-    ] == [255, 255]
+    ] == [255, 255, 255, 255, 255]
     assert all(
         brush.style() == Qt.BrushStyle.SolidPattern
         for brush in window._prn_monitor._bar_item.opts["brushes"]
@@ -1064,11 +1249,14 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     assert [
         pen.color().alpha()
         for pen in window._prn_monitor._bar_item.opts["pens"]
-    ] == [255, 255]
-    assert window._prn_monitor._x_tick_labels == ["G05", "G09"]
+    ] == [255, 255, 255, 255, 255]
+    assert window._prn_monitor._x_tick_labels == ["G05", "G09", "G12", "G13", "G14"]
     assert [label.toPlainText() for label in window._prn_monitor._label_items] == [
         "42.4",
         "36.4",
+        "34.0",
+        "34.5",
+        "39.0",
     ]
     assert all(
         label.zValue() > window._prn_monitor._bar_item.zValue()
@@ -1160,12 +1348,12 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
         }
     )
 
-    assert window._prn_monitor._displayed_prns == []
+    assert window._prn_monitor._displayed_prns == [8]
     assert window._prn_monitor._pending_tracking_prns == [8]
     assert window._prn_monitor._pending_tracking_reasons == {8: "missing_cno"}
-    assert window._prn_monitor._bar_positions == []
-    assert window._prn_monitor._bar_heights == []
-    assert [label.toPlainText() for label in window._prn_monitor._label_items] == []
+    assert window._prn_monitor._bar_positions == [_bar_position_for_index(0)]
+    assert window._prn_monitor._bar_heights == [PRN_STATE_BAR_HEIGHT]
+    assert [label.toPlainText() for label in window._prn_monitor._label_items] == ["--"]
     assert window._skyplot_monitor._plotted_prns == []
 
     window._on_data_ready(
@@ -1177,6 +1365,8 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
         }
     )
 
+    # Summary-only PRN lists are not chart entries; the chart uses per-PRN
+    # GNSS-SDR tracking records so it can label and size each bar honestly.
     assert window._prn_monitor._displayed_prns == []
     assert window._prn_monitor._bar_positions == []
     assert [label.toPlainText() for label in window._prn_monitor._label_items] == []
@@ -1301,15 +1491,57 @@ def test_receiver_projection_prevents_skyplot_tracking_contradictions(qtbot) -> 
         }
     )
 
-    assert window._prn_monitor._displayed_prns == []
+    # The chart shows the actual tracking state; the skyplot still excludes the
+    # satellite because it lacks stable, fresh navigation/PVT geometry.
+    assert window._prn_monitor._displayed_prns == [12]
     assert window._skyplot_monitor._plotted_prns == []
     assert window._stable_prns == []
     assert window._current_used_in_pvt_prns == []
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
-    assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 0"
+    assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 1"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 0"
     assert _plain_text(window._position_error_label) == "PVT accuracy: --"
     assert _plain_text(window._accuracy_chip) == "--"
+
+
+def test_prn_chart_keeps_gps_and_beidou_with_same_prn_number(qtbot) -> None:
+    worker = DummyWorker()
+    window = MainWindow(StreamConfig(), worker)  # type: ignore[arg-type]
+    qtbot.addWidget(window)
+    window.show()
+
+    window._on_data_ready(
+        {
+            "gnss_snapshot": {
+                "pvt_output_seen": True,
+                "pvt_current": True,
+                "prns": [
+                    {
+                        "prn": 5,
+                        "state": "tracking",
+                        "satellite_id": "G05",
+                        "cno_db_hz": 41.2,
+                        "cno_stable": True,
+                    },
+                    {
+                        "prn": 5,
+                        "constellation": "beidou",
+                        "satellite_id": "C05",
+                        "state": "tracking",
+                        "cno_db_hz": 38.7,
+                        "cno_stable": True,
+                    },
+                ],
+                "sky_prns": [],
+            }
+        }
+    )
+
+    assert window._prn_monitor._x_tick_labels == ["G05", "C05"]
+    assert window._prn_monitor._bar_heights == [41.2, 38.7]
+    assert window._prn_monitor._bar_colors == [GPS_TRACKING, BEIDOU_TRACKING]
+    assert len(window._prn_monitor._displayed_prns) == 2
+    assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 2"
 
 
 def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) -> None:
@@ -1358,14 +1590,14 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
         }
     )
 
-    assert window._prn_monitor._displayed_prns == [5]
-    assert window._prn_monitor._bar_colors == [GPS_TRACKING]
+    assert window._prn_monitor._displayed_prns == [5, 9]
+    assert window._prn_monitor._bar_colors == [GPS_TRACKING, GPS_TRACKING]
     assert window._skyplot_monitor._plotted_prns == [5]
     assert window._stable_prns == [5]
     assert window._current_used_in_pvt_prns == []
     assert window._raw_used_in_fix_prns == [9]
     assert _plain_text(window._position_status_label) == "PVT fix: 3D Fix"
-    assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 1"
+    assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 2"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 1 (G09)"
     assert _plain_text(window._position_error_label) == "PVT accuracy: 1.40 m"
     tracking_marker = window._skyplot_monitor._marker_items[0]
@@ -1408,11 +1640,11 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
         }
     )
 
-    assert window._prn_monitor._displayed_prns == [5]
+    assert window._prn_monitor._displayed_prns == [5, 9]
     assert window._skyplot_monitor._plotted_prns == [5]
     assert window._current_used_in_pvt_prns == []
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
-    assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 1"
+    assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 2"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 0"
     assert _plain_text(window._position_error_label) == "PVT accuracy: --"
     assert window._skyplot_monitor._marker_items[0].opts["brush"].color().name().upper() == (
@@ -1540,7 +1772,7 @@ def test_receiver_projection_holds_stable_prn_during_transient_tracking_monitor_
     assert window._current_used_in_pvt_prns == [9]
 
 
-def test_receiver_projection_expires_non_pvt_prn_display_hold(qtbot) -> None:
+def test_receiver_projection_expires_hold_but_keeps_tracked_placeholder(qtbot) -> None:
     worker = DummyWorker()
     window = MainWindow(StreamConfig(), worker)  # type: ignore[arg-type]
     qtbot.addWidget(window)
@@ -1589,7 +1821,10 @@ def test_receiver_projection_expires_non_pvt_prn_display_hold(qtbot) -> None:
 
     window._on_data_ready(transient_gap_snapshot)
 
-    assert window._prn_monitor._displayed_prns == []
+    assert window._prn_monitor._displayed_prns == [9]
+    assert window._prn_monitor._pending_tracking_prns == [9]
+    assert window._prn_monitor._bar_heights == [PRN_STATE_BAR_HEIGHT]
+    assert [label.toPlainText() for label in window._prn_monitor._label_items] == ["--"]
     assert window._stable_prns == []
     assert window._current_used_in_pvt_prns == []
 
@@ -1854,20 +2089,29 @@ def test_phase_calibration_tab_has_no_calibration_selector(qtbot) -> None:
     assert not hasattr(window, "_calibration_profile_combo")
 
 
-def test_gui_shows_doa_and_jammer_monitor(qtbot) -> None:
+def test_gui_shows_doa_and_rx_health(qtbot) -> None:
     cfg = StreamConfig()
     worker = DummyWorker()
     window = MainWindow(cfg, worker)  # type: ignore[arg-type]
     qtbot.addWidget(window)
     window.show()
+    window._operator_tabs.setCurrentIndex(1)
 
     scan = np.linspace(cfg.doa_min_deg, cfg.doa_max_deg, cfg.doa_points)
-    normalized_doa = np.exp(-0.5 * ((scan - 88.75) / 12.0) ** 2)
+    raw_doa = 12.5 * np.exp(-0.5 * ((scan - 88.75) / 12.0) ** 2)
+    lcmv_response_db = -20.0 * np.exp(-0.5 * ((scan - 88.75) / 8.0) ** 2)
+    expected_bearing = (90.0 - 88.75) % 360.0
 
     window._on_data_ready(
         {
             "doa_deg": 88.75,
-            "doa_spectrum": normalized_doa,
+            "doa_raw_spectrum": raw_doa,
+            "lcmv_test": {
+                "enabled": True,
+                "mode": "on",
+                "null_bearing_deg": expected_bearing,
+                "lcmv_response_db": lcmv_response_db,
+            },
             "rx_signal_health": {
                 "assessed": True,
                 "clipping_suspected": False,
@@ -1879,46 +2123,71 @@ def test_gui_shows_doa_and_jammer_monitor(qtbot) -> None:
                 "threshold_component": 0.98,
                 "threshold_pct": 0.1,
             },
-            "jammer": {
-                "state": "detected",
-                "detected": True,
-                "input_power_db": -63.0,
-                "min_power_db": -120.0,
-                "power_rise_db": 12.0,
-                "power_rise_threshold_db": 8.0,
-                "doa_deg": 88.75,
-                "reason": "Raw IQ power rise 12.0 dB above baseline -75.0 dB",
-            },
             "gnss_snapshot": {},
         }
     )
 
-    assert _plain_text(window._jammer_chip) == "Detected"
-    assert _plain_text(window._jammer_state_label) == "Jammer status: Detected"
-    assert _plain_text(window._jammer_power_label) == "Raw IQ power: -63.0 / -120.0 dB"
-    assert _plain_text(window._jammer_power_rise_label) == "Power rise: 12.0 / 8.0 dB"
+    assert _plain_text(window._doa_status_label) == f"DoA: {expected_bearing:.1f}°"
+    assert _plain_text(window._doa_chip) == f"{expected_bearing:.1f}°"
     assert _plain_text(window._rx_clipping_label) == "RX clipping: OK"
     assert _plain_text(window._rx_peak_label) == "IQ peak: 0.0032 / 0.980 mag 0.0035"
     assert _plain_text(window._rx_rms_label) == "IQ RMS: 0.0007"
     assert _plain_text(window._rx_near_full_scale_label) == "Near full scale: 0.0000 / 0.1000%"
-    expected_bearing = (360.0 - 88.75) % 360.0
-    assert _plain_text(window._jammer_doa_label) == f"Direction candidate: {expected_bearing:.1f}°"
-    assert not hasattr(window, "_jammer_reason_label")
-    assert _plain_text(window._doa_chip) == f"{expected_bearing:.1f}°"
-    assert not hasattr(window, "_doa_raw_curve")
     assert not hasattr(window, "_doa_compass_curve")
+    assert not hasattr(window, "_array_pattern_curve")
+
+    polar_db_x, polar_db_y = window._doa_polar_db_curve.getData()
+    assert polar_db_x is not None and polar_db_y is not None
+    assert len(polar_db_x) == cfg.doa_points + 1
+    assert len(polar_db_y) == cfg.doa_points + 1
+    rel_db = 10.0 * np.log10(np.maximum(raw_doa, 1e-300) / float(np.nanmax(raw_doa)))
+    rel_db_min = float(np.min(rel_db[np.isfinite(rel_db)]))
+    rel_db_max = float(np.max(rel_db[np.isfinite(rel_db)]))
+    expected_db_radius = (rel_db - rel_db_min) / (rel_db_max - rel_db_min)
+    assert np.nanmax(np.hypot(polar_db_x, polar_db_y)) == pytest.approx(
+        float(np.nanmax(expected_db_radius))
+    )
+    polar_db_marker_x, polar_db_marker_y = window._doa_polar_db_marker.getData()
+    assert polar_db_marker_x is not None and polar_db_marker_y is not None
+    assert polar_db_marker_x[-1] == pytest.approx(
+        float(np.nanmax(expected_db_radius)) * np.sin(np.deg2rad(expected_bearing))
+    )
+    assert polar_db_marker_y[-1] == pytest.approx(
+        float(np.nanmax(expected_db_radius)) * np.cos(np.deg2rad(expected_bearing))
+    )
+    lcmv_x, lcmv_y = window._lcmv_response_curve.getData()
+    assert lcmv_x is not None and lcmv_y is not None
+    assert len(lcmv_x) == cfg.doa_points
+    assert len(lcmv_y) == cfg.doa_points
+    bearing_scan, order = window._bearing_axis_for_internal_scan(scan)
+    assert np.allclose(lcmv_x, bearing_scan)
+    assert np.allclose(lcmv_y, lcmv_response_db[order])
+    assert window._lcmv_response_marker.value() == pytest.approx(expected_bearing)
+
+
+def test_gui_displays_current_source_count_estimators(qtbot) -> None:
+    cfg = StreamConfig(expected_sources=1)
+    worker = DummyWorker()
+    window = MainWindow(cfg, worker)  # type: ignore[arg-type]
+    qtbot.addWidget(window)
+    window.show()
 
     window._on_data_ready(
         {
-            "doa_deg": 88.75,
+            "n_sources": 1,
+            "source_estimate_gap": 2.5,
+            "source_effective_rank": 1.42,
             "gnss_snapshot": {},
         }
     )
 
-    assert _plain_text(window._jammer_chip) == "Monitoring"
+    expected = "set 1 | eig-gap 2.5 | eff-rank 1.42"
+    assert _plain_text(window._music_sources_label) == f"MUSIC sources: {expected}"
+    assert f"MUSIC sources: {expected}" in _plain_text(window._system_info_label)
+    assert f"Sources {expected}" in _plain_text(window._antijam_summary_label)
 
 
-def test_gui_displays_internal_doa_as_clockwise_bearing(qtbot) -> None:
+def test_gui_displays_internal_doa_as_top_zero_clockwise_bearing(qtbot) -> None:
     cfg = StreamConfig()
     worker = DummyWorker()
     window = MainWindow(cfg, worker)  # type: ignore[arg-type]
@@ -1929,64 +2198,9 @@ def test_gui_displays_internal_doa_as_clockwise_bearing(qtbot) -> None:
     window._on_data_ready(
         {
             "doa_deg": 88.75,
-            "doa_spectrum": np.ones((cfg.doa_points,), dtype=np.float64),
-            "jammer": {
-                "state": "detected",
-                "detected": True,
-                "doa_deg": 88.75,
-            },
             "gnss_snapshot": {},
         }
     )
 
-    assert _plain_text(window._jammer_doa_label) == "Direction candidate: 271.2°"
-    assert _plain_text(window._doa_chip) == "271.2°"
-
-
-def test_gui_shows_backend_jammer_detection_state(qtbot) -> None:
-    cfg = StreamConfig()
-    worker = DummyWorker()
-    window = MainWindow(cfg, worker)  # type: ignore[arg-type]
-    qtbot.addWidget(window)
-    window.show()
-
-    window._on_data_ready(
-        {
-            "jammer": {"state": "not_detected", "detected": False},
-            "gnss_snapshot": {},
-        }
-    )
-    assert _plain_text(window._jammer_state_label) == "Jammer status: Not detected"
-    assert _plain_text(window._jammer_power_label) == "Raw IQ power: --"
-    assert _plain_text(window._jammer_power_rise_label) == "Power rise: --"
-    assert _plain_text(window._jammer_doa_label) == "Direction candidate: --"
-    assert not hasattr(window, "_jammer_null_label")
-    assert not hasattr(window, "_jammer_suppression_label")
-    assert not hasattr(window, "_jammer_reason_label")
-
-    window._on_data_ready(
-        {
-            "doa_deg": 42.0,
-            "jammer": {
-                "state": "not_detected",
-                "detected": False,
-                "detector_power_db": -82.0,
-                "power_threshold_db": -70.0,
-                "power_rise_db": 2.0,
-                "power_rise_threshold_db": 8.0,
-            },
-            "gnss_snapshot": {},
-        }
-    )
-    assert _plain_text(window._jammer_chip) == "Not detected"
-    assert _plain_text(window._jammer_power_label) == "Raw IQ power: -82.0 / -70.0 dB"
-    assert _plain_text(window._jammer_power_rise_label) == "Power rise: 2.0 / 8.0 dB"
-
-    window._on_data_ready(
-        {
-            "doa_deg": 42.0,
-            "jammer": {"state": "disabled", "detected": False},
-            "gnss_snapshot": {},
-        }
-    )
-    assert _plain_text(window._jammer_chip) == "Detection off"
+    assert _plain_text(window._doa_status_label) == "DoA: 1.2°"
+    assert _plain_text(window._doa_chip) == "1.2°"

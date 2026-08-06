@@ -4,12 +4,24 @@ from __future__ import annotations
 
 import re
 
-from .constants import GPS_L1_CA_FREQ_HZ
+from .constants import (
+    GNSS_INPUT_FILTER_CUTOFF_HZ,
+    GNSS_INPUT_FILTER_STOPBAND_HZ,
+    GNSS_INPUT_FILTER_TRANSITION_WIDTH_HZ,
+    GPS_L1_CA_FREQ_HZ,
+    GPS_L1_CA_PROCESSING_BANDWIDTH_HZ,
+)
+
 
 class ConfigRendererMixin:
     def _render_config(self) -> str:
         template_path = self._cfg.gnss_sdr_config_template.expanduser().resolve()
         template = template_path.read_text(encoding="utf-8")
+        channels_1c_count = max(1, int(self._cfg.gnss_1c_channel_count))
+        channels_in_acquisition = min(
+            channels_1c_count,
+            max(1, int(self._cfg.gnss_channels_in_acquisition)),
+        )
         return template.format(
             acquisition_bit_transition_flag=str(
                 bool(self._cfg.gnss_acquisition_bit_transition_flag)
@@ -25,8 +37,8 @@ class ConfigRendererMixin:
             ),
             acquisition_max_dwells=max(1, int(self._cfg.gnss_acquisition_max_dwells)),
             acquisition_pfa=max(1e-12, float(self._cfg.gnss_acquisition_pfa)),
-            channels_1c_count=max(1, int(self._cfg.gnss_1c_channel_count)),
-            channels_in_acquisition=max(1, int(self._cfg.gnss_channels_in_acquisition)),
+            channels_1c_count=channels_1c_count,
+            channels_in_acquisition=channels_in_acquisition,
             channel_signal_config=self._render_channel_signal_config(),
             fifo_path=self._fifo_path,
             agnss_xml_enable=str(bool(self._cfg.gnss_agnss_xml_enable)).lower(),
@@ -47,7 +59,7 @@ class ConfigRendererMixin:
             ).lower(),
             monitor_udp_port=str(self._cfg.gnss_monitor_udp_port),
             observables_dump_path="./outputs/observables/observables.dat",
-            pvt_dump_prefix="./outputs/pvt/pvt",
+            pvt_dump_prefix="pvt",
             pvt_monitor_client_addresses=str(
                 self._cfg.gnss_pvt_monitor_client_addresses
             ),
@@ -134,7 +146,10 @@ class ConfigRendererMixin:
             return match.group(1).strip() if match else "--"
 
         channels_1c = max(1, int(self._cfg.gnss_1c_channel_count))
-        channels_in_acquisition = max(1, int(self._cfg.gnss_channels_in_acquisition))
+        channels_in_acquisition = min(
+            channels_1c,
+            max(1, int(self._cfg.gnss_channels_in_acquisition)),
+        )
         summary = (
             "GNSS-SDR rendered load: "
             f"channels_1c={channels_1c} "
@@ -159,7 +174,8 @@ class ConfigRendererMixin:
             f"tracking_monitor={value_for('TrackingMonitor.enable_monitor')}:"
             f"{value_for('TrackingMonitor.udp_port')} "
             f"sample_rate_sps={int(self._cfg.sample_rate)} "
-            f"if_bw_hz={float(self._cfg.gnss_sdr_if_bandwidth_hz):.0f}"
+            f"active_signals={','.join(self._active_signal_ids())} "
+            f"input_filter_bw_hz={self.input_filter_bandwidth_hz:.0f}"
         )
         self._log.info("%s", summary)
         self._handoff_log.info("%s", summary)
@@ -171,35 +187,24 @@ class ConfigRendererMixin:
     def _render_signal_conditioner_config(self) -> str:
         sample_rate_hz = max(1.0, float(self._cfg.sample_rate))
         sample_rate_sps = int(round(sample_rate_hz))
-        passband_end, stopband_begin = self._fifo_filter_band_edges(
-            sample_rate_hz,
-            float(self._cfg.gnss_sdr_if_bandwidth_hz),
-        )
+        # Validate that the configured rate can represent the physical GPS L1
+        # pass/stop edges before asking GNU Radio to derive low-pass taps.
+        self.input_filter_bandwidth_hz
         return "\n".join(
             [
                 "SignalConditioner.implementation=Signal_Conditioner",
                 "DataTypeAdapter.implementation=Pass_Through",
                 "DataTypeAdapter.item_type=gr_complex",
-                "InputFilter.implementation=Fir_Filter",
+                "InputFilter.implementation=Freq_Xlating_Fir_Filter",
                 "InputFilter.input_item_type=gr_complex",
                 "InputFilter.output_item_type=gr_complex",
                 "InputFilter.taps_item_type=float",
-                "InputFilter.number_of_taps=11",
-                "InputFilter.number_of_bands=2",
-                "InputFilter.band1_begin=0.0",
-                f"InputFilter.band1_end={passband_end:.6f}",
-                f"InputFilter.band2_begin={stopband_begin:.6f}",
-                "InputFilter.band2_end=1.0",
-                "InputFilter.ampl1_begin=1.0",
-                "InputFilter.ampl1_end=1.0",
-                "InputFilter.ampl2_begin=0.0",
-                "InputFilter.ampl2_end=0.0",
-                "InputFilter.band1_error=1.0",
-                "InputFilter.band2_error=1.0",
-                "InputFilter.filter_type=bandpass",
-                "InputFilter.grid_density=16",
+                "InputFilter.filter_type=lowpass",
+                f"InputFilter.bw={GNSS_INPUT_FILTER_CUTOFF_HZ:.0f}",
+                f"InputFilter.tw={GNSS_INPUT_FILTER_TRANSITION_WIDTH_HZ:.0f}",
                 f"InputFilter.sampling_frequency={sample_rate_sps}",
                 "InputFilter.IF=0",
+                "InputFilter.decimation_factor=1",
                 "InputFilter.dump=false",
                 "InputFilter.dump_filename=./outputs/signal_conditioner/input_filter.dat",
                 "Resampler.implementation=Pass_Through",
@@ -211,20 +216,25 @@ class ConfigRendererMixin:
             ]
         )
 
-    def _fifo_filter_band_edges(
-        self,
-        sample_rate_hz: float,
-        if_bandwidth_hz: float,
-    ) -> tuple[float, float]:
-        if if_bandwidth_hz <= 0.0:
-            return 0.48, 0.52
-        nyquist_hz = 0.5 * max(1.0, sample_rate_hz)
-        passband_end = (0.5 * max(0.0, if_bandwidth_hz)) / nyquist_hz
-        passband_end = max(0.05, min(passband_end, 0.90))
-        stopband_begin = min(0.98, passband_end + 0.10)
-        if stopband_begin <= passband_end:
-            stopband_begin = min(0.99, passband_end + 0.02)
-        return passband_end, stopband_begin
+    def _active_signal_ids(self) -> tuple[str, ...]:
+        signals: list[str] = []
+        if int(self._cfg.gnss_1c_channel_count) > 0:
+            signals.append("1C")
+        if not signals:
+            raise ValueError("GNSS-SDR requires at least one enabled signal")
+        return tuple(signals)
+
+    @property
+    def input_filter_bandwidth_hz(self) -> float:
+        self._active_signal_ids()
+        sample_rate_hz = max(1.0, float(self._cfg.sample_rate))
+        if sample_rate_hz <= GNSS_INPUT_FILTER_STOPBAND_HZ:
+            raise ValueError(
+                f"Configured sample_rate {sample_rate_hz:.0f} Hz cannot place the "
+                f"GPS L1 input-filter stopband at {GNSS_INPUT_FILTER_STOPBAND_HZ:.0f} Hz "
+                "below Nyquist; increase sample_rate"
+            )
+        return GPS_L1_CA_PROCESSING_BANDWIDTH_HZ
 
     def _warn_if_gps_l1_is_outside_capture_band(self) -> None:
         half_span_hz = 0.5 * float(self._cfg.sample_rate)
