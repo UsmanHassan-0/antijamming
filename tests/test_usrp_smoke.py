@@ -17,7 +17,11 @@ from antijamming.radio.usrp import UsrpRxDevice
 def test_usrp_smoke_recv_and_stop() -> None:
     cfg = default_stream_config()
     cfg.usrp_addr = os.environ.get("USRP_ADDR", cfg.usrp_addr)
-    cfg.sample_rate = float(os.environ.get("USRP_TEST_RATE", "2e6"))
+    rate_override = os.environ.get("USRP_TEST_RATE")
+    if rate_override is not None:
+        cfg.sample_rate = float(rate_override)
+        cfg.usrp_rx_bandwidth_hz = cfg.sample_rate
+        cfg.min_sample_rate = cfg.sample_rate
     cfg.gain_db = float(os.environ.get("USRP_TEST_GAIN", "25.0"))
     cfg.samples_per_chunk = int(os.environ.get("USRP_TEST_CHUNK", "4096"))
     device = UsrpRxDevice(cfg)

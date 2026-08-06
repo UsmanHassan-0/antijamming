@@ -27,6 +27,7 @@ class ReceiverViewState:
     prn_entries: list[dict[str, object]]
     sky_entries: list[dict[str, object]]
     current_tracking_prns: list[int]
+    current_tracking_satellite_ids: list[str]
     stable_prns: list[int]
     stable_satellite_ids: list[str]
     current_used_in_pvt_prns: list[int]
@@ -94,13 +95,16 @@ class ReceiverProjection:
                 if sat_id != "--"
             )
 
-        prn_entries = self._apply_prn_display_hold(
-            prn_entries,
-            pvt_current,
-            raw_used_in_fix_satellites,
-            now=now,
-        )
-
+        # Count the receiver's current tracking state before applying the
+        # display hold.  The hold is intentionally presentation-only and must
+        # not turn a previously tracked satellite into a current one.
+        current_tracking_satellite_ids = {
+            sat_id
+            for entry in prn_entries
+            if str(entry.get("state", "")).lower() == "tracking"
+            for sat_id in [satellite_id(entry)]
+            if sat_id != "--"
+        }
         current_tracking_prns = sorted(
             {
                 prn
@@ -109,6 +113,13 @@ class ReceiverProjection:
                 for prn in [valid_prn(entry.get("prn"))]
                 if prn is not None
             }
+        )
+
+        prn_entries = self._apply_prn_display_hold(
+            prn_entries,
+            pvt_current,
+            raw_used_in_fix_satellites,
+            now=now,
         )
         stable_prns = sorted(
             {
@@ -173,6 +184,10 @@ class ReceiverProjection:
             prn_entries=prn_entries,
             sky_entries=projected_sky_entries,
             current_tracking_prns=current_tracking_prns,
+            current_tracking_satellite_ids=sorted(
+                current_tracking_satellite_ids,
+                key=satellite_sort_key,
+            ),
             stable_prns=stable_prns,
             stable_satellite_ids=sorted(stable_satellite_ids, key=satellite_sort_key),
             current_used_in_pvt_prns=sorted(current_used_in_pvt_prns),

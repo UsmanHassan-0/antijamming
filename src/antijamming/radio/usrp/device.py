@@ -25,7 +25,7 @@ from antijamming.radio.usrp.discovery import usrp_arg_int, with_usrp_frame_sizes
 
 # Prefer enum checks: str(error_code) is easy to get wrong across UHD versions.
 _RXEC: Any = uhd.types.RXMetadataErrorCode if uhd is not None else None
-_REQUIRED_X300_FPGA_IMAGE = "XG"
+_REQUIRED_X300_FPGA_IMAGE = "HG"
 _X300_MBOARD_NAME_MARKERS = ("x300", "x310")
 _FPGA_IMAGE_MARKERS = (
     "fpga_image",
@@ -435,7 +435,7 @@ class UsrpRxDevice:
                 raise RuntimeError(
                     "USRP X300/X310 is running the "
                     f"{flavor} FPGA image; this runtime requires "
-                    f"{_REQUIRED_X300_FPGA_IMAGE} for the 10GbE/XG path. "
+                    f"{_REQUIRED_X300_FPGA_IMAGE} for the configured Port-1 10GbE path. "
                     "Run `./setup.sh`, then power-cycle the USRP if UHD requests it."
                 )
             unknown.append(mboard)
@@ -444,7 +444,8 @@ class UsrpRxDevice:
             boards = ",".join(str(mboard) for mboard in unknown)
             report.append(
                 "Mboard FPGA image: not reported by UHD "
-                f"(mboard_indices={boards}); XG could not be verified from runtime metadata."
+                f"(mboard_indices={boards}); "
+                f"{_REQUIRED_X300_FPGA_IMAGE} could not be verified from runtime metadata."
             )
         return report
 

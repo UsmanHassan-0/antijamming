@@ -1,15 +1,10 @@
-"""Typed shared models for scan geometry and operator bearings."""
+"""Typed shared models for scan geometry."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-
 import numpy as np
 
-
-# =============================================================================
-# Operator Bearing Helpers
-# =============================================================================
 
 def normalize_angle_deg(angle_deg: float) -> float:
     """Normalize an azimuth angle into the 0..360 degree interval."""
@@ -18,10 +13,17 @@ def normalize_angle_deg(angle_deg: float) -> float:
 
 
 def internal_angle_to_operator_bearing_deg(angle_deg: float) -> float:
-    """Map the internal steering angle to the operator clockwise bearing."""
+    """Map internal CCW azimuth to operator bearing: 0 deg at top, clockwise."""
 
     angle = normalize_angle_deg(float(angle_deg))
-    return (360.0 - angle) % 360.0
+    return (90.0 - angle) % 360.0
+
+
+def operator_bearing_to_internal_angle_deg(bearing_deg: float) -> float:
+    """Map operator bearing back to the internal CCW azimuth convention."""
+
+    bearing = normalize_angle_deg(float(bearing_deg))
+    return (90.0 - bearing) % 360.0
 
 
 def operator_bearing_axis_for_internal_scan(
@@ -30,7 +32,7 @@ def operator_bearing_axis_for_internal_scan(
     """Return the sorted operator bearing axis and source-order index."""
 
     internal_scan = np.asarray(scan_angles_deg, dtype=np.float64)
-    display_scan = np.asarray((360.0 - internal_scan) % 360.0, dtype=np.float64)
+    display_scan = np.asarray((90.0 - internal_scan) % 360.0, dtype=np.float64)
     order = np.argsort(display_scan)
     return display_scan[order], order
 

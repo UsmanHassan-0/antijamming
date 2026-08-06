@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -7,10 +8,17 @@ import sys
 import pytest
 from threadpoolctl import threadpool_info
 
-from antijamming.config import DEFAULT_RUNTIME_CONFIG_PATH, REPO_ROOT, default_stream_config
+from antijamming.config import (
+    DEFAULT_RUNTIME_CONFIG_PATH,
+    REPO_ROOT,
+    default_stream_config,
+    load_stream_config_file,
+)
 from antijamming.logging import LOGGER_DEFS, reset_session_logs, setup_logging
 from antijamming.logging.setup import ImmediateFileHandler
 from antijamming.app.main import _runtime_config, parse_args
+from antijamming.config.schemas.runtime import VALID_LCMV_METHODS
+from antijamming.rf.budget import manifest_from_config
 from antijamming.radio.usrp.uhd_events import (
     UhdConsoleMarkerMonitor,
     UhdConsoleMarkerScanner,
@@ -31,6 +39,7 @@ def test_product_runtime_limits_native_numeric_thread_pools() -> None:
 
 
 def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
+    profile = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     cfg = default_stream_config()
 
     assert DEFAULT_RUNTIME_CONFIG_PATH.exists()
@@ -38,16 +47,15 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
         "configs/antijamming/x300_realtime.json"
     )
     assert cfg.array_spacing_m > 0.0
-    assert cfg.usrp_addr == "addr=192.168.40.2"
+    assert cfg.usrp_addr == profile["usrp_addr"]
     assert cfg.recv_frame_size == 8000
     assert cfg.send_frame_size == 8000
     assert cfg.recv_buff_size == 50_000_000
     assert cfg.num_recv_frames == 4096
     assert cfg.rx_antennas_by_channel == ("RX1", "RX2", "RX1", "RX2")
-    assert cfg.sample_rate == 4_000_000.0
+    assert cfg.sample_rate == float(profile["sample_rate"])
     assert cfg.center_freq_hz == 1_575_420_000.0
-    assert cfg.usrp_rx_bandwidth_hz == 4_000_000.0
-    assert cfg.gnss_sdr_if_bandwidth_hz == 4_000_000.0
+    assert cfg.usrp_rx_bandwidth_hz == float(profile["sample_rate"])
     assert cfg.log_dir == REPO_ROOT / "logs"
     assert cfg.gnss_sdr_runtime_dir == REPO_ROOT / "logs/gnss-sdr/runtime"
     assert cfg.gnss_sdr_log_dir == REPO_ROOT / "logs/gnss-sdr/glog"
@@ -63,11 +71,31 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.gnss_truth_static_lon_deg == 73.0479
     assert cfg.gnss_truth_static_alt_m == 540.0
     assert cfg.gnss_sdr_echo_stdout is False
-    assert cfg.ui_update_interval_s == 0.3333333333333333
-    assert cfg.dsp_update_interval_s == 0.3333333333333333
-    assert cfg.prn_chart_update_interval_s == 0.3333333333333333
-    assert cfg.skyplot_update_interval_s == 0.3333333333333333
-    assert cfg.process_every_n_chunks == 24
+    assert cfg.ui_update_interval_s == 0.1
+    assert cfg.dsp_update_interval_s == 0.1
+    assert cfg.prn_chart_update_interval_s == 0.1
+    assert cfg.skyplot_update_interval_s == 0.1
+    assert cfg.lcmv_test_enabled is False
+    assert cfg.lcmv_test_max_weight_norm == 8.0
+    assert cfg.lcmv_test_condition_number_limit == 100_000_000.0
+    assert cfg.lcmv_test_null_method == "covariance_lcmv_ideal"
+    assert VALID_LCMV_METHODS == {
+        "covariance_lcmv_ideal",
+        "measured_dominant_eigenvector",
+        "covariance_lcmv_measured_u1",
+    }
+    assert cfg.lcmv_candidate_methods_enabled is True
+    assert cfg.lcmv_covariance_diagonal_loading_rel == 0.001
+    assert cfg.lcmv_covariance_diagonal_loading_abs == 0.0
+    assert cfg.lcmv_max_weight_norm == 8.0
+    assert cfg.lcmv_max_white_noise_gain_db == 15.0
+    assert cfg.lcmv_desired_loss_guard_enabled is False
+    assert cfg.lcmv_max_desired_loss_db == 6.0
+    assert cfg.lcmv_min_predicted_jammer_suppression_db == 3.0
+    assert cfg.lcmv_heavy_diagnostics_interval_s == 1.0
+    assert cfg.one_run_segmentation_enabled is True
+    assert cfg.healthy_reference_capture_enabled is True
+    assert cfg.process_every_n_chunks == 15
     assert cfg.samples_per_chunk == 32768
     assert cfg.gnss_feed_queue_maxsize == 512
     assert cfg.auto_rate_backoff is False
@@ -77,8 +105,8 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.rx_clipping_fraction_threshold == 0.001
     assert "/tmp" not in cfg.gnss_sdr_runtime_dir.as_posix()
     assert "/tmp" not in cfg.gnss_sdr_log_dir.as_posix()
-    assert cfg.gnss_1c_channel_count == 15
-    assert cfg.gnss_channels_in_acquisition == 15
+    assert cfg.gnss_1c_channel_count == 9
+    assert cfg.gnss_channels_in_acquisition == 1
     assert cfg.gnss_pvt_monitor_enable is True
     assert cfg.gnss_pvt_monitor_client_addresses == "127.0.0.1"
     assert cfg.gnss_pvt_monitor_udp_port == "1111"
@@ -87,7 +115,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.gnss_monitor_client_addresses == "127.0.0.1"
     assert cfg.gnss_monitor_udp_port == "1112"
     assert cfg.gnss_monitor_enable_protobuf is True
-    assert cfg.gnss_monitor_decimation_factor == 1
+    assert cfg.gnss_monitor_decimation_factor == 1700
     assert cfg.gnss_tracking_monitor_enable is True
     assert cfg.gnss_tracking_monitor_client_addresses == "127.0.0.1"
     assert cfg.gnss_tracking_monitor_udp_port == "1236"
@@ -117,17 +145,144 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
         REPO_ROOT / "configs/calibration/x300_phase_offsets_added_hw_100khz.json"
     )
     assert cfg.phase_calibration_file.exists()
+    assert cfg.calibration_correction_mode == "complex_gain"
     assert cfg.rx_lo_sources_by_channel == (
         "internal",
         "companion",
         "reimport",
         "reimport",
     )
+    assert cfg.experiment["rx_chain"] == "antenna->cable->BPF->LNA->DC_block->cable->TwinRX"
+    assert cfg.experiment["jammer_attenuation_db"] == 50.0
+
+
+def test_runtime_config_experiment_section_is_optional(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload.pop("experiment", None)
+    path = tmp_path / "runtime_without_experiment.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cfg = load_stream_config_file(path)
+
+    assert cfg.experiment == {}
+
+
+def test_runtime_profile_authors_sample_rate_once_and_derives_followers(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert "usrp_rx_bandwidth_hz" not in payload
+    assert "gnss_sdr_if_bandwidth_hz" not in payload
+    assert "min_sample_rate" not in payload
+    assert "sample_rate_sps" not in payload["experiment"]
+    assert "rx_bandwidth_hz" not in payload["experiment"]
+
+    payload["sample_rate"] = 6_250_000
+    path = tmp_path / "runtime_with_one_sample_rate.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cfg = load_stream_config_file(path)
+    manifest = manifest_from_config(cfg)
+
+    assert cfg.sample_rate == 6_250_000.0
+    assert cfg.usrp_rx_bandwidth_hz == 6_250_000.0
+    assert cfg.min_sample_rate == 6_250_000.0
+    assert manifest["sample_rate_sps"] == 6_250_000.0
+    assert manifest["rx_bandwidth_hz"] == 6_250_000.0
+    assert manifest["bandwidth_hz"] == 6_250_000.0
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["usrp_rx_bandwidth_hz", "min_sample_rate"],
+)
+def test_runtime_profile_rejects_authored_sample_rate_followers(tmp_path, field) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload[field] = payload["sample_rate"]
+    path = tmp_path / f"runtime_with_duplicate_{field}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not be authored"):
+        load_stream_config_file(path)
+
+
+@pytest.mark.parametrize("field", ["sample_rate_sps", "rx_bandwidth_hz"])
+def test_runtime_profile_rejects_experiment_rate_duplicates(tmp_path, field) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["experiment"][field] = payload["sample_rate"]
+    path = tmp_path / f"runtime_with_duplicate_experiment_{field}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not be authored"):
+        load_stream_config_file(path)
+
+
+def test_runtime_config_calibration_mode_defaults_to_complex_gain(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload.pop("calibration_correction_mode", None)
+    path = tmp_path / "runtime_without_calibration_mode.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cfg = load_stream_config_file(path)
+
+    assert cfg.calibration_correction_mode == "complex_gain"
+
+
+def test_runtime_config_gnss_startup_timeout_defaults_to_unlimited(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload.pop("gnss_sdr_startup_timeout_s", None)
+    path = tmp_path / "runtime_without_gnss_startup_timeout.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cfg = load_stream_config_file(path)
+
+    assert cfg.gnss_sdr_startup_timeout_s == 0.0
+
+
+def test_runtime_config_lcmv_method_defaults_to_covariance_ideal(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload.pop("lcmv_test_null_method", None)
+    path = tmp_path / "runtime_without_lcmv_method.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cfg = load_stream_config_file(path)
+
+    assert cfg.lcmv_test_null_method == "covariance_lcmv_ideal"
+
+
+@pytest.mark.parametrize("method", ["ideal_steering", "ideal_angle_fan"])
+def test_runtime_config_rejects_legacy_lcmv_methods(tmp_path, method) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["lcmv_test_null_method"] = method
+    path = tmp_path / f"runtime_with_{method}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid lcmv_test_null_method"):
+        load_stream_config_file(path)
+
+
+def test_runtime_config_loads_operator_experiment_section(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["experiment"] = {
+        "name": "unit_test",
+        "jammer_attenuation_db": 80.0,
+    }
+    path = tmp_path / "runtime_with_experiment.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cfg = load_stream_config_file(path)
+
+    assert cfg.experiment["name"] == "unit_test"
+    assert cfg.experiment["jammer_attenuation_db"] == 80.0
 
 
 def test_product_shell_entrypoints_are_parseable() -> None:
     subprocess.run(
-        ["bash", "-n", "run_realtime.sh", "setup.sh", "run_tests.sh"],
+        [
+            "bash",
+            "-n",
+            "run_realtime.sh",
+            "setup.sh",
+            "run_tests.sh",
+        ],
         cwd=REPO_ROOT,
         check=True,
     )
@@ -144,6 +299,20 @@ def test_project_docs_live_under_docs_directory() -> None:
     assert (REPO_ROOT / "docs/realtime_gui.md").exists()
     assert (REPO_ROOT / "docs/hardware.md").exists()
     assert (REPO_ROOT / "docs/architecture_refactor_notes.md").exists()
+    for name in (
+        "00_system_architecture.md",
+        "01_rf_hardware_and_link_budget.md",
+        "02_calibration.md",
+        "03_steering_model_and_angles.md",
+        "04_doa_music_bartlett.md",
+        "05_beamforming_algorithms.md",
+        "06_diagnostics_and_metrics.md",
+        "07_one_run_test_method.md",
+        "08_progress_tracker.md",
+        "09_known_failure_modes.md",
+        "10_next_steps_and_open_questions.md",
+    ):
+        assert (REPO_ROOT / "docs" / name).exists()
 
 
 def test_runtime_logs_are_repo_anchored_from_other_working_directory(monkeypatch, tmp_path) -> None:
@@ -169,9 +338,13 @@ def test_default_stream_config_rejects_missing_json_profile_path() -> None:
 
 
 
-def test_jammer_detection_has_dedicated_log_file() -> None:
+def test_runtime_has_core_signal_processing_logs() -> None:
     assert LOGGER_DEFS["doa"][1] == "doa.log"
-    assert LOGGER_DEFS["jammer"][1] == "jammer_detection.log"
+    assert LOGGER_DEFS["lcmv"][1] == "lcmv.log"
+    assert LOGGER_DEFS["analysis"][1] == "analysis.log"
+    assert LOGGER_DEFS["lcmv_pattern"][1] == "lcmv_pattern_absolute.jsonl"
+    assert LOGGER_DEFS["spatial_vector"][1] == "spatial_vector_diagnostics.jsonl"
+    assert "jammer" not in LOGGER_DEFS
     assert LOGGER_DEFS["ui"][1] == "ui_health.log"
 
 
@@ -188,8 +361,9 @@ def test_session_log_reset_removes_rotated_backups(tmp_path) -> None:
     loggers = setup_logging(tmp_path)
     rotated = tmp_path / "gnss_sdr.log.1"
     rotated.write_text("old rotated log", encoding="utf-8")
-    unknown_log = tmp_path / "uhd_console.log"
-    unknown_log.write_text("old uhd log", encoding="utf-8")
+    helper_log = tmp_path / "remote_gui_access" / "rdp_autostart_gui.log"
+    helper_log.parent.mkdir(parents=True)
+    helper_log.write_text("old helper log", encoding="utf-8")
     nested_log = tmp_path / "gnss-sdr" / "runtime" / "console.log"
     nested_log.parent.mkdir(parents=True)
     nested_log.write_text("old console log", encoding="utf-8")
@@ -200,8 +374,8 @@ def test_session_log_reset_removes_rotated_backups(tmp_path) -> None:
     reset_session_logs(tmp_path, loggers)
 
     assert (tmp_path / "gnss_sdr.log").read_text(encoding="utf-8") == ""
-    assert unknown_log.read_text(encoding="utf-8") == ""
-    assert nested_log.read_text(encoding="utf-8") == ""
+    assert helper_log.read_text(encoding="utf-8") == "old helper log"
+    assert nested_log.read_text(encoding="utf-8") == "old console log"
     assert output_file.read_text(encoding="utf-8") == "keep output"
     assert not rotated.exists()
 
@@ -227,6 +401,14 @@ def test_uhd_console_marker_scanner_handles_split_writes() -> None:
     events.extend(scanner.feed("2026-06-11 next log line"))
 
     assert [(event.marker, event.count) for event in events] == [("D", 2)]
+
+
+def test_uhd_console_marker_scanner_ignores_single_marker_glued_to_qt_warning() -> None:
+    scanner = UhdConsoleMarkerScanner()
+
+    events = scanner.feed("DThis plugin does not support propagateSizeHints()\n")
+
+    assert events == []
 
 
 def test_uhd_console_marker_monitor_logs_window_counts(tmp_path) -> None:
@@ -290,22 +472,23 @@ def test_parse_args_rejects_runtime_flags(monkeypatch) -> None:
 
 
 def test_runtime_config_builds_product_profile_without_cli_overrides() -> None:
+    profile = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     cfg = _runtime_config()
 
-    assert cfg.sample_rate == 4_000_000.0
+    assert cfg.sample_rate == float(profile["sample_rate"])
     assert cfg.center_freq_hz == 1_575_420_000.0
     assert cfg.auto_rate_backoff is False
     assert cfg.stop_on_overflow is True
     assert cfg.rx_clipping_component_threshold == 0.98
     assert cfg.rx_clipping_fraction_threshold == 0.001
-    assert cfg.ui_update_interval_s == 0.3333333333333333
-    assert cfg.dsp_update_interval_s == 0.3333333333333333
-    assert cfg.prn_chart_update_interval_s == 0.3333333333333333
-    assert cfg.skyplot_update_interval_s == 0.3333333333333333
-    assert cfg.process_every_n_chunks == 24
+    assert cfg.ui_update_interval_s == 0.1
+    assert cfg.dsp_update_interval_s == 0.1
+    assert cfg.prn_chart_update_interval_s == 0.1
+    assert cfg.skyplot_update_interval_s == 0.1
+    assert cfg.process_every_n_chunks == 15
     assert cfg.samples_per_chunk == 32768
     assert cfg.gnss_feed_queue_maxsize == 512
-    assert cfg.usrp_addr.startswith("addr=192.168.40.2")
+    assert cfg.usrp_addr.startswith(str(profile["usrp_addr"]))
     assert "recv_frame_size=8000" in cfg.usrp_addr
     assert "send_frame_size=8000" in cfg.usrp_addr
     assert cfg.recv_frame_size == 8000
@@ -313,8 +496,8 @@ def test_runtime_config_builds_product_profile_without_cli_overrides() -> None:
     assert "recv_buff_size=50000000" in cfg.usrp_addr
     assert "num_recv_frames=4096" in cfg.usrp_addr
     assert cfg.gnss_sdr_echo_stdout is False
-    assert cfg.gnss_1c_channel_count == 15
-    assert cfg.gnss_channels_in_acquisition == 15
+    assert cfg.gnss_1c_channel_count == 9
+    assert cfg.gnss_channels_in_acquisition == 1
     assert cfg.phase_calibration_file is not None
     assert cfg.phase_calibration_file.is_absolute()
     assert cfg.phase_correction_vector is not None

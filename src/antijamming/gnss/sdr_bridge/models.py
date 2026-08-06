@@ -22,7 +22,7 @@ def _sat_key(constellation: object, prn: int) -> _SatKey:
 
     GPS keeps the historical integer key so existing tests and diagnostics keep
     working. Non-GPS constellations use a tuple to avoid collisions such as G12
-    and E12.
+    and C12.
     """
 
     normalized = _constellation_from_token(constellation)

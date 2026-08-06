@@ -5,7 +5,11 @@ from __future__ import annotations
 import numpy as np
 
 from antijamming.dsp.beamforming import apply_beamformer, uniform_weights
-from antijamming.dsp.doa.music import music_spectrum
+from antijamming.dsp.doa.music import (
+    bartlett_spectrum,
+    music_spectrum,
+    source_count_diagnostics,
+)
 from antijamming.dsp.phase.alignment import apply_phase_calibration, phase_offsets_deg
 
 
@@ -20,7 +24,6 @@ def _tone_bin_phase_offsets_deg(
     buffer: np.ndarray,
     sample_rate_hz: float,
     tone_offset_hz: float,
-    ref_channel: int = 0,
 ) -> np.ndarray:
     data = np.asarray(buffer, dtype=np.complex128)
     if data.ndim != 2 or data.shape[0] == 0:
@@ -28,35 +31,32 @@ def _tone_bin_phase_offsets_deg(
     if data.shape[1] == 0:
         return np.zeros((data.shape[0],), dtype=np.float64)
 
-    ref_channel = max(0, min(int(ref_channel), data.shape[0] - 1))
     sample_rate_hz = float(sample_rate_hz)
     if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
         # Without a valid sample rate we cannot demodulate a tone bin; fall back
         # to the standard chunk-wide phase estimator.
-        return phase_offsets_deg(data, ref_channel=ref_channel)
+        return phase_offsets_deg(data)
 
     n = np.arange(data.shape[1], dtype=np.float64)
     mixer = np.exp(
         -1j * 2.0 * np.pi * float(tone_offset_hz) * n / sample_rate_hz
     ).astype(np.complex128)
     tone = np.mean(data * mixer[None, :], axis=1)
-    ref = tone[ref_channel]
+    aggregate = np.mean(tone)
+    if np.abs(aggregate) <= 1e-24 or not np.isfinite(np.abs(aggregate)):
+        return np.zeros((data.shape[0],), dtype=np.float64)
 
     offsets: list[float] = []
     for ch in range(data.shape[0]):
-        if ch == ref_channel:
-            offsets.append(0.0)
-            continue
-        cross = tone[ch] * np.conj(ref)
+        cross = tone[ch] * np.conj(aggregate)
         offsets.append(float(np.degrees(np.angle(cross))))
     return np.asarray(offsets, dtype=np.float64)
 
 
-def _estimate_ref_tone_offset_hz(
+def _estimate_array_tone_offset_hz(
     buffer: np.ndarray,
     sample_rate_hz: float,
     expected_tone_offset_hz: float,
-    ref_channel: int = 0,
     search_half_span_hz: float = 10000.0,
 ) -> float:
     data = np.asarray(buffer, dtype=np.complex128)
@@ -67,16 +67,18 @@ def _estimate_ref_tone_offset_hz(
     if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
         return float(expected_tone_offset_hz)
 
-    ref_channel = max(0, min(int(ref_channel), data.shape[0] - 1))
-    ref = np.asarray(data[ref_channel], dtype=np.complex128)
     # Oversized FFT improves visual stability when the tone is not exactly on a
     # bin. This is UI/monitoring work, not a sample-perfect carrier tracker.
-    n = max(ref.size, 8)
+    n = max(data.shape[1], 8)
     n_fft = int(max(8192, 1 << int(np.ceil(np.log2(n * 16)))))
-    window = np.hanning(ref.size).astype(np.float64)
+    window = np.hanning(data.shape[1]).astype(np.float64)
     if not np.any(window):
-        window = np.ones((ref.size,), dtype=np.float64)
-    spectrum = np.fft.fftshift(np.fft.fft(ref * window, n=n_fft))
+        window = np.ones((data.shape[1],), dtype=np.float64)
+    spectra = np.fft.fftshift(
+        np.fft.fft(data * window[None, :], n=n_fft, axis=1),
+        axes=1,
+    )
+    spectrum = np.mean(np.abs(spectra), axis=0)
     freqs_hz = np.fft.fftshift(np.fft.fftfreq(n_fft, d=1.0 / sample_rate_hz))
     expected = float(expected_tone_offset_hz)
     half_span = max(1000.0, float(search_half_span_hz))
@@ -96,7 +98,10 @@ def _estimate_ref_tone_offset_hz(
         if abs(denom) > 1e-30 and masked_freqs.size > 1:
             bin_delta = 0.5 * (left - right) / denom
             bin_delta = max(-0.5, min(0.5, bin_delta))
-            return float(masked_freqs[peak_idx] + bin_delta * (masked_freqs[1] - masked_freqs[0]))
+            return float(
+                masked_freqs[peak_idx]
+                + bin_delta * (masked_freqs[1] - masked_freqs[0])
+            )
     return float(masked_freqs[peak_idx])
 
 
@@ -105,11 +110,10 @@ def _estimate_ref_tone_offset_hz(
 # =============================================================================
 
 # Phase metrics carry both raw and calibrated views because the GUI shows the
-# before/after effect of static or dynamic phase alignment.
+# before/after effect of the loaded static phase calibration.
 
 def compute_phase_metrics(
     buffer: np.ndarray,
-    ref_channel: int = 0,
     preview_cols: int | None = None,
     phase_correction_vector: np.ndarray | None = None,
     sample_rate_hz: float | None = None,
@@ -120,35 +124,31 @@ def compute_phase_metrics(
     raw_buffer = np.asarray(buffer, dtype=np.complex128)
     corrected_buffer = apply_phase_calibration(
         raw_buffer,
-        ref_channel=ref_channel,
         correction_vector=phase_correction_vector,
     )
     powers = np.mean(np.abs(raw_buffer) ** 2, axis=1)
     tone_monitor_estimated_offset_hz = float(phase_monitor_tone_offset_hz)
     if bool(phase_monitor_use_tone_bin):
-        # Estimate the actual reference-channel tone offset first, then use that
+        # Estimate the actual array tone offset first, then use that
         # same offset for every channel so relative phases stay comparable.
-        tone_monitor_estimated_offset_hz = _estimate_ref_tone_offset_hz(
+        tone_monitor_estimated_offset_hz = _estimate_array_tone_offset_hz(
             raw_buffer,
             sample_rate_hz=float(sample_rate_hz or 0.0),
             expected_tone_offset_hz=float(phase_monitor_tone_offset_hz),
-            ref_channel=ref_channel,
         )
         raw_offsets = _tone_bin_phase_offsets_deg(
             raw_buffer,
             sample_rate_hz=float(sample_rate_hz or 0.0),
             tone_offset_hz=tone_monitor_estimated_offset_hz,
-            ref_channel=ref_channel,
         )
         corrected_offsets = _tone_bin_phase_offsets_deg(
             corrected_buffer,
             sample_rate_hz=float(sample_rate_hz or 0.0),
             tone_offset_hz=tone_monitor_estimated_offset_hz,
-            ref_channel=ref_channel,
         )
     else:
-        raw_offsets = phase_offsets_deg(raw_buffer, ref_channel=ref_channel)
-        corrected_offsets = phase_offsets_deg(corrected_buffer, ref_channel=ref_channel)
+        raw_offsets = phase_offsets_deg(raw_buffer)
+        corrected_offsets = phase_offsets_deg(corrected_buffer)
 
     metrics = {
         "raw_buffer": raw_buffer,
@@ -171,51 +171,128 @@ def compute_phase_metrics(
 # Direction Finding Metrics
 # =============================================================================
 
+def _angle_distance_deg(a: float, b: float) -> float:
+    """Return the shortest circular distance between two azimuth angles."""
+
+    return abs((float(a) - float(b) + 180.0) % 360.0 - 180.0)
+
+
+def _dominant_spectrum_peaks(
+    scan_angles_deg: np.ndarray,
+    spectrum: np.ndarray,
+    *,
+    max_reported_peaks: int = 4,
+    min_peak_height: float = 0.25,
+    min_separation_deg: float = 8.0,
+) -> list[dict[str, float]]:
+    """Return separated local maxima from a normalized circular DoA spectrum."""
+
+    scan = np.asarray(scan_angles_deg, dtype=np.float64).reshape(-1)
+    spec = np.asarray(spectrum, dtype=np.float64).reshape(-1)
+    if scan.size != spec.size or scan.size < 3:
+        return []
+
+    finite = np.isfinite(spec)
+    if not np.any(finite):
+        return []
+    spec = np.where(finite, spec, -np.inf)
+
+    prev_spec = np.roll(spec, 1)
+    next_spec = np.roll(spec, -1)
+    local_maxima = np.where((spec >= prev_spec) & (spec > next_spec))[0]
+    local_maxima = local_maxima[spec[local_maxima] >= float(min_peak_height)]
+    if local_maxima.size == 0:
+        local_maxima = np.asarray([int(np.nanargmax(spec))], dtype=np.int64)
+
+    ordered = local_maxima[np.argsort(spec[local_maxima])[::-1]]
+    selected: list[dict[str, float]] = []
+    for idx in ordered:
+        angle = float(scan[int(idx)] % 360.0)
+        if any(
+            _angle_distance_deg(angle, peak["angle_deg"]) < float(min_separation_deg)
+            for peak in selected
+        ):
+            continue
+        height = float(spec[int(idx)])
+        selected.append(
+            {
+                "angle_deg": angle,
+                "height": height,
+                "rel_db": float(10.0 * np.log10(max(height, 1e-12))),
+            }
+        )
+        if len(selected) >= int(max_reported_peaks):
+            break
+    return selected
+
+
 def compute_doa_metrics(
     corrected_buffer: np.ndarray,
     center_freq_hz: float,
     scan_angles_deg: np.ndarray,
-    uca_radius_m: float,
+    array_spacing_m: float,
     n_sources: int = 1,
-    doa_method: str = "music",
 ) -> dict:
-    """Compute MUSIC DoA metrics for the realtime receiver."""
-    method = "music"
+    """Compute MUSIC DoA metrics plus Bartlett diagnostic spectra."""
     corrected = np.asarray(corrected_buffer, dtype=np.complex128)
+    n_channels = int(corrected.shape[0]) if corrected.ndim >= 1 else 1
+    source_count = min(max(int(n_sources), 1), max(n_channels - 1, 1))
+    source_diagnostics = source_count_diagnostics(
+        corrected,
+        noise_tail_sources=source_count,
+    )
     doa_raw_spectrum = music_spectrum(
         x=corrected,
         rf_freq_hz=center_freq_hz,
         scan_angles_deg=scan_angles_deg,
-        uca_radius_m=uca_radius_m,
-        n_sources=max(int(n_sources), 1),
+        array_spacing_m=array_spacing_m,
+        n_sources=source_count,
         normalize=False,
     )
-    doa_spectrum = doa_raw_spectrum / (np.max(doa_raw_spectrum) + 1e-12)
-    doa_deg = float(scan_angles_deg[int(np.argmax(doa_spectrum))])
+    normalized_for_peaks = doa_raw_spectrum / (np.max(doa_raw_spectrum) + 1e-12)
+    doa_deg = float(scan_angles_deg[int(np.argmax(doa_raw_spectrum))])
+    doa_peaks = _dominant_spectrum_peaks(scan_angles_deg, normalized_for_peaks)
+    bartlett_raw_spectrum = bartlett_spectrum(
+        x=corrected,
+        rf_freq_hz=center_freq_hz,
+        scan_angles_deg=scan_angles_deg,
+        array_spacing_m=array_spacing_m,
+        normalize=False,
+    )
+    bartlett_normalized_for_peaks = bartlett_raw_spectrum / (
+        np.max(bartlett_raw_spectrum) + 1e-12
+    )
+    bartlett_deg = float(scan_angles_deg[int(np.argmax(bartlett_raw_spectrum))])
+    bartlett_peaks = _dominant_spectrum_peaks(
+        scan_angles_deg,
+        bartlett_normalized_for_peaks,
+    )
 
     return {
-        "doa_method": method,
-        "n_sources": max(int(n_sources), 1),
+        "n_sources": source_count,
         "doa_raw_spectrum": np.asarray(doa_raw_spectrum, dtype=np.float64),
-        "doa_spectrum": np.asarray(doa_spectrum, dtype=np.float64),
-        "music_spectrum": np.asarray(doa_spectrum, dtype=np.float64),
         "doa_deg": doa_deg,
+        "doa_peaks": doa_peaks,
+        "doa_peak_count": len(doa_peaks),
+        "bartlett_raw_spectrum": np.asarray(bartlett_raw_spectrum, dtype=np.float64),
+        "bartlett_deg": bartlett_deg,
+        "bartlett_peaks": bartlett_peaks,
+        "bartlett_peak_count": len(bartlett_peaks),
+        **source_diagnostics,
     }
 
 
 def compute_gnss_output_vector(
     buffer: np.ndarray,
-    ref_channel: int,
     beamformer_weights: np.ndarray,
     phase_correction_vector: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Render the calibrated, beamformed one-channel stream handed to GNSS-SDR."""
+    """Render the calibrated, uniform-combined one-channel stream handed to GNSS-SDR."""
     source = np.asarray(buffer, dtype=np.complex128)
     if source.ndim != 2 or source.shape[1] == 0:
         return np.zeros((0,), dtype=np.complex64)
     corrected = apply_phase_calibration(
         source,
-        ref_channel=ref_channel,
         correction_vector=phase_correction_vector,
     )
     return apply_beamformer(corrected, np.asarray(beamformer_weights, dtype=np.complex128))
@@ -232,25 +309,21 @@ def compute_realtime_metrics(
     buffer: np.ndarray,
     center_freq_hz: float,
     scan_angles_deg: np.ndarray,
-    uca_radius_m: float,
-    ref_channel: int = 0,
+    array_spacing_m: float,
     n_sources: int = 1,
-    doa_method: str = "music",
     phase_correction_vector: np.ndarray | None = None,
 ) -> dict:
     """Compute the combined phase and DoA metrics for a runtime chunk."""
     phase_metrics = compute_phase_metrics(
         buffer=buffer,
-        ref_channel=ref_channel,
         phase_correction_vector=phase_correction_vector,
     )
     doa_metrics = compute_doa_metrics(
         corrected_buffer=phase_metrics["calibrated_buffer"],
         center_freq_hz=center_freq_hz,
         scan_angles_deg=scan_angles_deg,
-        uca_radius_m=uca_radius_m,
+        array_spacing_m=array_spacing_m,
         n_sources=n_sources,
-        doa_method=doa_method,
     )
     return {
         "powers": phase_metrics["powers"],
@@ -263,10 +336,32 @@ def compute_realtime_metrics(
         "i_samples": np.real(phase_metrics["raw_buffer"]),
         "i_samples_raw": np.real(phase_metrics["raw_buffer"]),
         "i_samples_calibrated": np.real(phase_metrics["calibrated_buffer"]),
-        "music_spectrum": doa_metrics["music_spectrum"],
-        "doa_spectrum": doa_metrics["doa_spectrum"],
         "doa_raw_spectrum": doa_metrics["doa_raw_spectrum"],
-        "doa_method": doa_metrics["doa_method"],
         "n_sources": doa_metrics["n_sources"],
         "doa_deg": doa_metrics["doa_deg"],
+        "doa_peaks": doa_metrics["doa_peaks"],
+        "doa_peak_count": doa_metrics["doa_peak_count"],
+        "bartlett_raw_spectrum": doa_metrics["bartlett_raw_spectrum"],
+        "bartlett_deg": doa_metrics["bartlett_deg"],
+        "bartlett_peaks": doa_metrics["bartlett_peaks"],
+        "bartlett_peak_count": doa_metrics["bartlett_peak_count"],
+        "covariance_eigenvalues": doa_metrics["covariance_eigenvalues"],
+        "covariance_eigenvalues_db": doa_metrics["covariance_eigenvalues_db"],
+        "covariance_eigenvalues_rel_db": doa_metrics["covariance_eigenvalues_rel_db"],
+        "covariance_eigen_gap_db": doa_metrics["covariance_eigen_gap_db"],
+        "noise_tail_assumed_sources": doa_metrics["noise_tail_assumed_sources"],
+        "noise_tail_count": doa_metrics["noise_tail_count"],
+        "noise_tail_eigenvalues_rel_db": doa_metrics["noise_tail_eigenvalues_rel_db"],
+        "noise_tail_spread_db": doa_metrics["noise_tail_spread_db"],
+        "noise_tail_flatness_db": doa_metrics["noise_tail_flatness_db"],
+        "noise_tail_testable": doa_metrics["noise_tail_testable"],
+        "noise_tail_white_like": doa_metrics["noise_tail_white_like"],
+        "noise_tail_spread_threshold_db": doa_metrics[
+            "noise_tail_spread_threshold_db"
+        ],
+        "noise_tail_flatness_threshold_db": doa_metrics[
+            "noise_tail_flatness_threshold_db"
+        ],
+        "source_estimate_gap": doa_metrics["source_estimate_gap"],
+        "source_effective_rank": doa_metrics["source_effective_rank"],
     }

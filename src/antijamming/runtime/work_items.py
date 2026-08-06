@@ -19,6 +19,9 @@ class PhaseResult:
     """Phase-calibrated chunk passed from phase processing to DoA."""
 
     calibrated_chunk: np.ndarray
+    raw_chunk: np.ndarray | None = None
+    raw_power_metrics: dict[str, object] | None = None
+    cal_power_metrics: dict[str, object] | None = None
 
 
 __all__ = [

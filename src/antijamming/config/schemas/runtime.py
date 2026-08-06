@@ -4,7 +4,7 @@ Product runtime values are loaded from
 ``configs/antijamming/x300_realtime.json``. This module defines the Python
 object shape used by the realtime application after loading that JSON profile.
 The schema covers the USRP/X300 RF front-end, TwinRX coherent LO setup, DSP
-update pacing, phase calibration, DoA estimation, GNSS combining, and
+update pacing, phase calibration, DoA estimation, uniform IQ combining, and
 GNSS-SDR FIFO/runtime integration.
 
 Unknown JSON keys fail fast so spelling mistakes or stale config fields are
@@ -26,6 +26,14 @@ from antijamming.dsp.models import AngleScanSpec
 
 # Default product profile used by the realtime X300 application.
 DEFAULT_RUNTIME_CONFIG_PATH = REPO_ROOT / "configs/antijamming/x300_realtime.json"
+
+VALID_LCMV_METHODS = frozenset(
+    {
+        "covariance_lcmv_ideal",
+        "measured_dominant_eigenvector",
+        "covariance_lcmv_measured_u1",
+    }
+)
 
 
 # =============================================================================
@@ -68,7 +76,7 @@ class StreamConfig:
 
         cfg = cls.__new__(cls)
         for field in dataclass_fields(cls):
-            if field.name == "phase_correction_vector":
+            if field.name in {"phase_correction_vector", "calibration_correction_metadata"}:
                 setattr(cfg, field.name, values.get(field.name))
                 continue
             setattr(cfg, field.name, values[field.name])
@@ -78,7 +86,7 @@ class StreamConfig:
     # UHD / RF Front-End
     # -------------------------------------------------------------------------
 
-    # Fixed UHD device address for the X300/XG 10GbE product profile.
+    # Fixed UHD device address for the X300/HG Port-1 10GbE product profile.
     usrp_addr: str
 
     # UHD transport frame sizes. Zero means choose from selected route MTU/speed.
@@ -95,13 +103,15 @@ class StreamConfig:
     # If antenna element order differs from UHD channel numbering, adjust this.
     channels: tuple[int, int, int, int]
 
-    # Complex baseband sample rate used by the realtime receive pipeline.
+    # Sole authored product sample rate. The runtime profile loader derives the
+    # USRP RX bandwidth, GNSS-SDR IF bandwidth, minimum rate, and experiment
+    # manifest rate/bandwidth from this value.
     sample_rate: float
 
     # GPS L1 center frequency.
     center_freq_hz: float
 
-    # USRP analog RX bandwidth. A value of 0.0 lets UHD/device defaults apply.
+    # USRP analog RX bandwidth derived from sample_rate by the profile loader.
     usrp_rx_bandwidth_hz: float
 
     # Frequency used for array geometry/steering-vector calculations.
@@ -145,8 +155,8 @@ class StreamConfig:
     # Runtime Pacing and Overflow Policy
     # -------------------------------------------------------------------------
 
-    # Number of complex samples per receive/GNSS handoff chunk. The product
-    # profile uses 32768 samples, which is 8.192 ms at 4 Msps.
+    # Number of complex samples per receive/GNSS handoff chunk. Its wall-clock
+    # duration changes with sample_rate.
     samples_per_chunk: int
 
     # Process one out of N chunks for heavier DSP work. The product value keeps
@@ -170,6 +180,7 @@ class StreamConfig:
     # Overflows are logged as transport health events instead of silently
     # changing sample rate.
     auto_rate_backoff: bool
+    # Derived from sample_rate; fixed-rate product runs do not author it separately.
     min_sample_rate: float
 
     # Fail-fast overflow controls. Sustained overflows mean the receive path is
@@ -197,13 +208,16 @@ class StreamConfig:
     # Number of points retained in GUI history plots.
     ui_points: int
 
-    # Reference channel for relative phase calculations.
-    phase_ref_channel: int
-
     # Static hardware phase correction measured from a conducted calibration
-    # source. None preserves legacy dynamic per-chunk alignment behavior.
+    # source. None leaves channels uncorrected instead of selecting a live
+    # channel as master.
     phase_correction_vector: tuple[complex, ...] | None
+    calibration_correction_metadata: dict[str, object] | None
     phase_calibration_file: Path | None
+
+    # Selects the persisted calibration vector applied before MUSIC/Bartlett,
+    # spatial-vector diagnostics, LCMV, and GNSS FIFO beamforming.
+    calibration_correction_mode: str
 
     # Tone offset used by the live phase monitor when tone-bin estimation is on.
     phase_monitor_tone_offset_hz: float
@@ -213,7 +227,7 @@ class StreamConfig:
     live_phase_monitor_use_tone_bin: bool
 
     # -------------------------------------------------------------------------
-    # DoA Estimation and Jammer Detection
+    # DoA Estimation
     # -------------------------------------------------------------------------
 
     # Angular scan range used by MUSIC spatial spectrum estimation.
@@ -221,22 +235,30 @@ class StreamConfig:
     doa_max_deg: float
     doa_points: int
 
-    # Default DoA estimator and expected number of spatial sources. Internal
-    # steering/scanning angles remain CCW; operator display bearings are fixed
-    # to clockwise.
-    doa_method: str
+    # Expected number of spatial sources. Internal steering/scanning angles
+    # remain CCW; operator display bearings use top as 0 deg and increase clockwise.
     expected_sources: int
 
-    # Radius for the uniform circular array model.
-    uca_radius_m: float
-
-    # Jammer detector gates. The product decision is driven by raw IQ power
-    # rising above a learned quiet baseline.
-    jammer_detection_enabled: bool
-    jammer_detection_min_power_db: float
-    jammer_detection_power_rise_db: float
-    jammer_detection_power_baseline_alpha: float
-    jammer_detection_consecutive_alarms: int
+    # Manual test mode only. When enabled by the operator, the runtime uses the
+    # strongest MUSIC peak as one LCMV null direction and falls back to uniform on
+    # any invalid condition.
+    lcmv_test_enabled: bool
+    lcmv_test_max_weight_norm: float
+    lcmv_test_condition_number_limit: float
+    lcmv_test_null_method: str
+    lcmv_candidate_methods_enabled: bool
+    lcmv_covariance_diagonal_loading_rel: float
+    lcmv_covariance_diagonal_loading_abs: float
+    lcmv_max_weight_norm: float
+    lcmv_max_white_noise_gain_db: float
+    # When disabled, desired/SOI loss remains diagnostic and cannot force the
+    # active LCMV method back to the uniform combiner.
+    lcmv_desired_loss_guard_enabled: bool
+    lcmv_max_desired_loss_db: float
+    lcmv_min_predicted_jammer_suppression_db: float
+    lcmv_heavy_diagnostics_interval_s: float
+    one_run_segmentation_enabled: bool
+    healthy_reference_capture_enabled: bool
 
     # -------------------------------------------------------------------------
     # GNSS-SDR Process and Runtime Paths
@@ -264,6 +286,11 @@ class StreamConfig:
     # GUI runs keep this quiet by default; clean receiver status is captured in
     # runtime/console.log and GNSS-SDR diagnostics in gnss_sdr_log_dir/receiver.log.
     gnss_sdr_echo_stdout: bool
+
+    # Maximum time to wait for GNSS-SDR to construct its flowgraph and open the
+    # IQ FIFO. Zero or a negative value waits as long as the child process is
+    # alive. Cold FFTW planning after a sample-rate change can take minutes.
+    gnss_sdr_startup_timeout_s: float
 
     # Static truth data used for PVT error display in the GUI/logs.
     gnss_truth_static_lat_deg: float | None
@@ -296,15 +323,9 @@ class StreamConfig:
     # Sample representation expected by the GNSS-SDR SignalSource.
     gnss_sdr_sample_type: str
 
-    # Signal conditioner.
-    #
-    # IF filter bandwidth rendered into the GNSS-SDR config.
-    # A value of 0.0 lets GNSS-SDR/default configuration behavior apply.
-    gnss_sdr_if_bandwidth_hz: float
-
     # Channel allocation and acquisition.
     #
-    # GPS L1 C/A channel allocation for the realtime receiver view.
+    # GPS L1 C/A channel allocation and acquisition concurrency.
     gnss_1c_channel_count: int
     gnss_channels_in_acquisition: int
 
@@ -342,7 +363,8 @@ class StreamConfig:
     gnss_acquisition_max_dwells: int
 
     # Tracking loop settings rendered explicitly so realtime runs do not depend
-    # on GNSS-SDR build defaults. Values start from GNSS-SDR's TTFF/system tests.
+    # on GNSS-SDR build defaults. GPS values start from GNSS-SDR's TTFF/system
+    # tests.
     gnss_tracking_1c_pll_bw_hz: float
     gnss_tracking_1c_dll_bw_hz: float
     gnss_tracking_1c_pll_filter_order: int
@@ -374,6 +396,10 @@ class StreamConfig:
     # Limit expensive/high-volume DoA log emissions.
     doa_log_interval_s: float
 
+    # Optional operator-authored test manifest. Runtime must not require it;
+    # missing values are logged as unknown/null in diagnostics.
+    experiment: dict[str, object]
+
     # -------------------------------------------------------------------------
     # Derived Config Views
     # -------------------------------------------------------------------------
@@ -387,4 +413,4 @@ class StreamConfig:
             points=int(self.doa_points),
         )
 
-__all__ = ["DEFAULT_RUNTIME_CONFIG_PATH", "StreamConfig"]
+__all__ = ["DEFAULT_RUNTIME_CONFIG_PATH", "StreamConfig", "VALID_LCMV_METHODS"]

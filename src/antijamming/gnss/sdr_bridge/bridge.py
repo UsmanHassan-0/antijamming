@@ -9,6 +9,7 @@ import pty
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -52,14 +53,12 @@ class GnssSdrBridge(
         self._err_log = loggers["errors"]
 
         # Runtime paths and process handles.
-        self._runtime_dir = config.gnss_sdr_runtime_dir.expanduser().resolve()
-        self._log_dir = config.gnss_sdr_log_dir.expanduser().resolve()
+        self._set_session_paths(
+            config.gnss_sdr_runtime_dir,
+            config.gnss_sdr_log_dir,
+        )
         self._proc: subprocess.Popen[bytes] | None = None
         self._fifo_fd: int | None = None
-        self._fifo_path = self._runtime_dir / "gnss_iq.fifo"
-        self._config_path = self._runtime_dir / "fifo_gps_l1.conf"
-        self._console_log_path = self._runtime_dir / "console.log"
-        self._receiver_log_path = self._log_dir / "receiver.log"
         self._stdout_thread: threading.Thread | None = None
         self._stdout_handle = None
         self._nmea_thread: threading.Thread | None = None
@@ -89,16 +88,6 @@ class GnssSdrBridge(
         self._pvt_output_seen = False
         self._pvt_observed_monotonic_s: float | None = None
         self._pvt_observation_count: int | None = None
-
-        # GNSS-SDR output directories.
-        self._outputs_dir = self._runtime_dir / "outputs"
-        self._signal_source_outputs_dir = self._outputs_dir / "signal_source"
-        self._signal_conditioner_outputs_dir = self._outputs_dir / "signal_conditioner"
-        self._tracking_outputs_dir = self._outputs_dir / "tracking"
-        self._acquisition_outputs_dir = self._outputs_dir / "acquisition"
-        self._telemetry_outputs_dir = self._outputs_dir / "telemetry"
-        self._observables_outputs_dir = self._outputs_dir / "observables"
-        self._pvt_outputs_dir = self._outputs_dir / "pvt"
 
         # GNSS monitor state.
         self._tracking_cn0_by_channel: dict[int, float] = {}
@@ -136,6 +125,24 @@ class GnssSdrBridge(
         self._last_accuracy_point_count = 0
         self._latest_accuracy: dict[str, object] = {}
         self._latest_accuracy_observed_monotonic_s: float | None = None
+
+    def _set_session_paths(self, runtime_dir: Path, log_dir: Path) -> None:
+        """Set every path derived from a GNSS-SDR runtime/log directory pair."""
+
+        self._runtime_dir = Path(runtime_dir).expanduser().resolve()
+        self._log_dir = Path(log_dir).expanduser().resolve()
+        self._fifo_path = self._runtime_dir / "gnss_iq.fifo"
+        self._config_path = self._runtime_dir / "fifo_gps_l1.conf"
+        self._console_log_path = self._runtime_dir / "console.log"
+        self._receiver_log_path = self._log_dir / "receiver.log"
+        self._outputs_dir = self._runtime_dir / "outputs"
+        self._signal_source_outputs_dir = self._outputs_dir / "signal_source"
+        self._signal_conditioner_outputs_dir = self._outputs_dir / "signal_conditioner"
+        self._tracking_outputs_dir = self._outputs_dir / "tracking"
+        self._acquisition_outputs_dir = self._outputs_dir / "acquisition"
+        self._telemetry_outputs_dir = self._outputs_dir / "telemetry"
+        self._observables_outputs_dir = self._outputs_dir / "observables"
+        self._pvt_outputs_dir = self._outputs_dir / "pvt"
 
     @property
     def active(self) -> bool:
@@ -266,8 +273,18 @@ class GnssSdrBridge(
             daemon=True,
         )
         self._glog_thread.start()
+        startup_timeout_s = float(self._cfg.gnss_sdr_startup_timeout_s)
+        timeout_label = "none" if startup_timeout_s <= 0.0 else f"{startup_timeout_s:.1f}s"
+        self._report_startup(
+            "GNSS-SDR startup at %.3f Msps: checking cached FFTW plans in %s "
+            "(timeout=%s). A cached rate normally starts in under a second; a new "
+            "rate can take several minutes once while FFTW measures new plans.",
+            float(self._cfg.sample_rate) / 1e6,
+            str(Path.home() / ".gr_fftw_wisdom"),
+            timeout_label,
+        )
         try:
-            self._fifo_fd = self._open_fifo_writer(timeout_s=5.0)
+            self._fifo_fd = self._open_fifo_writer(timeout_s=startup_timeout_s)
         except Exception:
             self.stop("startup failure")
             raise
@@ -301,7 +318,7 @@ class GnssSdrBridge(
             self._pipe_size_bytes if self._pipe_size_bytes is not None else "unknown",
             int(self._cfg.samples_per_chunk) * np.dtype(np.complex64).itemsize,
             float(self._cfg.sample_rate) / 1e6,
-            float(self._cfg.gnss_sdr_if_bandwidth_hz) / 1e6,
+            self.input_filter_bandwidth_hz / 1e6,
         )
         self._warn_if_gps_l1_is_outside_capture_band()
         self._app_log.info("GNSS-SDR bridge active: %s", exe_path)

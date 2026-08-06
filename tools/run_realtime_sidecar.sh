@@ -5,9 +5,49 @@ ROOT="${ROOT:-/home/qvise/antijamming}"
 cd "${ROOT}"
 
 PY_PID="${1:-}"
-IFACE="${IFACE:-enp6s0f1np1}"
+IFACE="${IFACE:-}"
 INTERVAL="${INTERVAL:-1}"
 GNSS_MATCH="${GNSS_MATCH:-${ROOT}/gnss-sdr/*/gnss-sdr --config_file=*fifo_gps_l1.conf}"
+
+runtime_usrp_ip() {
+  python3 - <<'PY'
+import json
+import re
+from pathlib import Path
+
+cfg = json.loads(Path("configs/antijamming/x300_realtime.json").read_text())
+match = re.search(r"addr=([\d.]+)", str(cfg.get("usrp_addr", "")))
+if match:
+    print(match.group(1))
+PY
+}
+
+route_iface_for_ip() {
+  local ip_addr="$1"
+  local route_line
+
+  [[ -n "${ip_addr}" ]] || return 1
+  route_line="$(ip route get "${ip_addr}" 2>/dev/null | head -n1 || true)"
+  awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "dev" && (i + 1) <= NF) {
+          print $(i + 1)
+          exit
+        }
+      }
+    }
+  ' <<<"${route_line}"
+}
+
+if [[ -z "${IFACE}" ]]; then
+  IFACE="$(route_iface_for_ip "$(runtime_usrp_ip)")"
+fi
+if [[ -z "${IFACE}" ]]; then
+  echo "Could not determine USRP network interface for sidecar logging." >&2
+  echo "Set IFACE or ANTIJAM_SIDECAR_IFACE to the Ethernet interface connected to the X300." >&2
+  exit 2
+fi
 
 if [[ -z "${PY_PID}" ]]; then
   PY_PID="$(pgrep -fo "${ROOT}/.aj/bin/python -m antijamming.app.main" || true)"
@@ -25,6 +65,17 @@ printf '%s\n' "${SIDE}" > logs/sidecar/LATEST
 
 CHILD_PIDS=()
 GNSS_PID=""
+BACKEND_PID=""
+
+discover_backend_pid() {
+  ps -eo pid=,ppid=,args= | awk -v gui_pid="${PY_PID}" '
+    $2 == gui_pid &&
+    $0 ~ /-m antijamming[.]app[.]headless/ {
+      print $1
+      exit
+    }
+  '
+}
 
 discover_gnss_pid() {
   ps -eo pid=,args= | awk -v root="${ROOT}" '
@@ -41,13 +92,14 @@ discover_gnss_pid() {
 }
 
 pid_list_now() {
+  local backend
   local gnss
+  backend="$(discover_backend_pid)"
   gnss="$(discover_gnss_pid)"
-  if [[ -n "${gnss}" ]]; then
-    printf '%s,%s\n' "${PY_PID}" "${gnss}"
-  else
-    printf '%s\n' "${PY_PID}"
-  fi
+  local pids="${PY_PID}"
+  [[ -n "${backend}" ]] && pids="${pids},${backend}"
+  [[ -n "${gnss}" ]] && pids="${pids},${gnss}"
+  printf '%s\n' "${pids}"
 }
 
 write_manifest_start() {
@@ -56,6 +108,8 @@ write_manifest_start() {
     printf 'sidecar_started_local=%s\n' "$(date --iso-8601=ns)"
     printf 'repo=%s\n' "${ROOT}"
     printf 'python_pid=%s\n' "${PY_PID}"
+    printf 'gui_python_pid=%s\n' "${PY_PID}"
+    printf 'backend_python_pid_initial=%s\n' "${BACKEND_PID:-missing}"
     printf 'gnss_sdr_pid_initial=%s\n' "${GNSS_PID:-missing}"
     printf 'gnss_match=%s\n' "${GNSS_MATCH}"
     printf 'iface=%s\n' "${IFACE}"
@@ -66,10 +120,15 @@ write_manifest_start() {
 
 snapshot_processes() {
   local suffix="$1"
+  local backend
   local gnss
+  backend="$(discover_backend_pid)"
   gnss="$(discover_gnss_pid)"
-  ps -fp "${PY_PID}" ${gnss:+ "${gnss}"} > "${SIDE}/ps_${suffix}.txt" 2>&1 || true
-  ps -L -p "${PY_PID}" ${gnss:+ -p "${gnss}"} \
+  local pids="${PY_PID}"
+  [[ -n "${backend}" ]] && pids="${pids},${backend}"
+  [[ -n "${gnss}" ]] && pids="${pids},${gnss}"
+  ps -fp "${pids}" > "${SIDE}/ps_${suffix}.txt" 2>&1 || true
+  ps -L -p "${pids}" \
     -o pid,tid,psr,pcpu,pmem,stat,comm,wchan:32 \
     > "${SIDE}/ps_threads_${suffix}.txt" 2>&1 || true
 }
@@ -84,6 +143,7 @@ launch() {
 }
 
 GNSS_PID="$(discover_gnss_pid)"
+BACKEND_PID="$(discover_backend_pid)"
 write_manifest_start
 
 uname -a > "${SIDE}/uname.txt" || true
@@ -104,8 +164,12 @@ repo_root="$1"
 interval="$2"
 last=""
 while kill -0 "${root_pid}" 2>/dev/null; do
+  backend="$(ps -eo pid=,ppid=,args= | awk -v gui_pid="${root_pid}" '\''$2 == gui_pid && $0 ~ /-m antijamming[.]app[.]headless/ {print $1; exit}'\'')"
   gnss="$(ps -eo pid=,args= | awk -v root="${repo_root}" '\''index($0, root "/gnss-sdr/") && $0 ~ /\/gnss-sdr --config_file=.*fifo_gps_l1[.]conf/ && $0 !~ /bash -c/ && $0 !~ /tools\/run_realtime_sidecar[.]sh/ {gsub(/^[[:space:]]+/, "", $0); split($0, fields, " "); print fields[1]; exit}'\'')"
   pids="${root_pid}"
+  if [[ -n "${backend}" ]]; then
+    pids="${pids},${backend}"
+  fi
   if [[ -n "${gnss}" ]]; then
     pids="${pids},${gnss}"
   fi
@@ -123,8 +187,12 @@ repo_root="$1"
 interval="$2"
 last=""
 while kill -0 "${root_pid}" 2>/dev/null; do
+  backend="$(ps -eo pid=,ppid=,args= | awk -v gui_pid="${root_pid}" '\''$2 == gui_pid && $0 ~ /-m antijamming[.]app[.]headless/ {print $1; exit}'\'')"
   gnss="$(ps -eo pid=,args= | awk -v root="${repo_root}" '\''index($0, root "/gnss-sdr/") && $0 ~ /\/gnss-sdr --config_file=.*fifo_gps_l1[.]conf/ && $0 !~ /bash -c/ && $0 !~ /tools\/run_realtime_sidecar[.]sh/ {gsub(/^[[:space:]]+/, "", $0); split($0, fields, " "); print fields[1]; exit}'\'')"
   pids="${root_pid}"
+  if [[ -n "${backend}" ]]; then
+    pids="${pids},${backend}"
+  fi
   if [[ -n "${gnss}" ]]; then
     pids="${pids},${gnss}"
   fi
@@ -209,6 +277,7 @@ cleanup() {
   {
     printf 'sidecar_stopping_utc=%s\n' "$(date -u --iso-8601=ns)"
     printf 'sidecar_stopping_local=%s\n' "$(date --iso-8601=ns)"
+    printf 'backend_python_pid_final=%s\n' "$(discover_backend_pid || true)"
     printf 'gnss_sdr_pid_final=%s\n' "$(discover_gnss_pid || true)"
   } >> "${SIDE}/manifest.txt"
 

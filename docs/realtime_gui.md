@@ -10,6 +10,50 @@ Run the normal realtime product:
 ./run_realtime.sh
 ```
 
+Do not run the realtime operator GUI over SSH X11 forwarding. In this repo's
+measured runs, the SSH-forwarded display appeared as `DISPLAY=localhost:10.0`
+with an active `SSH_CONNECTION`, and Qt later reported a broken X11 connection
+or left the GUI process stuck while GNSS-SDR continued/cleaned up separately.
+
+For interactive operation from a laptop, use the configured GNOME RDP desktop:
+
+```text
+Protocol: RDP
+Server: 10.189.184.209:3389
+Username: qvise
+```
+
+The current workstation RDP session is configured as `antijam-gnome-safe`, which
+forces GNOME Shell and the RDP handover path to use software rendering. This is
+intentional: measured RDP login attempts using the default Ubuntu Wayland session
+crashed GNOME Shell with `signal 11` after DRI/Vulkan driver errors.
+
+The anti-jam GUI is installed as a desktop autostart entry for that RDP session.
+It waits 20 seconds for the desktop to settle, then runs:
+
+```bash
+cd /home/qvise/antijamming
+./run_realtime.sh
+```
+
+If you need to restart the GUI manually, open a terminal inside the RDP desktop
+and run:
+
+```bash
+cd /home/qvise/antijamming
+./run_realtime.sh
+```
+
+For non-interactive receiver diagnostics over SSH, use the offscreen Qt path:
+
+```bash
+QT_QPA_PLATFORM=offscreen ./run_realtime.sh --auto-start --auto-stop-after-s 170 --quit-after-stop
+```
+
+The launcher rejects SSH X11 forwarding by default. To force that old transport
+for a short test, set `ANTIJAM_ALLOW_SSH_X11=1`; expect slow or fragile GUI
+behavior. The supported operator path is the configured GNOME RDP desktop.
+
 Run phase calibration from the sibling repo:
 
 ```bash
@@ -39,15 +83,39 @@ That file owns the X300/TwinRX spec values such as sample rate, center frequency
 gain, channel order, antenna map, TwinRX LO map, array spacing, frame sizes, and
 GNSS-SDR runtime profile values.
 
-The USRP address is fixed to the known X300/XG 10GbE SFP path:
+`sample_rate` is the single authored receive-rate setting. Changing that one
+number also sets the USRP RX bandwidth, fixed minimum rate, and the
+sample-rate/bandwidth values recorded in the experiment manifest. Do not add
+separate `usrp_rx_bandwidth_hz`, `min_sample_rate`,
+`experiment.sample_rate_sps`, or `experiment.rx_bandwidth_hz` keys; the loader
+rejects those duplicates.
+
+The GNSS-SDR digital input filter uses `Freq_Xlating_Fir_Filter` at zero IF and
+decimation 1. It has a fixed 2.6 MHz physical passband and a 3.0 MHz stopband
+start, leaving a 200 kHz edge-to-edge transition on each side. The passband
+contains the 2.046 MHz GPS L1 C/A null-to-null main lobe plus 277 kHz of guard
+on each side. Startup rejects sample rates at or below 3.0 MS/s because they
+cannot represent the configured stopband below Nyquist.
+
+The translating filter is rendered with `filter_type=lowpass`, `bw=1385000`,
+and `tw=175000`. There is deliberately no `number_of_taps`: GNSS-SDR passes
+`bw` and `tw` to GNU Radio's `firdes.low_pass`, which designs a Hamming-window
+filter automatically. At 4 MS/s, GNU Radio's estimate is
+`N = floor(A*Fs/(22*tw)) = floor(53*4e6/(22*175e3)) = 55` taps; 55 is already
+odd. Evaluating those exact generated coefficients gives 0.44346 dB maximum
+ripple through +/-1.3 MHz and -43.7022 dB maximum response from +/-1.5 MHz,
+meeting the 0.5 dB / 40 dB limits. The resulting linear-phase group delay is
+`(55-1)/(2*4e6) = 6.75 us`.
+
+The USRP address is fixed to the known X300/HG Port-1 10GbE SFP path:
 
 ```json
 "usrp_addr": "addr=192.168.40.2"
 ```
 
-The host-side 10GbE profile uses `192.168.40.1/24` on the SFP+ NIC. The runtime
-uses fixed UHD transport frame sizes of 8000 bytes for this profile; it does not
-search for another USRP address.
+The host-side 10GbE profile currently uses `192.168.40.1/24` on `enP7s7`.
+`setup.sh` can auto-detect the connected X300 across the known X3x0 subnets;
+the GUI runtime still uses the concrete `usrp_addr` value in this JSON file.
 
 ## GNSS-SDR Path
 

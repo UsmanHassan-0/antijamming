@@ -89,17 +89,24 @@ def test_fpga_image_flavor_parser_detects_xg_bit_path() -> None:
     )
 
 
-def test_x300_fpga_image_check_accepts_reported_xg() -> None:
-    device = _device_for_fake_usrp(
-        _FakeUsrp(sensors={"fpga_image": "/usr/share/uhd/images/usrp_x300_fpga_XG.bit"})
+def test_fpga_image_flavor_parser_detects_hg_bit_path() -> None:
+    assert (
+        _fpga_image_flavor_from_text("FPGA path: /usr/share/uhd/images/usrp_x300_fpga_HG.bit")
+        == "HG"
     )
 
-    assert device._verify_x300_fpga_image() == ["Mboard0 FPGA image: XG"]
 
-
-def test_x300_fpga_image_check_rejects_non_xg_report() -> None:
+def test_x300_fpga_image_check_accepts_reported_hg() -> None:
     device = _device_for_fake_usrp(
-        _FakeUsrp(sensors={"fpga_image": "fpga: hg"})
+        _FakeUsrp(sensors={"fpga_image": "/usr/share/uhd/images/usrp_x300_fpga_HG.bit"})
+    )
+
+    assert device._verify_x300_fpga_image() == ["Mboard0 FPGA image: HG"]
+
+
+def test_x300_fpga_image_check_rejects_non_hg_report() -> None:
+    device = _device_for_fake_usrp(
+        _FakeUsrp(sensors={"fpga_image": "fpga: xg"})
     )
 
     try:
@@ -107,9 +114,9 @@ def test_x300_fpga_image_check_rejects_non_xg_report() -> None:
     except RuntimeError as exc:
         message = str(exc)
     else:
-        raise AssertionError("non-XG FPGA image should be rejected")
+        raise AssertionError("non-HG FPGA image should be rejected")
 
-    assert "requires XG" in message
+    assert "requires HG" in message
     assert "./setup.sh" in message
 
 
@@ -118,5 +125,5 @@ def test_x300_fpga_image_check_reports_unknown_when_uhd_omits_flavor() -> None:
 
     assert device._verify_x300_fpga_image() == [
         "Mboard FPGA image: not reported by UHD (mboard_indices=0); "
-        "XG could not be verified from runtime metadata."
+        "HG could not be verified from runtime metadata."
     ]

@@ -2,7 +2,14 @@
 
 This document records **what UHD and the OS report** for the connected system: motherboard, daughterboards (including TwinRX), synchronization options, RFNoC graph, and the **host ↔ radio** Ethernet path. Regenerate after hardware changes by re-running the commands in [How this file was produced](#how-this-file-was-produced).
 
-**Snapshot date:** 2026-04-17 (UHD probe snapshot), with live host transport/performance update on 2026-04-24.  
+**Snapshot date:** 2026-08-06.
+
+**Live DGX/X300 update:** The connected path is `enP7s7` with host address
+`192.168.40.1/24`, MTU `9000`, and route
+`192.168.40.2 dev enP7s7 src 192.168.40.1`. The link reports 10,000 Mb/s,
+full duplex. UHD reports X300 serial `35D068E`, FPGA image `HG`, and a maximum
+frame size of `8000` bytes. This is the HG Port-1 10GbE path; XG is not required
+for this single 10GbE connection.
 
 ---
 
@@ -19,8 +26,8 @@ This document records **what UHD and the OS report** for the connected system: m
 
 | Item | Value |
 |------|--------|
-| **UHD version** | `4.9.0.0+ds1-1~noble2` |
-| **Build / platform (from logs)** | GNU C++ 13.3.0; Boost 1.83; Linux |
+| **UHD version** | `4.6.0.0+ds1-5.1ubuntu0.24.04.1` |
+| **Build / platform (from probe)** | GNU C++ 13.2.0; Boost 1.83; Linux |
 
 ---
 
@@ -30,8 +37,8 @@ This document records **what UHD and the OS report** for the connected system: m
 |------|--------|
 | **Product** | X300 |
 | **UHD type** | `x300` |
-| **FPGA image** | `XG` |
-| **Serial** | `32CEC52` |
+| **FPGA image** | `HG` |
+| **Serial** | `35D068E` |
 | **Connection address used** | `addr=192.168.40.2` |
 | **RFNoC capable** | Yes |
 
@@ -48,16 +55,16 @@ This document records **what UHD and the OS report** for the connected system: m
 | **revision_compat** | 7 |
 | **product (numeric)** | 30817 |
 | **FW version** | 6.1 |
-| **FPGA version** | 39.3 |
-| **FPGA git hash** | da5c64b |
-| **Device DNA** | 0018C5282869685C |
+| **FPGA version** | 39.2 |
+| **FPGA git hash** | 6a990d9 |
+| **Device DNA** | Not reported by the current probe |
 
 ### Ethernet interfaces on the USRP (as reported by UHD)
 
 | Port | MAC address | IP address | Subnet |
 |------|-------------|------------|--------|
-| 0 | 00:80:2f:39:51:2f | 192.168.10.2 | 255.255.255.0 |
-| 1 | 00:80:2f:39:51:30 | 192.168.20.2 | 255.255.255.0 |
+| 0 | 00:80:2f:44:37:fa | 192.168.10.2 | 255.255.255.0 |
+| 1 | 00:80:2f:44:37:fb | 192.168.20.2 | 255.255.255.0 |
 | 2 | *(same mboard)* | 192.168.30.2 | 255.255.255.0 |
 | 3 | *(same mboard)* | 192.168.40.2 | 255.255.255.0 |
 
@@ -74,10 +81,9 @@ This document records **what UHD and the OS report** for the connected system: m
 
 | Item | Value |
 |------|--------|
-| **Maximum frame size (observed)** | 7972 bytes (after host MTU=8000) |
-| **UHD guidance** | For this link, UHD recommends **send_frame_size** and **recv_frame_size** of at least **8000** for best performance. |
-| **Observed limitation** | Configuration “will only allow **7972**” — UHD still warns when requesting `recv_frame_size/send_frame_size=8000` because payload max is slightly below 8000. |
-| **Practical implication** | Use `recv_frame_size/send_frame_size` at or below **7972** for clean transport settings on current link MTU. |
+| **Maximum frame size (observed)** | 8000 bytes with host MTU 9000 |
+| **Configured frame sizes** | `recv_frame_size=8000`, `send_frame_size=8000` |
+| **Practical implication** | The configured 8000-byte UHD frames fit the current Port-1 10GbE path. |
 
 ### Other UHD messages at probe
 
@@ -162,7 +168,7 @@ For each TwinRX RX frontend, UHD reports:
 | Item | Value |
 |------|--------|
 | **ID** | Unknown (0x0094) |
-| **Serial** | 34E32C8 |
+| **Serial** | 35946E7 |
 | **Revision** | 8 |
 | **TX Frontend name** | Unknown (0x0094) - 0 |
 | **Antennas** | *(empty in probe)* |
@@ -177,7 +183,7 @@ For each TwinRX RX frontend, UHD reports:
 | Item | Value |
 |------|--------|
 | **ID** | TwinRX Rev C (0x0095) |
-| **Serial** | 34E2F1D |
+| **Serial** | 3594760 |
 | **Revision** | 5 |
 
 **TwinRX RX0 (frontend 0)**
@@ -215,7 +221,7 @@ For each TwinRX RX frontend, UHD reports:
 | Item | Value |
 |------|--------|
 | **ID** | Unknown (0x0094) |
-| **Serial** | 346D4DD |
+| **Serial** | 3594707 |
 | **Revision** | 8 |
 | **TX Frontend** | Same placeholder pattern as Radio#0 (0 MHz range in probe) |
 | **Connection type** | IQ |
@@ -226,7 +232,7 @@ For each TwinRX RX frontend, UHD reports:
 | Item | Value |
 |------|--------|
 | **ID** | TwinRX Rev C (0x0095) |
-| **Serial** | 346F390 |
+| **Serial** | 3594754 |
 | **Revision** | 5 |
 
 **TwinRX RX0 (frontend 0)** — same spec pattern as Radio#0: 10–6000 MHz, 80 MHz BW, 0–93 dB, antennas RX1/RX2, `lo_locked`, connection **II**.
@@ -243,11 +249,11 @@ Measurements below are for the interface used to reach **192.168.40.2** (USRP po
 
 | Item | Value |
 |------|--------|
-| **Interface** | `enp6s0f1np1` |
-| **PCI address** | `06:00.1` |
-| **Device** | Intel Ethernet Controller **X710** for 10GbE SFP+ `[8086:1572]` (rev 02) |
-| **Kernel driver** | `i40e` |
-| **Link** | Up, **10000 Mb/s**, Full duplex, FIBRE (SFP+) |
+| **Interface** | `enP7s7` (alternate name `enP7p1s0`) |
+| **PCI address** | `0007:01:00.0` |
+| **Device** | 10GbE adapter on the direct X300 data path |
+| **Kernel driver** | `r8127` |
+| **Link** | Up, **10000 Mb/s**, full duplex |
 
 ### IPv4 path
 
@@ -255,14 +261,14 @@ Measurements below are for the interface used to reach **192.168.40.2** (USRP po
 |------|--------|
 | **Host IP** | 192.168.40.1/24 |
 | **USRP IP (used)** | 192.168.40.2/24 |
-| **Host MAC** | 40:a6:b7:06:a0:81 |
+| **Host MAC** | 4c:bb:47:81:7e:4d |
 
 ### MTU and buffering
 
 | Item | Value |
 |------|--------|
-| **MTU** | 8000 |
-| **UHD max frame (with MTU 8000)** | 7972 bytes (see [Transport / streaming](#transport--streaming-uhd-log-at-connect)) |
+| **MTU** | 9000 |
+| **UHD max frame (with MTU 9000)** | 8000 bytes (see [Transport / streaming](#transport--streaming-uhd-log-at-connect)) |
 
 **MTU vs sample rate (Msps):** They are **not** the same thing. **Msps** is how many complex samples per second you stream (set in software / DDC). **MTU** is the **maximum payload per Ethernet frame** on the host link. UHD does **not** compute MTU from Msps. In practice they **interact**: higher aggregate throughput (more Msps × more channels) needs **more bytes per second**; smaller MTU means **more packets per second** for the same throughput, which can stress the stack. So you tune **both** — e.g. lower Msps to reduce load, **and** raise MTU (jumbo) to allow larger UHD `recv_frame_size` / `send_frame_size` on 10GbE.
 
@@ -303,7 +309,7 @@ Computed aggregate:
 
 Comparison to current host link:
 
-- NIC: Intel X710, link up at **10,000 Mb/s** full duplex.
+- NIC: `enP7s7` using `r8127`, link up at **10,000 Mb/s** full duplex.
 - At **10 Msps/ch**, wire load (~1.28 Gb/s) is comfortably below 10GbE.
 - At **50 Msps/ch**, wire load (~6.4 Gb/s) is significant but below nominal link.
 - At **80 Msps/ch**, wire load (~10.24 Gb/s) is already above nominal 10GbE *before* Ethernet/IP/UDP overhead, so overflow/drops are expected unless channel/rate/path changes.
@@ -313,7 +319,7 @@ Comparison to current host link:
 | Layer | Current value | Why it matters |
 |------|---------------|----------------|
 | Kernel | Linux `6.17.0-20-generic` | Driver/network stack behavior and available tuning features |
-| NIC model | Intel X710 SFP+ (`i40e`) | 10GbE class interface to USRP |
+| NIC model | `enP7s7` (`r8127`) | Current 10GbE interface to the USRP |
 | Link state | 10000 Mb/s, full duplex, link detected | Physical link is healthy/up |
 | MTU | 9000 live on 2026-04-24; older UHD probe snapshot used 8000 | Enables jumbo frames. Re-run `uhd_usrp_probe --args addr=192.168.40.2` if exact UHD max frame size after MTU 9000 is needed. |
 | Socket buffers | `rmem_max=26214400`, `wmem_max=26214400`, defaults same | Larger UDP buffering than stock defaults |
@@ -331,7 +337,7 @@ These values were checked live on 2026-04-24 and supersede older host-side value
 | CPU governor | All `32` cpufreq governors are `performance` | Avoids frequency-scaling lag during realtime streaming. |
 | CPU frequency policy | `scaling_min_freq=3201000 kHz`, `scaling_max_freq=3201000 kHz`; boost active; observed current frequencies up to about `5.7 GHz` | Frequency policy is pinned high, with turbo still active. |
 | OS power profile | `powerprofilesctl get` reports `balanced` | Power profile is not the same as cpufreq governor; cpufreq itself is already `performance`. |
-| NIC | `enp6s0f1np1`, Intel X710 SFP+ / `i40e`, PCI `06:00.1` | 10GbE data path to USRP `192.168.40.2`. |
+| NIC | `enP7s7`, `r8127`, PCI `0007:01:00.0` | Current 10GbE data path to USRP `192.168.40.2`. |
 | Link | `10000 Mb/s`, full duplex, FIBRE, link detected | Physical link is up at 10GbE. |
 | NIC queues | `32` TX queues and `32` RX queues | Parallel NIC queueing is available. |
 | MTU | `9000` | Jumbo frames are enabled. |
@@ -345,7 +351,7 @@ Live transport interpretation:
 - MTU and sample rate are independent. MTU controls Ethernet frame payload size; sample rate controls samples per second from UHD/DDC.
 - Higher sample rate increases bytes/s and packets/s. Jumbo MTU and large rings reduce per-packet overhead and burst drop risk, but they do not change Nyquist or RF bandwidth.
 - For one channel, `10 Msps` is modest for 10GbE. Previous `10 MHz` GNSS-SDR test issues looked more likely to be processing, conditioning, tracking robustness, or scheduling details than raw link capacity alone.
-- The older UHD max frame-size value of about `7972` bytes was measured with MTU `8000`. With live MTU `9000`, re-run `uhd_usrp_probe --args addr=192.168.40.2` to record the exact current UHD frame-size limit.
+- The current UHD probe with host MTU `9000` reports a maximum frame size of `8000` bytes.
 
 ### USRP + daughterboard limits relevant to this setup
 
@@ -366,7 +372,7 @@ Live transport interpretation:
 
 Runtime streaming values live in `configs/antijamming/x300_realtime.json`, loaded through `src/antijamming/config/schemas/runtime.py`, including:
 
-- `usrp_addr` value `addr=192.168.40.2`, the fixed X300/XG 10GbE SFP path
+- `usrp_addr` value `addr=192.168.40.2`, the current X300/HG Port-1 10GbE path
 - `recv_frame_size` / `send_frame_size` value **8000** for the jumbo-frame
   10GbE product profile
 - Default `sample_rate`, `center_freq_hz`, `channels`, `antenna`, etc.

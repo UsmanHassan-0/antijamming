@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -43,17 +45,33 @@ class ProcessMixin:
                 return candidate.resolve()
         return None
 
-    def _gnss_sdr_launch_args(self, exe_path: Path) -> list[str]:
-        """Return GNSS-SDR subprocess arguments for the product runtime."""
+    def _gnss_sdr_command_args(self, exe_path: Path) -> list[str]:
+        """Return raw GNSS-SDR command arguments for the product runtime."""
         args = [
             str(exe_path),
             f"--config_file={self._config_path}",
             "--logtostderr=1",
+            "--minloglevel=1",
         ]
         stdbuf = shutil.which("stdbuf")
         if stdbuf:
             return [stdbuf, "-oL", "-eL", *args]
         return args
+
+    def _gnss_sdr_launch_args(self, exe_path: Path) -> list[str]:
+        """Return parent-guarded GNSS-SDR subprocess arguments."""
+        command = self._gnss_sdr_command_args(exe_path)
+        if not sys.platform.startswith("linux"):
+            return command
+        return [
+            sys.executable,
+            "-m",
+            "antijamming.gnss.sdr_bridge.parent_guard",
+            "--parent-pid",
+            str(os.getpid()),
+            "--",
+            *command,
+        ]
 
     def _terminate_matching_stale_processes(self) -> None:
         matches = self._matching_gnss_sdr_processes()
@@ -202,9 +220,36 @@ class ProcessMixin:
         return False
 
     def _reset_runtime_dir(self) -> None:
-        self._clear_dir(self._runtime_dir)
-        if self._log_dir != self._runtime_dir:
-            self._clear_dir(self._log_dir)
+        configured_runtime_dir = self._runtime_dir
+        configured_log_dir = self._log_dir
+        try:
+            self._clear_dir(configured_runtime_dir)
+            if configured_log_dir != configured_runtime_dir:
+                self._clear_dir(configured_log_dir)
+            return
+        except PermissionError as exc:
+            fallback_runtime_dir = self._runtime_fallback_dir()
+            fallback_log_dir = fallback_runtime_dir / "glog"
+            self._log.warning(
+                "GNSS-SDR runtime path is not writable (%s: %s); "
+                "using per-user fallback runtime=%s log_dir=%s",
+                exc.filename or configured_runtime_dir,
+                exc,
+                fallback_runtime_dir,
+                fallback_log_dir,
+            )
+            self._set_session_paths(fallback_runtime_dir, fallback_log_dir)
+            self._clear_dir(self._runtime_dir)
+            if self._log_dir != self._runtime_dir:
+                self._clear_dir(self._log_dir)
+
+    def _runtime_fallback_dir(self) -> Path:
+        uid = getattr(os, "getuid", lambda: "user")()
+        return (
+            Path(tempfile.gettempdir())
+            / f"antijamming-{uid}"
+            / f"gnss-sdr-runtime-{os.getpid()}"
+        )
 
     def _clear_dir(self, base_dir: Path) -> None:
         base_dir.mkdir(parents=True, exist_ok=True)

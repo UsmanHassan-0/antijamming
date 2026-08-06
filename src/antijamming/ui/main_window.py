@@ -16,7 +16,9 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QTabBar,
     QTabWidget,
     QVBoxLayout,
@@ -27,7 +29,7 @@ from antijamming.dsp.models import (
     internal_angle_to_operator_bearing_deg,
     operator_bearing_axis_for_internal_scan,
 )
-from antijamming.dsp.phase import load_phase_correction_vector
+from antijamming.dsp.phase import load_calibration_correction_selection
 from antijamming.config import REPO_ROOT, StreamConfig
 from antijamming.gnss.sdr_bridge.constants import PVT_DEGRADED_PDOP_THRESHOLD
 from antijamming.runtime import StreamWorker
@@ -38,7 +40,9 @@ from antijamming.ui.widgets.cards import (
     make_stretch_row,
 )
 from antijamming.ui.widgets.plots import (
-    build_doa_plot,
+    build_doa_polar_plot,
+    build_lcmv_response_plot,
+    set_polar_radial_scale,
 )
 from antijamming.ui.widgets.prn_monitor import PocketPrnMonitor
 from antijamming.ui.widgets.skyplot import SkyplotMonitor
@@ -70,12 +74,9 @@ from antijamming.ui.specs import (
     PLOT_TILE_MARGINS,
     PRN_PLOT_COMPACT_MIN_HEIGHT,
     PRN_PLOT_MIN_HEIGHT,
-    REALTIME_ALGORITHM_PLOT_COMPACT_MIN_HEIGHT,
     REALTIME_ALGORITHM_PLOT_MIN_HEIGHT,
     ROW_SPACING,
     SECTION_SPACING,
-    SKYPLOT_COMPACT_MIN_SIZE,
-    SKYPLOT_MAX_SIZE,
     SKYPLOT_MIN_SIZE,
     ZERO_MARGINS,
 )
@@ -87,7 +88,7 @@ from antijamming.ui.state import (
     valid_prn,
 )
 
-_OPERATOR_UI_REFRESH_MIN_MS = 50
+_OPERATOR_UI_REFRESH_MIN_MS = 100
 _UI_HEARTBEAT_LOG_INTERVAL_S = 5.0
 _UI_TIMER_STALL_WARN_S = 1.0
 _UI_SLOW_REFRESH_WARN_MS = 150.0
@@ -132,15 +133,22 @@ class MainWindow(QMainWindow):
         self._position_error_label = QLabel("PVT accuracy: --")
         self._enu_label = QLabel("UTM east/north: -- / --")
         self._system_health_label = QLabel("System health: Idle")
-        self._antijam_summary_label = QLabel("Idle | Direction --")
-        self._stream_summary_label = QLabel("Idle\nOutput: GNSS IQ -> GNSS-SDR")
-        self._jammer_detection_checkbox = QCheckBox("Jammer detection")
+        self._antijam_summary_label = QLabel("DoA -- | MUSIC sources --")
+        self._stream_summary_label = QLabel("Idle\nOutput: Uniform array IQ -> GNSS-SDR")
+        self._expected_sources_spin = QSpinBox()
+        self._expected_sources_control = self._build_expected_sources_control()
+        self._lcmv_test_checkbox = QCheckBox("LCMV Test Nulling")
+        self._lcmv_test_control = self._build_lcmv_test_control()
+        self._lcmv_test_status_label = QLabel("LCMV Test Nulling: OFF")
+        self._lcmv_null_bearing_label = QLabel("Null bearing / MUSIC peak: --")
         self._stream_status_text = "Idle"
         self._receiver_fix_text = "Not available"
         self._receiver_accuracy_text = "--"
+        self._tracking_prn_count = 0
         self._stable_prn_count = 0
         self._used_in_pvt_count = 0
         self._current_tracking_prns: list[int] = []
+        self._current_tracking_satellite_ids: list[str] = []
         self._stable_prns: list[int] = []
         self._current_used_in_pvt_prns: list[int] = []
         self._raw_used_in_fix_prns: list[int] = []
@@ -173,34 +181,35 @@ class MainWindow(QMainWindow):
         self._last_skyplot_update_s = 0.0
         self._last_prn_chart_signature: tuple[object, ...] | None = None
         self._last_skyplot_signature: tuple[object, ...] | None = None
-        self._jammer_summary_text = "Idle"
+        self._last_system_info_text = ""
+        self._doa_summary_text = "--"
+        self._source_count_summary_text = self._source_count_display_text({})
         self._status_chip = QLabel("Stream: Idle")
         self._mode_chip = QLabel("")
         self._fix_chip = QLabel("Not available")
-        self._jammer_chip = QLabel("Idle")
         self._doa_chip = QLabel("--")
         self._accuracy_chip = QLabel("--")
         self._stable_prns_chip = QLabel("0")
         self._used_in_pvt_chip = QLabel("0")
-        self._phase_chip = QLabel("Not checked")
         self._gnss_chip = QLabel("")
-        self._jammer_state_label = QLabel("Interference: Idle")
-        self._jammer_power_label = QLabel("Raw IQ power: --")
-        self._jammer_power_rise_label = QLabel("Power rise: --")
+        self._doa_status_label = QLabel("DoA: --")
+        self._music_sources_label = QLabel("MUSIC sources: --")
         self._rx_clipping_label = QLabel("RX clipping: --")
         self._rx_peak_label = QLabel("IQ peak: --")
         self._rx_rms_label = QLabel("IQ RMS: --")
         self._rx_near_full_scale_label = QLabel("Near full scale: --")
-        self._jammer_doa_label = QLabel("Direction candidate: --")
-        self._output_path_label = QLabel("Output: GNSS IQ -> GNSS-SDR")
+        self._output_path_label = QLabel("Output: Uniform Array IQ -> GNSS-SDR")
         self._system_info_label = QLabel("")
         self._prn_monitor: PocketPrnMonitor | None = None
         self._skyplot_monitor: SkyplotMonitor | None = None
         self._skyplot_section: QWidget | None = None
+        self._receiver_status_section: QWidget | None = None
         self._skyplot_heading_label: QLabel | None = None
         self._skyplot_legend_label: QLabel | None = None
         self._receiver_overview_row: QBoxLayout | None = None
         self._operator_nav_bar: QTabBar | None = None
+        self._startup_screen_fit_done = False
+        self._last_screen_geometry: tuple[int, int, int, int] | None = None
 
         self._run_btn = QPushButton("")
         self._metrics_timer = QTimer(self)
@@ -209,7 +218,6 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Anti-Jamming Control")
         self._build_ui()
-        self.maximize_to_available_screen()
         self._connect_signals()
         self._metrics_timer.start()
         self._refresh_system_info()
@@ -217,7 +225,6 @@ class MainWindow(QMainWindow):
         self._clear_antijam_operator_state()
         self._set_direction_chip("--", INFO)
         self._set_accuracy_chip("--", INFO)
-        self._set_phase_chip("Not checked", INFO)
         self._gnss_chip.hide()
         self._set_status_state("idle", "Idle")
 
@@ -236,7 +243,8 @@ class MainWindow(QMainWindow):
         self._run_btn.setMinimumWidth(112)
         self._run_btn.clicked.connect(self._toggle_run)
         self._run_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._configure_jammer_detection_toggle()
+        self._configure_expected_sources_control()
+        self._configure_lcmv_test_control()
 
         self._load_configured_phase_calibration()
         layout.addWidget(self._build_main_view(), stretch=1)
@@ -261,13 +269,27 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
-        QTimer.singleShot(0, self.maximize_to_available_screen)
+        if not self._startup_screen_fit_done:
+            QTimer.singleShot(0, self.maximize_to_available_screen)
 
     def maximize_to_available_screen(self) -> None:
         screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is None:
             return
         available = screen.availableGeometry()
+        geometry = (
+            available.x(),
+            available.y(),
+            available.width(),
+            available.height(),
+        )
+        if (
+            self._last_screen_geometry == geometry
+            and self.windowState() & Qt.WindowState.WindowMaximized
+        ):
+            return
+        self._startup_screen_fit_done = True
+        self._last_screen_geometry = geometry
         self.setMaximumSize(available.size())
         self.setGeometry(available)
         self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
@@ -291,7 +313,6 @@ class MainWindow(QMainWindow):
         )
         for row_name in (
             "_receiver_overview_row",
-            "_algorithm_plots_row",
         ):
             row = getattr(self, row_name, None)
             if row is not None and row.direction() != row_direction:
@@ -317,19 +338,26 @@ class MainWindow(QMainWindow):
                 monitor.setMaximumSize(skyplot_size, skyplot_size)
                 monitor.set_plot_side(skyplot_size)
         self._constrain_receiver_card_to_content()
-        plot_height = (
-            REALTIME_ALGORITHM_PLOT_COMPACT_MIN_HEIGHT
-            if compact
-            else REALTIME_ALGORITHM_PLOT_MIN_HEIGHT
+        algorithm_plots = tuple(
+            plot
+            for plot in (
+                getattr(self, "_lcmv_response_plot", None),
+                getattr(self, "_doa_polar_db_plot", None),
+            )
+            if plot is not None
         )
-        for plot_name in ("_doa_plot",):
-            plot = getattr(self, plot_name, None)
-            if plot is not None:
-                plot.setMinimumHeight(
-                    max(
-                        REALTIME_ALGORITHM_PLOT_COMPACT_MIN_HEIGHT,
-                        min(plot_height, int(max(1, height) * 0.16)),
-                    )
+        if algorithm_plots:
+            polar_target_height = int(REALTIME_ALGORITHM_PLOT_MIN_HEIGHT * 1.75)
+            polar_height = max(
+                int(REALTIME_ALGORITHM_PLOT_MIN_HEIGHT * 1.45),
+                min(
+                    int(REALTIME_ALGORITHM_PLOT_MIN_HEIGHT * 2.1),
+                    max(polar_target_height, int(max(1, height) * 0.38)),
+                ),
+            )
+            for algorithm_plot in algorithm_plots:
+                algorithm_plot.setMinimumHeight(
+                    polar_height,
                 )
         main_view = getattr(self, "_main_view", None)
         if main_view is not None:
@@ -405,6 +433,7 @@ class MainWindow(QMainWindow):
             self._operator_tabs.currentChanged.connect(
                 self._operator_nav_bar.setCurrentIndex
             )
+            self._operator_tabs.currentChanged.connect(self._on_operator_tab_changed)
         return self._operator_tabs
 
     def _build_receiver_tab(self) -> QWidget:
@@ -427,11 +456,61 @@ class MainWindow(QMainWindow):
         self._antijam_tab.setObjectName("antijamTab")
         self._antijam_tab.setAccessibleName("Anti-Jam processing view")
         self._antijam_tab.setStyleSheet(f"background:{BG_APP}; border:none;")
+        self._antijam_tab.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         layout = QVBoxLayout(self._antijam_tab)
         layout.setContentsMargins(*PAGE_MARGINS)
         layout.setSpacing(SECTION_SPACING)
-        layout.addWidget(self._build_realtime_algorithm_plots(), stretch=1)
-        return self._antijam_tab
+        layout.addWidget(
+            self._build_antijam_status_card(),
+            alignment=Qt.AlignmentFlag.AlignTop,
+        )
+        layout.addWidget(
+            self._build_realtime_algorithm_plots(),
+            stretch=1,
+        )
+        self._antijam_scroll_area = QScrollArea()
+        self._antijam_scroll_area.setObjectName("antijamScrollArea")
+        self._antijam_scroll_area.setWidgetResizable(True)
+        self._antijam_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._antijam_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._antijam_scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._antijam_scroll_area.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self._antijam_scroll_area.setStyleSheet(f"background:{BG_APP}; border:none;")
+        self._antijam_scroll_area.setWidget(self._antijam_tab)
+        return self._antijam_scroll_area
+
+    def _build_antijam_status_card(self) -> QWidget:
+        self._antijam_status_card, layout = make_panel("")
+        self._antijam_status_card.setObjectName("operatorAntiJamStatusCard")
+        self._antijam_status_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
+        )
+        antijam_labels = (
+            self._expected_sources_control,
+            self._lcmv_test_control,
+            self._lcmv_test_status_label,
+            self._lcmv_null_bearing_label,
+            self._music_sources_label,
+            self._doa_status_label,
+            self._rx_clipping_label,
+            self._rx_peak_label,
+            self._rx_rms_label,
+            self._rx_near_full_scale_label,
+            self._system_health_label,
+        )
+        layout.addWidget(self._build_status_section("Anti-Jam", antijam_labels))
+        return self._antijam_status_card
 
     def _build_operator_header(self) -> QWidget:
         self._operator_header = QWidget()
@@ -467,31 +546,65 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
 
     def _build_realtime_algorithm_plots(self) -> QWidget:
-        doa_plot, self._doa_curve, self._doa_marker = build_doa_plot(
-            float(self._cfg.doa_min_deg),
-            float(self._cfg.doa_max_deg),
+        self._lcmv_response_plot, self._lcmv_response_curve, self._lcmv_response_marker = (
+            build_lcmv_response_plot(
+                doa_min_deg=float(self._cfg.doa_min_deg),
+                doa_max_deg=float(self._cfg.doa_max_deg),
+            )
         )
-        doa_plot.setMinimumHeight(REALTIME_ALGORITHM_PLOT_MIN_HEIGHT)
-        self._doa_plot = doa_plot
-        self._algorithm_plots_container, container_layout = make_panel("Signal Processing", "")
+        (
+            doa_polar_db_plot,
+            self._doa_polar_db_curve,
+            self._doa_polar_db_marker,
+        ) = build_doa_polar_plot()
+        self._lcmv_response_plot.setMinimumHeight(
+            int(REALTIME_ALGORITHM_PLOT_MIN_HEIGHT * 1.35)
+        )
+        doa_polar_db_plot.setMinimumHeight(int(REALTIME_ALGORITHM_PLOT_MIN_HEIGHT * 1.35))
+        self._doa_polar_db_plot = doa_polar_db_plot
+        self._algorithm_plots_container, container_layout = make_panel("")
         self._algorithm_plots_container.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        self._algorithm_plots_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
-        self._algorithm_plots_row.setContentsMargins(*ZERO_MARGINS)
-        self._algorithm_plots_row.setSpacing(ROW_SPACING)
-        self._algorithm_plots_row.addWidget(
-            self._build_plot_tile("DoA / MUSIC Spectrum", make_plot_body(doa_plot)),
+        self._lcmv_response_container = self._build_plot_tile(
+            "",
+            make_plot_body(self._lcmv_response_plot),
+        )
+        self._lcmv_response_container.setObjectName("operatorLcmvResponseCard")
+        self._lcmv_response_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        polar_db_tile = self._build_plot_tile(
+            "",
+            make_plot_body(doa_polar_db_plot),
+        )
+        polar_db_tile.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self._doa_polar_db_tile = polar_db_tile
+        container_layout.addLayout(
+            make_stretch_row(
+                (
+                    (self._lcmv_response_container, 1),
+                    (polar_db_tile, 1),
+                ),
+                spacing=ROW_SPACING,
+            ),
             stretch=1,
         )
-        container_layout.addLayout(self._algorithm_plots_row, stretch=1)
         return self._algorithm_plots_container
 
     def _build_plot_tile(self, title: str, body: QWidget) -> QWidget:
-        tile, layout = make_panel(title)
+        del title
+        tile, layout = make_panel("")
         tile.setStyleSheet(transparent_style())
-        tile.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        tile.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.MinimumExpanding,
+        )
         layout.setContentsMargins(*PLOT_TILE_MARGINS)
         layout.setSpacing(CARD_INNER_SPACING)
         layout.addWidget(body, stretch=1)
@@ -499,7 +612,7 @@ class MainWindow(QMainWindow):
 
     def _build_receiver_overview_card(self) -> QWidget:
         self._skyplot_monitor = SkyplotMonitor()
-        self._receiver_card, layout = make_panel("Receiver Overview")
+        self._receiver_card, layout = make_panel("")
         self._receiver_card.setObjectName("operatorReceiverOverviewCard")
         self._receiver_card.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -517,19 +630,6 @@ class MainWindow(QMainWindow):
             self._position_error_label,
             self._enu_label,
         )
-        antijam_labels = (
-            self._jammer_detection_checkbox,
-            self._jammer_state_label,
-            self._jammer_doa_label,
-            self._jammer_power_rise_label,
-            self._jammer_power_label,
-            self._rx_clipping_label,
-            self._rx_peak_label,
-            self._rx_rms_label,
-            self._rx_near_full_scale_label,
-            self._system_health_label,
-        )
-
         self._receiver_overview_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
         self._receiver_overview_row.setContentsMargins(*ZERO_MARGINS)
         self._receiver_overview_row.setSpacing(ROW_SPACING)
@@ -538,15 +638,14 @@ class MainWindow(QMainWindow):
             stretch=1,
             alignment=Qt.AlignmentFlag.AlignTop,
         )
-        self._receiver_overview_row.addWidget(
-            self._build_status_section("Receiver", receiver_labels),
-            stretch=1,
-            alignment=Qt.AlignmentFlag.AlignTop,
+        self._receiver_status_section = self._build_status_section(
+            "Receiver",
+            receiver_labels,
+            vertical_center=True,
         )
         self._receiver_overview_row.addWidget(
-            self._build_status_section("Anti-Jam", antijam_labels),
+            self._receiver_status_section,
             stretch=1,
-            alignment=Qt.AlignmentFlag.AlignTop,
         )
         layout.addLayout(self._receiver_overview_row)
         return self._receiver_card
@@ -575,14 +674,7 @@ class MainWindow(QMainWindow):
             alignment=Qt.AlignmentFlag.AlignCenter,
         )
 
-        self._skyplot_legend_label = QLabel(
-            "Legend: solid green = used for PVT; green outline = tracked"
-        )
-        self._skyplot_legend_label.setFrameShape(QLabel.Shape.NoFrame)
-        self._skyplot_legend_label.setWordWrap(True)
-        self._skyplot_legend_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._skyplot_legend_label.setStyleSheet(text_style(color=FG_SOFT))
-        layout.addWidget(self._skyplot_legend_label)
+        self._skyplot_legend_label = None
         return self._skyplot_section
 
     def _skyplot_plot_side_for_layout(
@@ -591,11 +683,12 @@ class MainWindow(QMainWindow):
         window_height: int,
         compact: bool,
     ) -> int:
-        minimum = SKYPLOT_COMPACT_MIN_SIZE if compact else SKYPLOT_MIN_SIZE
+        del compact
+        minimum = SKYPLOT_MIN_SIZE
         fallback = int(min(max(1, window_width), max(1, window_height)) * 0.20)
         section = self._skyplot_section
         if section is None:
-            return max(minimum, min(SKYPLOT_MAX_SIZE, fallback))
+            return max(minimum, fallback)
 
         card_layout = (
             self._receiver_card.layout() if self._receiver_card is not None else None
@@ -631,8 +724,8 @@ class MainWindow(QMainWindow):
         spacing_count = max(0, (layout.count() - 1) if layout is not None else 2)
         vertical_reserved = heading_h + legend_h + max(0, spacing) * spacing_count
         available_height = max(1, section_height - vertical_reserved)
-        side = min(max(1, section_width), available_height, SKYPLOT_MAX_SIZE)
-        return max(minimum, min(SKYPLOT_MAX_SIZE, int(side)))
+        side = min(max(1, section_width), available_height)
+        return max(minimum, int(side))
 
     @staticmethod
     def _label_height_for_width(label: QLabel | None, width: int) -> int:
@@ -655,18 +748,31 @@ class MainWindow(QMainWindow):
         for label in headings:
             label.setStyleSheet(text_style(color=FG_TEXT, font_weight=800))
 
-    def _build_status_section(self, heading_text: str, labels: tuple[QWidget, ...]) -> QWidget:
+    def _build_status_section(
+        self,
+        heading_text: str,
+        labels: tuple[QWidget, ...],
+        *,
+        vertical_center: bool = False,
+    ) -> QWidget:
         section = QWidget()
         section.setStyleSheet(transparent_style())
-        section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        section.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding if vertical_center else QSizePolicy.Policy.Maximum,
+        )
         heading = QLabel(heading_text)
         self._style_status_labels(labels, (heading,))
         column = QVBoxLayout(section)
         column.setContentsMargins(*ZERO_MARGINS)
         column.setSpacing(COMPACT_SPACING)
+        if vertical_center:
+            column.addStretch(1)
         column.addWidget(heading)
         for label in labels:
             column.addWidget(label)
+        if vertical_center:
+            column.addStretch(1)
         return section
 
     def _constrain_receiver_card_to_content(self) -> None:
@@ -681,7 +787,7 @@ class MainWindow(QMainWindow):
     def _build_prn_monitor_card(self) -> QWidget:
         if self._prn_monitor is None:
             self._prn_monitor = PocketPrnMonitor()
-        self._prn_card, layout = make_panel("Stable Tracking C/N0")
+        self._prn_card, layout = make_panel("")
         self._prn_card.setObjectName("operatorPrnMonitorCard")
         self._prn_card.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -703,10 +809,12 @@ class MainWindow(QMainWindow):
             finished.connect(self._on_worker_finished)
 
     def _set_status_row(self, label: QLabel, title: str, value: str, color: str) -> None:
-        label.setText(
+        text = (
             f"{escape(title)}: "
             f"<span style=\"color:{color}; font-weight:800;\">{escape(value)}</span>"
         )
+        if label.text() != text:
+            label.setText(text)
 
     def _set_status_chip(self, message: str, color: str) -> None:
         self._stream_status_text = message
@@ -725,7 +833,8 @@ class MainWindow(QMainWindow):
         color: str,
     ) -> None:
         setattr(self, summary_attr, value)
-        chip.setText(value)
+        if chip.text() != value:
+            chip.setText(value)
         self._set_status_row(detail_label, detail_title, value, color)
         self._refresh_operator_summaries()
 
@@ -736,7 +845,8 @@ class MainWindow(QMainWindow):
         detail_value: str | None = None,
     ) -> None:
         setattr(self, "_receiver_fix_text", fix_type)
-        self._fix_chip.setText(fix_type)
+        if self._fix_chip.text() != fix_type:
+            self._fix_chip.setText(fix_type)
         self._set_status_row(
             self._position_status_label,
             "PVT fix",
@@ -756,35 +866,37 @@ class MainWindow(QMainWindow):
             title, value, color
         )
 
-    def _set_jammer_chip(self, value: str, color: str) -> None:
-        self._set_summary_chip(
-            "_jammer_summary_text", self._jammer_chip, self._jammer_state_label, "Jammer status", value, color
-        )
-
     def _set_direction_chip(self, value: str, color: str = INFO) -> None:
-        del color
+        self._doa_summary_text = value
         self._doa_chip.setText(value)
+        self._set_status_row(self._doa_status_label, "DoA", value, color)
         self._refresh_operator_summaries()
-
-    def _set_phase_chip(self, value: str, color: str) -> None:
-        del color
-        self._phase_chip.setText(value)
 
     def _set_prn_counts(
         self,
         stable_count: int,
         used_in_pvt_count: int,
         used_in_pvt_satellites: list[str] | None = None,
+        *,
+        tracking_count: int | None = None,
     ) -> None:
+        self._tracking_prn_count = max(
+            0,
+            int(stable_count if tracking_count is None else tracking_count),
+        )
         self._stable_prn_count = max(0, int(stable_count))
         self._used_in_pvt_count = max(0, int(used_in_pvt_count))
-        self._stable_prns_chip.setText(str(self._stable_prn_count))
-        self._used_in_pvt_chip.setText(str(self._used_in_pvt_count))
+        stable_text = str(self._stable_prn_count)
+        used_text = str(self._used_in_pvt_count)
+        if self._stable_prns_chip.text() != stable_text:
+            self._stable_prns_chip.setText(stable_text)
+        if self._used_in_pvt_chip.text() != used_text:
+            self._used_in_pvt_chip.setText(used_text)
         self._set_status_row(
             self._satellites_tracked_label,
             "Satellites tracked",
-            str(self._stable_prn_count),
-            SUCCESS if self._stable_prn_count > 0 else INFO,
+            str(self._tracking_prn_count),
+            SUCCESS if self._tracking_prn_count > 0 else INFO,
         )
         self._set_status_row(
             self._satellites_used_label,
@@ -826,27 +938,40 @@ class MainWindow(QMainWindow):
         self._set_status_row(self._system_health_label, "System health", value, color)
 
     def _refresh_operator_summaries(self) -> None:
-        self._receiver_summary_label.setText(
+        receiver_text = (
             f"Position {self._receiver_fix_text.lower()} | "
-            f"Satellites tracked {self._stable_prn_count} | "
+            f"Satellites tracked {self._tracking_prn_count} | "
             f"Used for PVT {self._used_in_pvt_count} | "
             f"Error {self._receiver_accuracy_text}"
         )
-        self._antijam_summary_label.setText(
-            f"{self._jammer_summary_text} | Direction {self._doa_chip.text()}"
+        antijam_text = (
+            f"DoA {self._doa_summary_text} | "
+            f"Sources {self._source_count_summary_text}"
         )
-        self._stream_summary_label.setText(
+        stream_text = (
             f"{self._stream_status_text}\nOutput: {self._configured_feed_label()} -> GNSS-SDR"
         )
+        output_text = f"Output: {self._configured_feed_label()} -> GNSS-SDR"
+        if self._receiver_summary_label.text() != receiver_text:
+            self._receiver_summary_label.setText(receiver_text)
+        if self._antijam_summary_label.text() != antijam_text:
+            self._antijam_summary_label.setText(antijam_text)
+        if self._stream_summary_label.text() != stream_text:
+            self._stream_summary_label.setText(stream_text)
+        if self._output_path_label.text() != output_text:
+            self._output_path_label.setText(output_text)
 
     def _refresh_system_info(self) -> None:
-        self._system_info_label.setText(
+        text = (
             f"Stream: {self._stream_status_text}\n"
             "DoA: MUSIC\n"
-            "GNSS combiner: Uniform array sum\n"
+            f"MUSIC sources: {self._source_count_summary_text}\n"
             f"GNSS-SDR handoff: {self._configured_feed_label()}\n"
             f"{self._gnss_sdr_status_text()}"
         )
+        if text != self._last_system_info_text:
+            self._last_system_info_text = text
+            self._system_info_label.setText(text)
 
     def _set_status_state(self, state: str, message: str) -> None:
         self._stream_status_state = state
@@ -897,45 +1022,131 @@ class MainWindow(QMainWindow):
             self._clear_antijam_operator_state()
 
     def _clear_antijam_operator_state(self) -> None:
-        self._set_jammer_chip("Idle", WARNING)
         self._set_direction_chip("--", INFO)
-        self._set_status_row(self._jammer_doa_label, "Direction candidate", "--", INFO)
-        self._set_status_row(self._jammer_power_rise_label, "Power rise", "--", INFO)
-        self._set_status_row(self._jammer_power_label, "Raw IQ power", "--", INFO)
+        self._refresh_source_count_status({})
         self._set_status_row(self._rx_clipping_label, "RX clipping", "--", INFO)
         self._set_status_row(self._rx_peak_label, "IQ peak", "--", INFO)
         self._set_status_row(self._rx_rms_label, "IQ RMS", "--", INFO)
         self._set_status_row(self._rx_near_full_scale_label, "Near full scale", "--", INFO)
+        self._refresh_lcmv_test_status(
+            {
+                "lcmv_test": self._default_lcmv_test_status(
+                    bool(self._cfg.lcmv_test_enabled)
+                ),
+            }
+        )
 
     # -------------------------------------------------------------------------
     # Fixed Product Mode Status
     # -------------------------------------------------------------------------
 
-    def _configure_jammer_detection_toggle(self) -> None:
-        self._jammer_detection_checkbox.setObjectName("jammerDetectionToggle")
-        self._jammer_detection_checkbox.setAccessibleName("Jammer detection")
-        self._jammer_detection_checkbox.setMinimumHeight(CONTROL_H)
-        self._jammer_detection_checkbox.setChecked(bool(self._cfg.jammer_detection_enabled))
-        self._jammer_detection_checkbox.setStyleSheet(
+    def _build_expected_sources_control(self) -> QWidget:
+        container = QWidget()
+        container.setStyleSheet(transparent_style())
+        layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, container)
+        layout.setContentsMargins(*ZERO_MARGINS)
+        layout.setSpacing(COMPACT_SPACING)
+        label = QLabel("MUSIC sources")
+        label.setStyleSheet(text_style(color=FG_TEXT, font_weight=700))
+        self._expected_sources_spin.setObjectName("expectedSourcesSpin")
+        self._expected_sources_spin.setAccessibleName("MUSIC expected sources")
+        self._expected_sources_spin.setMinimumHeight(CONTROL_H)
+        self._expected_sources_spin.setMinimumWidth(76)
+        self._expected_sources_spin.setStyleSheet(text_style(color=FG_TEXT, font_weight=700))
+        layout.addWidget(label, stretch=1)
+        layout.addWidget(self._expected_sources_spin, stretch=0)
+        return container
+
+    def _build_lcmv_test_control(self) -> QWidget:
+        container = QWidget()
+        container.setStyleSheet(transparent_style())
+        layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, container)
+        layout.setContentsMargins(*ZERO_MARGINS)
+        layout.setSpacing(COMPACT_SPACING)
+        self._lcmv_test_checkbox.setObjectName("lcmvTestCheckbox")
+        self._lcmv_test_checkbox.setAccessibleName("LCMV Test Nulling")
+        self._lcmv_test_checkbox.setMinimumHeight(CONTROL_H)
+        self._lcmv_test_checkbox.setStyleSheet(
             text_style(color=FG_TEXT, font_weight=700)
         )
-        self._jammer_detection_checkbox.toggled.connect(
-            self._on_jammer_detection_toggled
+        layout.addWidget(self._lcmv_test_checkbox, stretch=0)
+        layout.addStretch(1)
+        return container
+
+    def _configure_expected_sources_control(self) -> None:
+        max_sources = max(len(self._cfg.channels) - 1, 1)
+        initial = min(max(1, int(self._cfg.expected_sources)), max_sources)
+        self._cfg.expected_sources = initial
+        self._expected_sources_spin.setRange(1, max_sources)
+        self._expected_sources_spin.setValue(initial)
+        self._expected_sources_spin.valueChanged.connect(self._on_expected_sources_changed)
+        self._refresh_source_count_status({})
+
+    def _configure_lcmv_test_control(self) -> None:
+        enabled = bool(self._cfg.lcmv_test_enabled)
+        self._cfg.lcmv_test_enabled = enabled
+        self._lcmv_test_checkbox.setChecked(enabled)
+        self._lcmv_test_checkbox.toggled.connect(self._on_lcmv_test_toggled)
+        self._refresh_lcmv_test_status(
+            {
+                "lcmv_test": self._default_lcmv_test_status(enabled),
+            }
         )
 
-    def _on_jammer_detection_toggled(self, enabled: bool) -> None:
-        normalized = bool(enabled)
-        self._cfg.jammer_detection_enabled = normalized
-        setter = getattr(self._worker, "set_jammer_detection_enabled", None)
+    def _on_expected_sources_changed(self, count: int) -> None:
+        max_sources = max(len(self._cfg.channels) - 1, 1)
+        normalized = min(max(1, int(count)), max_sources)
+        self._cfg.expected_sources = normalized
+        setter = getattr(self._worker, "set_expected_sources", None)
         if callable(setter):
             setter(normalized)
-        self._log.info("UI action: jammer_detection_enabled=%s", normalized)
+        self._log.info("UI action: expected_sources=%d", normalized)
+        self._refresh_source_count_status({})
+
+    def _on_lcmv_test_toggled(self, enabled: bool) -> None:
+        active = bool(enabled)
+        self._cfg.lcmv_test_enabled = active
+        setter = getattr(self._worker, "set_lcmv_test_enabled", None)
+        if callable(setter):
+            setter(active)
+        self._log.info("UI action: lcmv_test_enabled=%s", active)
+        self._refresh_lcmv_test_status(
+            {
+                "lcmv_test": self._default_lcmv_test_status(active),
+            }
+        )
+        self._refresh_operator_summaries()
         self._refresh_system_info()
 
     def _configured_feed_label(self) -> str:
         if not bool(self._cfg.gnss_sdr_enable):
             return "GNSS-SDR disabled"
-        return "GNSS Uniform Array IQ"
+        if bool(self._cfg.lcmv_test_enabled):
+            return "LCMV Test IQ"
+        return "Uniform Array IQ"
+
+    def _active_operator_tab_index(self) -> int:
+        tabs = getattr(self, "_operator_tabs", None)
+        if tabs is None:
+            return 0
+        return int(tabs.currentIndex())
+
+    def _receiver_tab_active(self) -> bool:
+        return self._active_operator_tab_index() == 0
+
+    def _antijam_tab_active(self) -> bool:
+        return self._active_operator_tab_index() == 1
+
+    def _on_operator_tab_changed(self, index: int) -> None:
+        if int(index) == 0:
+            self._last_prn_chart_update_s = 0.0
+            self._last_skyplot_update_s = 0.0
+            self._last_prn_chart_signature = None
+            self._last_skyplot_signature = None
+            if self._latest_gnss_snapshot:
+                self._refresh_gnss_monitors({"gnss_snapshot": self._latest_gnss_snapshot})
+        elif int(index) == 1:
+            pass
 
     # -------------------------------------------------------------------------
     # Run Control and Calibration Loading
@@ -951,12 +1162,9 @@ class MainWindow(QMainWindow):
         self._refresh_system_info()
         self._log.info(
             "UI action: start requested gnss_feed=%s gnss_sdr=%s "
-            "combiner=%s jammer_detection=%s sample_rate=%.3f_msps "
-            "center_freq=%.3f_mhz",
+            "combiner=uniform_array_sum sample_rate=%.3f_msps center_freq=%.3f_mhz",
             self._configured_feed_label(),
             bool(self._cfg.gnss_sdr_enable),
-            "uniform_array_sum",
-            bool(self._cfg.jammer_detection_enabled),
             float(self._cfg.sample_rate) / 1e6,
             float(self._cfg.center_freq_hz) / 1e6,
         )
@@ -1016,12 +1224,27 @@ class MainWindow(QMainWindow):
             self._log.warning("Configured phase correction file does not exist: %s", resolved)
             return
         try:
-            correction = load_phase_correction_vector(resolved)
+            selection = load_calibration_correction_selection(
+                resolved,
+                mode=str(self._cfg.calibration_correction_mode),
+                expected_channel_count=len(self._cfg.channels),
+            )
         except Exception as exc:
             self._log.warning("Could not load configured phase correction %s: %s", resolved, exc)
         else:
             self._cfg.phase_calibration_file = resolved
-            self._cfg.phase_correction_vector = tuple(complex(v) for v in correction)
+            self._cfg.phase_correction_vector = tuple(complex(v) for v in selection.vector)
+            self._cfg.calibration_correction_mode = selection.configured_mode
+            self._cfg.calibration_correction_metadata = selection.metadata(
+                expected_channel_count=len(self._cfg.channels)
+            )
+            if selection.fallback_used:
+                self._log.warning(
+                    "Calibration correction fallback: configured=%s applied=%s reason=%s",
+                    selection.configured_mode,
+                    selection.applied_mode,
+                    selection.fallback_reason,
+                )
 
     def _stop_worker(self) -> None:
         self._set_status_state("stopping", "Stopping")
@@ -1141,10 +1364,8 @@ class MainWindow(QMainWindow):
     def _apply_metrics_unchecked(self, metrics: dict) -> None:
         breakdown: dict[str, float] = {}
         t0 = time.monotonic()
-        self._refresh_phase_monitor(metrics)
-        breakdown["phase_ms"] = (time.monotonic() - t0) * 1000.0
-        t0 = time.monotonic()
-        self._refresh_algorithm_plots(metrics)
+        if self._antijam_tab_active():
+            self._refresh_algorithm_plots(metrics)
         breakdown["algorithm_ms"] = (time.monotonic() - t0) * 1000.0
         t0 = time.monotonic()
         self._refresh_gnss_monitors(metrics)
@@ -1152,6 +1373,12 @@ class MainWindow(QMainWindow):
         t0 = time.monotonic()
         self._refresh_doa_chips(metrics)
         breakdown["chips_ms"] = (time.monotonic() - t0) * 1000.0
+        t0 = time.monotonic()
+        self._refresh_source_count_status(metrics)
+        breakdown["source_count_ms"] = (time.monotonic() - t0) * 1000.0
+        t0 = time.monotonic()
+        self._refresh_lcmv_test_status(metrics)
+        breakdown["lcmv_ms"] = (time.monotonic() - t0) * 1000.0
         t0 = time.monotonic()
         self._refresh_rx_signal_health(metrics)
         breakdown["rx_health_ms"] = (time.monotonic() - t0) * 1000.0
@@ -1220,7 +1447,8 @@ class MainWindow(QMainWindow):
             "ui heartbeat: state=%s running=%s pending=%s pending_age_ms=%.1f "
             "since_received_ms=%.1f since_applied_ms=%.1f received=%d applied=%d "
             "coalesced=%d seq=%s seq_gaps=%d last_refresh_ms=%.1f "
-            "stable_prns=%d used_pvt=%d prn_bars=%d sky_markers=%d %s",
+            "tracking_prns=%d stable_prns=%d used_pvt=%d prn_bars=%d "
+            "sky_markers=%d %s",
             self._stream_status_state,
             self._stream_running,
             self._latest_pending_metrics is not None,
@@ -1233,6 +1461,7 @@ class MainWindow(QMainWindow):
             "--" if self._last_metrics_seq is None else self._last_metrics_seq,
             self._metrics_seq_gap_count,
             self._last_refresh_duration_ms,
+            self._tracking_prn_count,
             self._stable_prn_count,
             self._used_in_pvt_count,
             prn_bars,
@@ -1248,36 +1477,97 @@ class MainWindow(QMainWindow):
         )
 
     # -------------------------------------------------------------------------
-    # Phase and Algorithm Plot Refresh
+    # Algorithm Plot Refresh
     # -------------------------------------------------------------------------
 
-    def _refresh_phase_monitor(self, metrics: dict) -> None:
-        if "phase_offsets_calibrated_deg" not in metrics:
-            return
-        offsets = self._finite_vector(metrics.get("phase_offsets_calibrated_deg"))
-        if offsets.size <= 1:
-            return
-        finite = offsets[1:][np.isfinite(offsets[1:])]
-        if finite.size == 0:
-            return
-        residual = float(np.max(np.abs(finite)))
-        self._set_phase_chip(
-            f"After max {residual:.1f}°",
-            SUCCESS if self._cfg.phase_correction_vector is not None else WARNING,
-        )
-
     def _refresh_algorithm_plots(self, metrics: dict) -> None:
-        doa_spectrum = self._finite_vector(metrics.get("doa_spectrum"))
-        if doa_spectrum.size == 0:
-            doa_spectrum = self._finite_vector(metrics.get("music_spectrum"))
-        if doa_spectrum.size > 1:
-            scan = self._scan_angles_for_size(doa_spectrum.size)
+        doa_raw_spectrum = self._finite_vector(metrics.get("doa_raw_spectrum"))
+        rel_db_axis_min = -60.0
+        rel_db_axis_max = 0.0
+        db_marker_radius = 1.0
+        if doa_raw_spectrum.size > 1:
+            scan = self._scan_angles_for_size(doa_raw_spectrum.size)
             bearing_scan, order = self._bearing_axis_for_internal_scan(scan)
-            self._doa_curve.setData(bearing_scan, doa_spectrum[order])
+            ordered_raw = doa_raw_spectrum[order]
+            polar_theta = np.deg2rad(bearing_scan)
+            raw_values = np.maximum(ordered_raw, 0.0)
+            raw_value_max = max(float(np.nanmax(raw_values)), 1e-12)
+
+            safe_raw = np.maximum(ordered_raw, 1e-300)
+            rel_db = 10.0 * np.log10(safe_raw / raw_value_max)
+            finite_rel_db = rel_db[np.isfinite(rel_db)]
+            rel_db_axis_min = float(np.min(finite_rel_db)) if finite_rel_db.size else -60.0
+            rel_db_axis_max = float(np.max(finite_rel_db)) if finite_rel_db.size else 0.0
+            rel_db_span = max(rel_db_axis_max - rel_db_axis_min, 1e-12)
+            db_radius = (rel_db - rel_db_axis_min) / rel_db_span
+            db_radius = np.where(np.isfinite(db_radius), db_radius, 0.0)
+            db_radius = np.clip(db_radius, 0.0, 1.0)
+            db_x = db_radius * np.sin(polar_theta)
+            db_y = db_radius * np.cos(polar_theta)
+            if db_x.size > 0:
+                db_x = np.append(db_x, db_x[0])
+                db_y = np.append(db_y, db_y[0])
+            set_polar_radial_scale(
+                self._doa_polar_db_plot,
+                radial_min=rel_db_axis_min,
+                radial_max=rel_db_axis_max,
+                suffix=" dB",
+            )
+            self._doa_polar_db_curve.setData(db_x, db_y)
+            if finite_rel_db.size:
+                db_marker_radius = float(
+                    np.clip(
+                        (float(np.max(finite_rel_db)) - rel_db_axis_min)
+                        / max(rel_db_axis_max - rel_db_axis_min, 1e-12),
+                        0.0,
+                        1.0,
+                    )
+                )
+        self._refresh_lcmv_response_plot(metrics)
 
         doa_deg = valid_float(metrics.get("doa_deg"))
         if doa_deg is not None:
-            self._doa_marker.setValue(self._internal_angle_to_bearing(doa_deg))
+            bearing = self._internal_angle_to_bearing(doa_deg)
+            bearing_rad = np.deg2rad(bearing)
+            self._doa_polar_db_marker.setData(
+                [0.0, float(db_marker_radius * np.sin(bearing_rad))],
+                [0.0, float(db_marker_radius * np.cos(bearing_rad))],
+            )
+
+    def _refresh_lcmv_response_plot(self, metrics: dict) -> None:
+        status = metrics.get("lcmv_test", {}) if isinstance(metrics, dict) else {}
+        if not isinstance(status, dict):
+            status = {}
+        response = self._finite_vector(status.get("lcmv_response_db"))
+        if response.size > 1:
+            scan = self._scan_angles_for_size(response.size)
+            bearing_scan, order = self._bearing_axis_for_internal_scan(scan)
+            ordered_response = response[order]
+            self._lcmv_response_curve.setData(bearing_scan, ordered_response)
+            finite = ordered_response[np.isfinite(ordered_response)]
+            if finite.size:
+                y_min = float(np.min(finite))
+                y_max = float(np.max(finite))
+                if y_max <= y_min:
+                    y_max = y_min + 1.0
+                margin = max(1.0, 0.08 * (y_max - y_min))
+                self._lcmv_response_plot.setYRange(
+                    y_min - margin,
+                    y_max + margin,
+                    padding=0.0,
+                )
+                self._lcmv_response_plot.setLimits(
+                    yMin=y_min - margin,
+                    yMax=y_max + margin,
+                )
+        else:
+            self._lcmv_response_curve.setData([], [])
+
+        null_bearing = valid_float(status.get("null_bearing_deg"))
+        music_bearing = valid_float(status.get("music_bearing_deg"))
+        bearing = null_bearing if null_bearing is not None else music_bearing
+        if bearing is not None:
+            self._lcmv_response_marker.setValue(float(bearing) % 360.0)
 
     # -------------------------------------------------------------------------
     # GNSS Monitor Refresh
@@ -1305,6 +1595,7 @@ class MainWindow(QMainWindow):
             self._prn_monitor.update_snapshot([])
         self._update_skyplot_monitors([])
         self._current_tracking_prns = []
+        self._current_tracking_satellite_ids = []
         self._stable_prns = []
         self._current_used_in_pvt_prns = []
         self._raw_used_in_fix_prns = []
@@ -1352,27 +1643,34 @@ class MainWindow(QMainWindow):
             now=now,
         )
         self._current_tracking_prns = receiver_state.current_tracking_prns
+        self._current_tracking_satellite_ids = (
+            receiver_state.current_tracking_satellite_ids
+        )
         self._stable_prns = receiver_state.stable_prns
         self._current_used_in_pvt_prns = receiver_state.current_used_in_pvt_prns
         self._raw_used_in_fix_prns = receiver_state.raw_used_in_fix_prns
         self._fresh_geometry_prns = receiver_state.fresh_geometry_prns
         self._tracking_without_geometry = receiver_state.tracking_without_geometry
 
-        if self._display_update_due(
+        receiver_tab_active = self._receiver_tab_active()
+        prn_update_due = receiver_tab_active and self._display_update_due(
             self._last_prn_chart_update_s,
             self._prn_chart_update_interval_s,
             now,
-        ):
+        )
+        skyplot_update_due = receiver_tab_active and self._display_update_due(
+            self._last_skyplot_update_s,
+            self._skyplot_update_interval_s,
+            now,
+        )
+
+        if prn_update_due:
             signature = self._prn_chart_signature(receiver_state.prn_entries)
             if signature != self._last_prn_chart_signature:
                 self._prn_monitor.update_snapshot(receiver_state.prn_entries)
                 self._last_prn_chart_signature = signature
             self._last_prn_chart_update_s = now
-        if self._display_update_due(
-            self._last_skyplot_update_s,
-            self._skyplot_update_interval_s,
-            now,
-        ):
+        if skyplot_update_due:
             signature = self._skyplot_signature(
                 receiver_state.sky_entries,
                 receiver_state.tracking_without_geometry,
@@ -1384,21 +1682,23 @@ class MainWindow(QMainWindow):
                 )
                 self._last_skyplot_signature = signature
             self._last_skyplot_update_s = now
-        self._set_prn_counts(
-            len(receiver_state.stable_satellite_ids),
-            receiver_state.used_for_pvt_count,
-            receiver_state.raw_used_in_fix_satellites,
-        )
-        self._refresh_receiver_fix_and_accuracy(
-            gnss_snapshot,
-            receiver_state.pvt_current,
-            receiver_state.used_for_pvt_count,
-        )
-        self._set_receiver_pvt_details(
-            gnss_snapshot,
-            receiver_state.pvt_current,
-        )
-        self._refresh_system_info()
+        if prn_update_due or skyplot_update_due:
+            self._set_prn_counts(
+                len(receiver_state.stable_satellite_ids),
+                receiver_state.used_for_pvt_count,
+                receiver_state.raw_used_in_fix_satellites,
+                tracking_count=len(receiver_state.current_tracking_satellite_ids),
+            )
+            self._refresh_receiver_fix_and_accuracy(
+                gnss_snapshot,
+                receiver_state.pvt_current,
+                receiver_state.used_for_pvt_count,
+            )
+            self._set_receiver_pvt_details(
+                gnss_snapshot,
+                receiver_state.pvt_current,
+            )
+            self._refresh_system_info()
 
     def _refresh_receiver_fix_and_accuracy(
         self,
@@ -1585,83 +1885,165 @@ class MainWindow(QMainWindow):
         if doa_deg is not None:
             return doa_deg
         doa_deg = valid_float(metrics.get("doa_deg"))
-        jammer = metrics.get("jammer", {}) if isinstance(metrics, dict) else {}
-        if doa_deg is None and isinstance(jammer, dict):
-            jammer_display = valid_float(jammer.get("doa_display_deg"))
-            if jammer_display is not None:
-                return jammer_display
-            doa_deg = valid_float(jammer.get("doa_deg"))
         return self._internal_angle_to_bearing(doa_deg)
+
+    def _source_count_metric(
+        self,
+        metrics: dict | None,
+        key: str,
+        *aliases: str,
+    ) -> object:
+        if not isinstance(metrics, dict):
+            metrics = {}
+        nested = metrics.get("source_count")
+        keys = (key, *aliases)
+        if isinstance(nested, dict):
+            for candidate in keys:
+                if candidate in nested:
+                    return nested.get(candidate)
+        for candidate in keys:
+            if candidate in metrics:
+                return metrics.get(candidate)
+        return None
+
+    def _format_source_count_estimate(self, value: object) -> str:
+        number = valid_float(value)
+        if number is None:
+            return "--"
+        nearest = round(number)
+        if abs(number - nearest) < 1e-6:
+            return str(int(nearest))
+        return f"{number:.1f}"
+
+    def _format_effective_rank(self, value: object) -> str:
+        number = valid_float(value)
+        if number is None:
+            return "--"
+        return f"{number:.2f}"
+
+    def _source_count_display_text(self, metrics: dict | None) -> str:
+        configured = self._source_count_metric(metrics, "n_sources")
+        if configured is None:
+            configured = self._cfg.expected_sources
+        gap = self._source_count_metric(
+            metrics,
+            "source_estimate_gap",
+            "source_est_gap",
+        )
+        effective_rank = self._source_count_metric(
+            metrics,
+            "source_effective_rank",
+            "effective_rank",
+        )
+        return (
+            f"set {self._format_source_count_estimate(configured)} | "
+            f"eig-gap {self._format_source_count_estimate(gap)} | "
+            f"eff-rank {self._format_effective_rank(effective_rank)}"
+        )
+
+    def _refresh_source_count_status(self, metrics: dict | None) -> None:
+        value = self._source_count_display_text(metrics)
+        self._source_count_summary_text = value
+        self._set_status_row(self._music_sources_label, "MUSIC sources", value, INFO)
+        self._refresh_operator_summaries()
+        self._refresh_system_info()
 
     # -------------------------------------------------------------------------
     # Status Chip Refresh
     # -------------------------------------------------------------------------
 
+    def _default_lcmv_test_status(self, enabled: bool) -> dict[str, object]:
+        if bool(enabled):
+            return {
+                "enabled": True,
+                "mode": "fallback",
+                "status": "FALLBACK",
+                "description": "Uniform fallback",
+                "fallback_reason": "waiting_for_music_peak",
+            }
+        return {
+            "enabled": False,
+            "mode": "off",
+            "status": "OFF",
+            "description": "Uniform beamformer",
+            "fallback_reason": "",
+        }
+
+    def _refresh_lcmv_test_status(self, metrics: dict) -> None:
+        status = metrics.get("lcmv_test", {}) if isinstance(metrics, dict) else {}
+        if not isinstance(status, dict):
+            status = self._default_lcmv_test_status(bool(self._cfg.lcmv_test_enabled))
+        enabled = bool(status.get("enabled", self._cfg.lcmv_test_enabled))
+        mode = str(status.get("mode", "off")).strip().lower()
+        reason = str(status.get("fallback_reason", "") or "").strip()
+
+        if not enabled or mode == "off":
+            value = "OFF: Uniform beamformer"
+            color = INFO
+        elif mode == "on":
+            value = "ON: Nulling strongest MUSIC peak"
+            active_method = str(
+                status.get("active_lcmv_method")
+                or status.get("active_lcmv_null_method")
+                or ""
+            ).strip()
+            if active_method:
+                value = f"{value}, method {active_method.replace('_', ' ')}"
+            valid_methods = status.get("candidate_methods_valid", [])
+            rejected_methods = status.get("candidate_methods_rejected", {})
+            valid_count = len(valid_methods) if isinstance(valid_methods, list) else 0
+            rejected_count = len(rejected_methods) if isinstance(rejected_methods, dict) else 0
+            if valid_count or rejected_count:
+                value = f"{value}, candidates {valid_count} valid/{rejected_count} rejected"
+            color = WARNING
+        elif mode == "fallback":
+            value = "FALLBACK: Uniform fallback"
+            if reason:
+                value = f"{value}, {reason.replace('_', ' ')}"
+            color = WARNING
+        else:
+            value = str(status.get("description", "--") or "--")
+            color = INFO
+
+        self._set_status_row(
+            self._lcmv_test_status_label,
+            "LCMV Test Nulling",
+            value,
+            color,
+        )
+
+        null_bearing = valid_float(status.get("null_bearing_deg"))
+        music_bearing = valid_float(status.get("music_bearing_deg"))
+        bearing = null_bearing if null_bearing is not None else music_bearing
+        bearing_text = f"{bearing:.1f}°" if bearing is not None else "--"
+        output_metrics = status.get("output_metrics", {})
+        if not isinstance(output_metrics, dict):
+            output_metrics = {}
+        reduction_uniform_db = valid_float(
+            output_metrics.get("measured_output_reduction_vs_uniform_db")
+        )
+        reduction_raw_avg_db = valid_float(
+            output_metrics.get("measured_output_reduction_vs_raw_avg_channel_db")
+        )
+        if reduction_uniform_db is None:
+            reduction_uniform_db = valid_float(status.get("suppression_db"))
+        if reduction_uniform_db is not None and mode == "on":
+            bearing_text = f"{bearing_text} | out-vs-uniform {reduction_uniform_db:.1f} dB"
+            if reduction_raw_avg_db is not None:
+                bearing_text = f"{bearing_text} | raw-avg {reduction_raw_avg_db:.1f} dB"
+        self._set_status_row(
+            self._lcmv_null_bearing_label,
+            "Null bearing / MUSIC peak",
+            bearing_text,
+            color if bearing is not None else INFO,
+        )
+
     def _refresh_doa_chips(self, metrics: dict) -> None:
         doa_bearing = self._metric_doa_bearing(metrics)
-        jammer = metrics.get("jammer", {}) if isinstance(metrics, dict) else {}
-        self._refresh_jammer_status(metrics)
         if doa_bearing is None:
             self._set_direction_chip("--", INFO)
-            self._set_status_row(self._jammer_doa_label, "Direction candidate", "--", INFO)
             return
-
         self._set_direction_chip(f"{doa_bearing:.1f}°", INFO)
-        self._set_status_row(
-            self._jammer_doa_label,
-            "Direction candidate",
-            f"{doa_bearing:.1f}°",
-            INFO,
-        )
-
-    def _refresh_jammer_status(self, metrics: dict) -> None:
-        jammer = metrics.get("jammer", {}) if isinstance(metrics, dict) else {}
-        if not isinstance(jammer, dict) or not jammer:
-            self._set_jammer_chip("Monitoring", WARNING)
-            self._set_jammer_detector_metrics({})
-            return
-        state = str(jammer.get("state", "")).strip().lower()
-        if state == "detected" or bool(jammer.get("detected", False)):
-            self._set_jammer_chip("Detected", ALERT)
-        elif state == "suspected":
-            self._set_jammer_chip("Suspected", WARNING)
-        elif state == "not_detected":
-            self._set_jammer_chip("Not detected", SUCCESS)
-        elif state == "disabled":
-            self._set_jammer_chip("Detection off", INFO)
-        else:
-            self._set_jammer_chip("Monitoring", WARNING)
-        self._set_jammer_detector_metrics(jammer)
-
-    def _set_jammer_detector_metrics(self, jammer: dict[str, object]) -> None:
-        input_power_db = valid_float(
-            jammer.get("input_power_db", jammer.get("detector_power_db"))
-        )
-        min_power_db = valid_float(
-            jammer.get("min_power_db", jammer.get("power_threshold_db"))
-        )
-        power_rise_db = valid_float(jammer.get("power_rise_db"))
-        power_rise_threshold_db = valid_float(jammer.get("power_rise_threshold_db"))
-        rise_text, rise_color = self._format_db_threshold(
-            power_rise_db,
-            power_rise_threshold_db,
-            alert_on_threshold=True,
-        )
-        power_text, power_color = self._format_db_threshold(input_power_db, min_power_db)
-        self._set_status_row(self._jammer_power_rise_label, "Power rise", rise_text, rise_color)
-        self._set_status_row(self._jammer_power_label, "Raw IQ power", power_text, power_color)
-
-        doa_bearing = valid_float(jammer.get("doa_display_deg"))
-        if doa_bearing is None:
-            doa_deg = valid_float(jammer.get("doa_deg"))
-            doa_bearing = self._internal_angle_to_bearing(doa_deg)
-        if doa_bearing is not None:
-            self._set_status_row(
-                self._jammer_doa_label,
-                "Direction candidate",
-                f"{doa_bearing:.1f}°",
-                INFO,
-            )
 
     def _refresh_rx_signal_health(self, metrics: dict) -> None:
         health = metrics.get("rx_signal_health", {}) if isinstance(metrics, dict) else {}

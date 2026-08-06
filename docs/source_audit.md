@@ -17,7 +17,7 @@ should describe and validate the profile, not hide operational defaults.
   `ui/widgets/plots/algorithm.py`; these are reusable realtime plot builders,
   not an engineering tab.
 - Simplified `run_realtime.sh` so it no longer performs fixed-USRP-IP probing.
-  Host link and image setup remain owned by `setup.sh`; runtime XG image
+  Host link and image setup remain owned by `setup.sh`; runtime HG image
   validation remains in USRP device setup.
 
 ## Runtime Performance Focus
@@ -35,11 +35,10 @@ Runtime timing now records:
 - GNSS FIFO write time
 - DSP phase time
 - DSP DoA time
-- DSP DoA time
 - UI refresh breakdown
 
 `gnss_queue_wait` includes normal idle waits when the queue is empty. Bottlenecks
-are more likely when `gnss_beamform_compute`, `gnss_fifo_write`, DSP stage times,
+are more likely when `gnss_combiner_compute`, `gnss_fifo_write`, DSP stage times,
 or raw queue replacement counts are high.
 
 ## File Inventory
@@ -50,8 +49,7 @@ or raw queue replacement counts are high.
 | `config/loader.py` | Keep | Converts JSON profile into runtime schema. Keep profile values in JSON. |
 | `config/paths.py` | Keep | Central path helper. |
 | `config/schemas/runtime.py` | Keep, future split | Single schema is acceptable short term, but should be split by subsystem after call sites are cleaner. |
-| `detection/jammer/detector.py` | Keep | Small detector module. |
-| `dsp/beamforming/uniform.py` | Keep | Fixed all-channel GNSS IQ combiner. |
+| `dsp/beamforming/uniform.py` | Keep | Uniform all-channel IQ combiner used for GNSS-SDR handoff. |
 | `dsp/doa/music.py` | Keep | Core MUSIC implementation. |
 | `dsp/models.py` | Keep | Shared DSP payload models. |
 | `dsp/phase/alignment.py` | Keep | Phase calibration/alignment logic. |
@@ -60,7 +58,7 @@ or raw queue replacement counts are high.
 | `gnss/gnss_sdr.py` | Keep, high-priority split | Largest file. Split into process control, FIFO bridge, config rendering, line parsing, snapshot state, and accuracy/truth helpers. |
 | `logging/setup.py` | Keep | Owns log names and root log layout. |
 | `radio/transport/host.py` | Keep | Setup/diagnostic support for host transport. |
-| `radio/usrp/device.py` | Keep, trim later | Owns runtime USRP setup and XG image enforcement. Keep runtime validation here. |
+| `radio/usrp/device.py` | Keep, trim later | Owns runtime USRP setup and HG image enforcement. Keep runtime validation here. |
 | `radio/usrp/discovery.py` | Keep | Small discovery helper. Runtime launcher no longer needs fixed-IP probing. |
 | `runtime/backend.py` | Keep, high-priority split | Hot orchestration path. Split only along real threads/loops: RX, DSP, GNSS handoff, health/timing. |
 | `runtime/latest_queue.py` | Keep | Small latest-value queue abstraction. |
