@@ -1959,7 +1959,7 @@ class MainWindow(QMainWindow):
                 "mode": "fallback",
                 "status": "FALLBACK",
                 "description": "Uniform fallback",
-                "fallback_reason": "waiting_for_music_peak",
+                "fallback_reason": "waiting_for_stable_bladerf_reference",
             }
         return {
             "enabled": False,
@@ -1976,12 +1976,31 @@ class MainWindow(QMainWindow):
         enabled = bool(status.get("enabled", self._cfg.lcmv_test_enabled))
         mode = str(status.get("mode", "off")).strip().lower()
         reason = str(status.get("fallback_reason", "") or "").strip()
+        spatial = status.get("spatial_vector_diagnostics", {})
+        if not isinstance(spatial, dict):
+            spatial = {}
+        jammer_latched = bool(
+            status.get(
+                "lcmv_jammer_detected_latched",
+                spatial.get("lcmv_jammer_detected_latched", False),
+            )
+        )
+        armed = bool(spatial.get("lcmv_jammer_activation_armed", False)) and not jammer_latched
+        transition_active = bool(status.get("weight_transition_active", False))
+        transition_progress = valid_float(status.get("weight_transition_progress"))
 
         if not enabled or mode == "off":
             value = "OFF: Uniform beamformer"
             color = INFO
         elif mode == "on":
-            value = "ON: Nulling strongest MUSIC peak"
+            value = "ON: Covariance LCMV null active, jammer latched"
+            if transition_active:
+                progress_text = (
+                    f" {100.0 * transition_progress:.0f}%"
+                    if transition_progress is not None
+                    else ""
+                )
+                value = f"ACTIVATING: Smooth weight transition{progress_text}"
             active_method = str(
                 status.get("active_lcmv_method")
                 or status.get("active_lcmv_null_method")
@@ -1997,10 +2016,14 @@ class MainWindow(QMainWindow):
                 value = f"{value}, candidates {valid_count} valid/{rejected_count} rejected"
             color = WARNING
         elif mode == "fallback":
-            value = "FALLBACK: Uniform fallback"
+            value = (
+                "ARMED: Uniform output, waiting for jammer evidence"
+                if armed
+                else "FALLBACK: Uniform fallback"
+            )
             if reason:
                 value = f"{value}, {reason.replace('_', ' ')}"
-            color = WARNING
+            color = INFO if armed else WARNING
         else:
             value = str(status.get("description", "--") or "--")
             color = INFO
@@ -2015,7 +2038,11 @@ class MainWindow(QMainWindow):
         null_bearing = valid_float(status.get("null_bearing_deg"))
         music_bearing = valid_float(status.get("music_bearing_deg"))
         bearing = null_bearing if null_bearing is not None else music_bearing
+        if armed:
+            bearing = None
         bearing_text = f"{bearing:.1f}°" if bearing is not None else "--"
+        if armed:
+            bearing_text = "not applied (armed uniform)"
         output_metrics = status.get("output_metrics", {})
         if not isinstance(output_metrics, dict):
             output_metrics = {}
@@ -2025,10 +2052,11 @@ class MainWindow(QMainWindow):
         reduction_raw_avg_db = valid_float(
             output_metrics.get("measured_output_reduction_vs_raw_avg_channel_db")
         )
-        if reduction_uniform_db is None:
-            reduction_uniform_db = valid_float(status.get("suppression_db"))
         if reduction_uniform_db is not None and mode == "on":
-            bearing_text = f"{bearing_text} | out-vs-uniform {reduction_uniform_db:.1f} dB"
+            bearing_text = (
+                f"{bearing_text} | total out reduction {reduction_uniform_db:.1f} dB"
+                " (wanted included)"
+            )
             if reduction_raw_avg_db is not None:
                 bearing_text = f"{bearing_text} | raw-avg {reduction_raw_avg_db:.1f} dB"
         self._set_status_row(

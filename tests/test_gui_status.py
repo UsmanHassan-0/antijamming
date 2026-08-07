@@ -735,7 +735,50 @@ def test_gui_lcmv_test_toggle_defaults_off_and_updates_runtime(qtbot) -> None:
     assert worker.lcmv_test_enabled is True
     assert "LCMV Test IQ" in _plain_text(window._system_info_label)
     assert _plain_text(window._lcmv_test_status_label) == (
-        "LCMV Test Nulling: FALLBACK: Uniform fallback, waiting for music peak"
+        "LCMV Test Nulling: FALLBACK: Uniform fallback, waiting for stable bladerf reference"
+    )
+
+
+def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
+    window = MainWindow(StreamConfig(), DummyWorker())  # type: ignore[arg-type]
+    qtbot.addWidget(window)
+    window.show()
+
+    window._refresh_lcmv_test_status(
+        {
+            "lcmv_test": {
+                "enabled": True,
+                "mode": "fallback",
+                "fallback_reason": "waiting for jammer evidence",
+                "music_bearing_deg": 120.0,
+                "spatial_vector_diagnostics": {
+                    "lcmv_jammer_activation_armed": True,
+                    "lcmv_jammer_detected_latched": False,
+                },
+            }
+        }
+    )
+    assert "ARMED: Uniform output" in _plain_text(window._lcmv_test_status_label)
+    assert "not applied (armed uniform)" in _plain_text(
+        window._lcmv_null_bearing_label
+    )
+
+    window._refresh_lcmv_test_status(
+        {
+            "lcmv_test": {
+                "enabled": True,
+                "mode": "on",
+                "active_lcmv_method": "covariance_lcmv_ideal",
+                "weight_transition_active": True,
+                "weight_transition_progress": 0.5,
+                "spatial_vector_diagnostics": {
+                    "lcmv_jammer_detected_latched": True,
+                },
+            }
+        }
+    )
+    assert "ACTIVATING: Smooth weight transition 50%" in _plain_text(
+        window._lcmv_test_status_label
     )
 
 

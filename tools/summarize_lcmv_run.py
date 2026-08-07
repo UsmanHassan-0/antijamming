@@ -22,7 +22,6 @@ KV_RE = re.compile(r"(?P<key>[A-Za-z0-9_./-]+)=(?P<value>\[[^\]]*\]|\"[^\"]*\"|'
 
 CURRENT_LCMV_METHODS = {
     "covariance_lcmv_ideal",
-    "measured_dominant_eigenvector",
     "covariance_lcmv_measured_u1",
 }
 
@@ -952,7 +951,6 @@ def print_spatial_summary(events: list[tuple[datetime, dict[str, object]]]) -> N
     candidate_valid_by_method: dict[str, Counter[str]] = defaultdict(Counter)
     candidate_rejection_reasons: dict[str, Counter[str]] = defaultdict(Counter)
     prefix_by_method = {
-        "measured_dominant_eigenvector": "candidate_measured_u1",
         "covariance_lcmv_ideal": "candidate_covariance_lcmv_ideal",
         "covariance_lcmv_measured_u1": "candidate_covariance_lcmv_measured_u1",
     }

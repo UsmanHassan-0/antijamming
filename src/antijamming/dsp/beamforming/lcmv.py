@@ -14,69 +14,23 @@ RESPONSE_DB_EPS = 1e-300
 
 
 @dataclass(frozen=True, slots=True)
-class LcmvNullResult:
-    """Weights and diagnostics for one uniform-preserving null."""
-
-    weights: np.ndarray
-    null_angle_deg: float
-    condition_number: float
-    weight_norm: float
-    max_weight_abs: float
-    unity_response: complex
-    null_response: complex
-    unity_residual: complex
-    null_residual: complex
-
-
-@dataclass(frozen=True, slots=True)
-class LcmvVectorNullResult:
-    """Weights and diagnostics for one uniform-preserving measured-vector null."""
-
-    weights: np.ndarray
-    condition_number: float
-    weight_norm: float
-    max_weight_abs: float
-    unity_response: complex
-    null_response: complex
-    unity_residual: complex
-    null_residual: complex
-
-
-@dataclass(frozen=True, slots=True)
 class LcmvCovarianceNullResult:
     """Weights and diagnostics for one full-covariance LCMV null."""
 
     weights: np.ndarray
+    preserve_vector: np.ndarray
+    null_vector: np.ndarray
     null_angle_deg: float | None
     diagonal_loading: float
     condition_number_R: float
     condition_number: float
     weight_norm: float
     max_weight_abs: float
-    unity_response: complex
+    preserve_target: complex
+    preserve_response: complex
     null_response: complex
-    unity_residual: complex
+    preserve_residual: complex
     null_residual: complex
-
-
-@dataclass(frozen=True, slots=True)
-class LcmvAngleFanResult:
-    """Weights and diagnostics for an ideal-angle fan around one MUSIC angle."""
-
-    weights: np.ndarray
-    null_angle_deg: float
-    fan_offsets_deg: np.ndarray
-    fan_internal_angles_deg: np.ndarray
-    fan_display_bearings_deg: np.ndarray
-    condition_number: float
-    weight_norm: float
-    max_weight_abs: float
-    unity_response: complex
-    null_response: complex
-    fan_null_responses: np.ndarray
-    unity_residual: complex
-    null_residual: complex
-    fan_null_residuals: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,168 +57,14 @@ class LcmvModelResponse:
     model_max_response_bearing_deg: float | None
 
 
-def legacy_constraint_null_ideal_weights(
-    *,
-    n_channels: int,
-    null_angle_deg: float,
-    rf_freq_hz: float,
-    array_spacing_m: float,
-    condition_number_limit: float = 1e8,
-    max_weight_norm: float = 8.0,
-) -> LcmvNullResult:
-    """Return one-null weights using the same steering convention as MUSIC.
-
-    The runtime applies weights as ``weights.conj() @ samples``.  The constraints
-    here are therefore expressed as ``C^H w = f`` so a steering vector ``a`` is
-    nulled when ``a^H w = 0``.
-    """
-
-    n = int(n_channels)
-    if n != 4:
-        raise ValueError(f"LCMV test steering model expects 4 channels, got {n}")
-
-    null_angle = float(null_angle_deg) % 360.0
-    if not np.isfinite(null_angle):
-        raise ValueError("LCMV test null angle is not finite")
-    rf_freq = float(rf_freq_hz)
-    spacing = float(array_spacing_m)
-    if not np.isfinite(rf_freq) or rf_freq <= 0.0:
-        raise ValueError(f"LCMV test RF frequency is invalid: {rf_freq_hz!r}")
-    if not np.isfinite(spacing) or spacing <= 0.0:
-        raise ValueError(f"LCMV test array spacing is invalid: {array_spacing_m!r}")
-
-    unity = np.ones((n,), dtype=np.complex128)
-    null_steering = np.asarray(
-        steering_vector(
-            np.asarray([null_angle], dtype=np.float64),
-            rf_freq,
-            spacing,
-        ),
-        dtype=np.complex128,
-    ).reshape(-1)
-    if null_steering.size != n:
-        raise ValueError(
-            f"LCMV test steering vector size {null_steering.size} does not match {n}"
-        )
-
-    constraints = np.column_stack((unity, null_steering))
-    uniform_sum_target = complex(float(n), 0.0)
-    targets = np.asarray([uniform_sum_target, 0.0 + 0.0j], dtype=np.complex128)
-    gram = constraints.conj().T @ constraints
-    condition_number = float(np.linalg.cond(gram))
-    limit = float(condition_number_limit)
-    if not np.isfinite(condition_number) or condition_number > limit:
-        raise ValueError(
-            "LCMV test constraint matrix ill-conditioned: "
-            f"cond={condition_number:.3e} limit={limit:.3e}"
-        )
-
-    try:
-        weights = constraints @ np.linalg.solve(gram, targets)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"LCMV test constraint solve failed: {exc}") from exc
-
-    weights = np.asarray(weights, dtype=np.complex128).reshape(-1)
-    if weights.shape != (n,):
-        raise ValueError(f"LCMV test weights shape {weights.shape} does not match {(n,)}")
-    if not np.all(np.isfinite(weights)):
-        raise ValueError("LCMV test weights contain NaN or Inf")
-
-    weight_norm = float(np.linalg.norm(weights))
-    norm_limit = float(max_weight_norm)
-    if not np.isfinite(weight_norm) or weight_norm > norm_limit:
-        raise ValueError(
-            f"LCMV test weight norm {weight_norm:.3f} exceeds limit {norm_limit:.3f}"
-        )
-
-    unity_response = complex(np.vdot(unity, weights))
-    null_response = complex(np.vdot(null_steering, weights))
-    return LcmvNullResult(
-        weights=weights,
-        null_angle_deg=null_angle,
-        condition_number=condition_number,
-        weight_norm=weight_norm,
-        max_weight_abs=float(np.max(np.abs(weights))),
-        unity_response=unity_response,
-        null_response=null_response,
-        unity_residual=unity_response - uniform_sum_target,
-        null_residual=null_response,
-    )
-
-
-def uniform_preserving_vector_null_weights(
-    *,
-    null_vector: np.ndarray,
-    condition_number_limit: float = 1e8,
-    max_weight_norm: float = 8.0,
-) -> LcmvVectorNullResult:
-    """Return one-null weights using a measured complex spatial vector."""
-
-    vector = np.asarray(null_vector, dtype=np.complex128).reshape(-1)
-    n = int(vector.size)
-    if n == 0:
-        raise ValueError("measured-vector LCMV null vector is empty")
-    if not np.all(np.isfinite(vector)):
-        raise ValueError("measured-vector LCMV null vector contains NaN or Inf")
-    vector_norm = float(np.linalg.norm(vector))
-    if not np.isfinite(vector_norm) or vector_norm <= 0.0:
-        raise ValueError("measured-vector LCMV null vector has zero norm")
-    null_vector_norm = vector / vector_norm
-
-    unity = np.ones((n,), dtype=np.complex128)
-    constraints = np.column_stack((unity, null_vector_norm))
-    uniform_sum_target = complex(float(n), 0.0)
-    targets = np.asarray([uniform_sum_target, 0.0 + 0.0j], dtype=np.complex128)
-    gram = constraints.conj().T @ constraints
-    condition_number = float(np.linalg.cond(gram))
-    limit = float(condition_number_limit)
-    if not np.isfinite(condition_number) or condition_number > limit:
-        raise ValueError(
-            "measured-vector LCMV constraint matrix ill-conditioned: "
-            f"cond={condition_number:.3e} limit={limit:.3e}"
-        )
-
-    try:
-        weights = constraints @ np.linalg.solve(gram, targets)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"measured-vector LCMV constraint solve failed: {exc}") from exc
-
-    weights = np.asarray(weights, dtype=np.complex128).reshape(-1)
-    if weights.shape != (n,):
-        raise ValueError(
-            f"measured-vector LCMV weights shape {weights.shape} does not match {(n,)}"
-        )
-    if not np.all(np.isfinite(weights)):
-        raise ValueError("measured-vector LCMV weights contain NaN or Inf")
-
-    weight_norm = float(np.linalg.norm(weights))
-    norm_limit = float(max_weight_norm)
-    if not np.isfinite(weight_norm) or weight_norm > norm_limit:
-        raise ValueError(
-            f"measured-vector LCMV weight norm {weight_norm:.3f} exceeds limit {norm_limit:.3f}"
-        )
-
-    unity_response = complex(np.vdot(unity, weights))
-    null_response = complex(np.vdot(null_vector_norm, weights))
-    return LcmvVectorNullResult(
-        weights=weights,
-        condition_number=condition_number,
-        weight_norm=weight_norm,
-        max_weight_abs=float(np.max(np.abs(weights))),
-        unity_response=unity_response,
-        null_response=null_response,
-        unity_residual=unity_response - uniform_sum_target,
-        null_residual=null_response,
-    )
-
-
-def uniform_preserving_covariance_lcmv_null_weights(
+def covariance_lcmv_ideal_null_weights(
     *,
     covariance: np.ndarray,
     n_channels: int,
     null_angle_deg: float,
     rf_freq_hz: float,
     array_spacing_m: float,
+    preserve_vector: np.ndarray | None = None,
     diagonal_loading_rel: float = 1e-3,
     diagonal_loading_abs: float = 0.0,
     condition_number_limit: float = 1e8,
@@ -278,7 +78,6 @@ def uniform_preserving_covariance_lcmv_null_weights(
     null_angle = float(null_angle_deg) % 360.0
     if not np.isfinite(null_angle):
         raise ValueError("covariance LCMV null angle is not finite")
-    unity = np.ones((n,), dtype=np.complex128)
     null_steering = np.asarray(
         steering_vector(
             np.asarray([null_angle], dtype=np.float64),
@@ -291,9 +90,9 @@ def uniform_preserving_covariance_lcmv_null_weights(
         raise ValueError(
             f"covariance LCMV steering vector size {null_steering.size} does not match {n}"
         )
-    result = _uniform_preserving_covariance_constraint_weights(
+    result = _covariance_lcmv_constraint_weights(
         covariance=covariance,
-        constraints=np.column_stack((unity, null_steering)),
+        preserve_vector=preserve_vector,
         null_vector=null_steering,
         diagonal_loading_rel=diagonal_loading_rel,
         diagonal_loading_abs=diagonal_loading_abs,
@@ -303,10 +102,11 @@ def uniform_preserving_covariance_lcmv_null_weights(
     return LcmvCovarianceNullResult(null_angle_deg=null_angle, **result)
 
 
-def uniform_preserving_covariance_vector_null_weights(
+def covariance_lcmv_vector_null_weights(
     *,
     covariance: np.ndarray,
     null_vector: np.ndarray,
+    preserve_vector: np.ndarray | None = None,
     diagonal_loading_rel: float = 1e-3,
     diagonal_loading_abs: float = 0.0,
     condition_number_limit: float = 1e8,
@@ -323,12 +123,10 @@ def uniform_preserving_covariance_vector_null_weights(
     vector_norm = float(np.linalg.norm(vector))
     if not np.isfinite(vector_norm) or vector_norm <= 0.0:
         raise ValueError("covariance measured-vector LCMV null vector has zero norm")
-    null_vector_norm = vector / vector_norm
-    unity = np.ones((n,), dtype=np.complex128)
-    result = _uniform_preserving_covariance_constraint_weights(
+    result = _covariance_lcmv_constraint_weights(
         covariance=covariance,
-        constraints=np.column_stack((unity, null_vector_norm)),
-        null_vector=null_vector_norm,
+        preserve_vector=preserve_vector,
+        null_vector=vector,
         diagonal_loading_rel=diagonal_loading_rel,
         diagonal_loading_abs=diagonal_loading_abs,
         condition_number_limit=condition_number_limit,
@@ -337,99 +135,10 @@ def uniform_preserving_covariance_vector_null_weights(
     return LcmvCovarianceNullResult(null_angle_deg=None, **result)
 
 
-def legacy_angle_fan_diagnostic_weights(
-    *,
-    n_channels: int,
-    center_angle_deg: float,
-    offsets_deg: np.ndarray | list[float],
-    rf_freq_hz: float,
-    array_spacing_m: float,
-    condition_number_limit: float = 1e8,
-    max_weight_norm: float = 8.0,
-) -> LcmvAngleFanResult:
-    """Return a constraint-only ideal steering fan around a MUSIC internal angle."""
-
-    n = int(n_channels)
-    if n != 4:
-        raise ValueError(f"angle-fan LCMV steering model expects 4 channels, got {n}")
-    center = float(center_angle_deg) % 360.0
-    if not np.isfinite(center):
-        raise ValueError("angle-fan LCMV center angle is not finite")
-    offsets = np.asarray(offsets_deg, dtype=np.float64).reshape(-1)
-    if offsets.size == 0:
-        offsets = np.asarray([0.0], dtype=np.float64)
-    if offsets.size > n - 1:
-        raise ValueError(
-            f"angle-fan LCMV supports at most {n - 1} null angles for {n} channels"
-        )
-    if not np.all(np.isfinite(offsets)):
-        raise ValueError("angle-fan LCMV offsets contain NaN or Inf")
-    internal_angles = (center + offsets) % 360.0
-    unity = np.ones((n,), dtype=np.complex128)
-    steering = np.asarray(
-        steering_vector(
-            internal_angles,
-            float(rf_freq_hz),
-            float(array_spacing_m),
-        ),
-        dtype=np.complex128,
-    )
-    if steering.shape != (n, offsets.size):
-        raise ValueError(
-            f"angle-fan steering shape {steering.shape} does not match {(n, offsets.size)}"
-        )
-    constraints = np.column_stack((unity, steering))
-    uniform_sum_target = complex(float(n), 0.0)
-    targets = np.zeros((constraints.shape[1],), dtype=np.complex128)
-    targets[0] = uniform_sum_target
-    gram = constraints.conj().T @ constraints
-    condition_number = float(np.linalg.cond(gram))
-    limit = float(condition_number_limit)
-    if not np.isfinite(condition_number) or condition_number > limit:
-        raise ValueError(
-            "angle-fan LCMV constraint matrix ill-conditioned: "
-            f"cond={condition_number:.3e} limit={limit:.3e}"
-        )
-    try:
-        weights = constraints @ np.linalg.solve(gram, targets)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"angle-fan LCMV constraint solve failed: {exc}") from exc
-    weights = _validated_weight_vector(
-        weights,
-        n_channels=n,
-        max_weight_norm=max_weight_norm,
-        label="angle-fan LCMV",
-    )
-    unity_response = complex(np.vdot(unity, weights))
-    fan_responses = np.asarray(steering.conj().T @ weights, dtype=np.complex128)
-    center_index = int(np.argmin(np.abs((internal_angles - center + 180.0) % 360.0 - 180.0)))
-    null_response = complex(fan_responses[center_index])
-    fan_display = np.asarray(
-        [internal_angle_to_operator_bearing_deg(float(angle)) for angle in internal_angles],
-        dtype=np.float64,
-    )
-    return LcmvAngleFanResult(
-        weights=weights,
-        null_angle_deg=center,
-        fan_offsets_deg=offsets,
-        fan_internal_angles_deg=np.asarray(internal_angles, dtype=np.float64),
-        fan_display_bearings_deg=fan_display,
-        condition_number=condition_number,
-        weight_norm=float(np.linalg.norm(weights)),
-        max_weight_abs=float(np.max(np.abs(weights))),
-        unity_response=unity_response,
-        null_response=null_response,
-        fan_null_responses=fan_responses,
-        unity_residual=unity_response - uniform_sum_target,
-        null_residual=null_response,
-        fan_null_residuals=fan_responses,
-    )
-
-
-def _uniform_preserving_covariance_constraint_weights(
+def _covariance_lcmv_constraint_weights(
     *,
     covariance: np.ndarray,
-    constraints: np.ndarray,
+    preserve_vector: np.ndarray | None,
     null_vector: np.ndarray,
     diagonal_loading_rel: float,
     diagonal_loading_abs: float,
@@ -437,21 +146,39 @@ def _uniform_preserving_covariance_constraint_weights(
     max_weight_norm: float,
 ) -> dict[str, object]:
     cov = np.asarray(covariance, dtype=np.complex128)
-    constraints = np.asarray(constraints, dtype=np.complex128)
     null_vector = np.asarray(null_vector, dtype=np.complex128).reshape(-1)
     if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
         raise ValueError(f"covariance LCMV covariance must be square, got {cov.shape}")
     n = int(cov.shape[0])
-    if constraints.ndim != 2 or constraints.shape[0] != n:
-        raise ValueError(
-            f"covariance LCMV constraints shape {constraints.shape} does not match {n} channels"
-        )
     if null_vector.size != n:
         raise ValueError(
             f"covariance LCMV null vector size {null_vector.size} does not match {n}"
         )
-    if not np.all(np.isfinite(cov)) or not np.all(np.isfinite(constraints)):
+    preserve = (
+        np.ones((n,), dtype=np.complex128)
+        if preserve_vector is None
+        else np.asarray(preserve_vector, dtype=np.complex128).reshape(-1)
+    )
+    if preserve.size != n:
+        raise ValueError(
+            f"covariance LCMV preserve vector size {preserve.size} does not match {n}"
+        )
+    if not np.all(np.isfinite(cov)) or not np.all(np.isfinite(preserve)):
         raise ValueError("covariance LCMV inputs contain NaN or Inf")
+    if not np.all(np.isfinite(null_vector)):
+        raise ValueError("covariance LCMV null vector contains NaN or Inf")
+    preserve_norm_value = float(np.linalg.norm(preserve))
+    null_norm_value = float(np.linalg.norm(null_vector))
+    if not np.isfinite(preserve_norm_value) or preserve_norm_value <= 0.0:
+        raise ValueError("covariance LCMV preserve vector has zero norm")
+    if not np.isfinite(null_norm_value) or null_norm_value <= 0.0:
+        raise ValueError("covariance LCMV null vector has zero norm")
+    preserve_norm = preserve / preserve_norm_value
+    null_norm = null_vector / null_norm_value
+    constraints = np.column_stack((preserve_norm, null_norm))
+    reference_weights = np.ones((n,), dtype=np.complex128)
+    preserve_target = complex(np.vdot(preserve_norm, reference_weights))
+    targets = np.asarray([preserve_target, 0.0 + 0.0j], dtype=np.complex128)
     loading = _diagonal_loading_value(
         covariance=cov,
         diagonal_loading_rel=diagonal_loading_rel,
@@ -476,8 +203,6 @@ def _uniform_preserving_covariance_constraint_weights(
             "covariance LCMV constraint matrix ill-conditioned: "
             f"cond={condition_number:.3e} limit={limit:.3e}"
         )
-    uniform_sum_target = complex(float(n), 0.0)
-    targets = np.asarray([uniform_sum_target, 0.0 + 0.0j], dtype=np.complex128)
     try:
         weights = rinv_c @ np.linalg.solve(constraint_gram, targets)
     except np.linalg.LinAlgError as exc:
@@ -488,19 +213,21 @@ def _uniform_preserving_covariance_constraint_weights(
         max_weight_norm=max_weight_norm,
         label="covariance LCMV",
     )
-    unity = constraints[:, 0]
-    unity_response = complex(np.vdot(unity, weights))
-    null_response = complex(np.vdot(null_vector, weights))
+    preserve_response = complex(np.vdot(preserve_norm, weights))
+    null_response = complex(np.vdot(null_norm, weights))
     return {
         "weights": weights,
+        "preserve_vector": preserve_norm,
+        "null_vector": null_norm,
         "diagonal_loading": float(loading),
         "condition_number_R": cond_r,
         "condition_number": condition_number,
         "weight_norm": float(np.linalg.norm(weights)),
         "max_weight_abs": float(np.max(np.abs(weights))),
-        "unity_response": unity_response,
+        "preserve_target": preserve_target,
+        "preserve_response": preserve_response,
         "null_response": null_response,
-        "unity_residual": unity_response - uniform_sum_target,
+        "preserve_residual": preserve_response - preserve_target,
         "null_residual": null_response,
     }
 
