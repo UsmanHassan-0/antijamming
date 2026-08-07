@@ -10,13 +10,7 @@ In Python this is `w.conj() @ samples`. For a spatial vector `v`, response is `w
 
 Uniform sum uses `w = [1, 1, 1, 1]` and preserves the old raw four-channel sum into one GNSS-SDR stream. Uniform average would use `[0.25, 0.25, 0.25, 0.25]`; this is useful as a noise-gain reference but is not the default FIFO combiner.
 
-Constraint-only LCMV uses:
-
-```text
-w = C (C^H C)^-1 f
-```
-
-Full covariance LCMV uses diagonal-loaded covariance:
+The product has one LCMV implementation. It uses diagonal-loaded covariance:
 
 ```text
 R_loaded = R + delta I
@@ -28,17 +22,21 @@ w = R_loaded^-1 C (C^H R_loaded^-1 C)^-1 f
 
 All constraints are checked as `C^H w ~= f`.
 
-Current non-legacy methods:
+The two selectable methods are thin constraint-vector choices around that same
+covariance solver:
 
 - `covariance_lcmv_ideal`: product method; full covariance LCMV with the ideal steering vector at the MUSIC internal angle as its null constraint.
-- `measured_dominant_eigenvector`: diagnostic constraint-only null with `[ones, u1_norm]`.
 - `covariance_lcmv_measured_u1`: full covariance LCMV with measured `u1` null.
 
-The current product config uses `lcmv_test_null_method: "covariance_lcmv_ideal"`, so the active FIFO weights are the full-covariance ideal-steering LCMV weights when LCMV test mode is on and valid. Measured-u1 methods remain candidate diagnostics unless explicitly selected in the config.
+The current product config uses `lcmv_test_null_method: "covariance_lcmv_ideal"`, so the jammer null uses the ideal steering vector. The preserve constraint is separate: `lcmv_preserve_constraint_mode: "realtime_bladerf_measured_u1"` tracks a stable jammer-off bladeRF angle cluster, verifies that the recent healthy-reference angle belongs to that cluster, and freezes the measured healthy U1 and covariance when the operator enables LCMV. The old ideal-angle-only bladeRF preserve mode was removed after the 2026-08-07 live test showed 7-9 dB of C/N0 loss despite near-zero mathematical constraint residuals.
 
-The product profile sets `lcmv_desired_loss_guard_enabled: false`. Desired/SOI loss versus the healthy reference and the 6 dB diagnostic threshold remain in the logs, but exceeding that threshold does not reject the active LCMV method or switch the FIFO to uniform summation. Invalid/non-finite weights, excessive weight norm, unavailable covariance solutions, protected bladeRF bearings, and insufficient predicted target suppression retain their existing fallbacks.
+Enabling LCMV first arms the runtime while the FIFO remains on uniform weights. Angular movement alone cannot activate covariance weights. Activation requires both an input-power rise and a generalized covariance-mode rise against the exact frozen arm-time baseline. Detection then latches until LCMV is disabled, so a long jammer interval cannot silently return the system to unprotected uniform weights.
 
-The old constraint-only ideal-steering null and ideal-angle fan remain unit-test helpers named `legacy_constraint_null_ideal_weights` and `legacy_angle_fan_diagnostic_weights`. They are not accepted runtime active-method values, are not computed as live candidates, and are not ranked by the run summary.
+The product applies target weights with a one-second complex linear chunk ramp. The uniform and LCMV endpoints have the same complex response to the frozen measured bladeRF U1, so every interpolated weight has that same response. New covariance targets restart the ramp from the currently applied weights rather than introducing a one-chunk discontinuity.
+
+The product profile sets `lcmv_desired_loss_guard_enabled: false` because the frozen measured bladeRF U1 is now an explicit equality constraint. Desired/SOI loss versus the healthy reference and the 6 dB diagnostic threshold remain in the logs. Invalid/non-finite weights, excessive weight norm, unavailable covariance solutions, protected bladeRF bearings, missing/stale measured references, and absent jammer activation evidence retain uniform fallbacks.
+
+Covariance-free constraint projection, the old ideal-steering shortcut, and the old ideal-angle fan have been removed from the product module and tests. The runtime schema rejects their old method names.
 
 Common live signal model:
 
@@ -49,4 +47,4 @@ R = E{x x^H}
 
 `R` is not jammer-only. `u1` is not always jammer. When the jammer is off, `u1` can be healthy/SOI/bladeRF-like. When the jammer is on and strong, `u1` can become jammer-like. SOI inside `R` can be damaged unless protected by a correct desired constraint. GSC is a future-work path for separating blocking/nulling from an adaptive noise canceller.
 
-Measured-u1 methods are not the product default because `u1` is not always the jammer. Their desired/SOI loss must be measured against a reliable run-local healthy reference before an operator selects either measured method.
+The measured-u1 method is not the product default because `u1` is not always the jammer. Its desired/SOI loss must be measured against a reliable run-local healthy reference before an operator selects it.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,11 +10,8 @@ import pytest
 from antijamming.config import StreamConfig
 from antijamming.dsp.beamforming import (
     apply_beamformer,
-    legacy_angle_fan_diagnostic_weights,
-    legacy_constraint_null_ideal_weights,
-    uniform_preserving_covariance_lcmv_null_weights,
-    uniform_preserving_covariance_vector_null_weights,
-    uniform_preserving_vector_null_weights,
+    covariance_lcmv_ideal_null_weights,
+    covariance_lcmv_vector_null_weights,
     uniform_weights,
 )
 from antijamming.dsp.doa.music import steering_vector
@@ -45,6 +43,37 @@ def _build_loggers() -> dict[str, logging.Logger]:
     return {k: logging.getLogger(f"test.bf.{k}") for k in keys}
 
 
+def _prime_realtime_bladerf_reference(
+    runtime: BackendRuntime,
+    cfg: StreamConfig,
+    *,
+    internal_angle_deg: float,
+    baseline_power_linear: float = 1.0,
+    measured_vector: np.ndarray | None = None,
+) -> np.ndarray:
+    vector = (
+        np.asarray(measured_vector, dtype=np.complex128).reshape(-1)
+        if measured_vector is not None
+        else steering_vector(
+            np.asarray([internal_angle_deg], dtype=np.float64),
+            cfg.center_freq_hz,
+            cfg.array_spacing_m,
+        ).reshape(-1)
+    )
+    normalized = vector / np.linalg.norm(vector)
+    runtime._healthy_reference_vector = normalized
+    runtime._healthy_reference_covariance = np.eye(4, dtype=np.complex128)
+    runtime._healthy_reference_internal_angle_deg = internal_angle_deg
+    runtime._healthy_reference_display_bearing_deg = (
+        internal_angle_to_operator_bearing_deg(internal_angle_deg)
+    )
+    runtime._healthy_reference_updated_monotonic_s = time.monotonic()
+    runtime._healthy_reference_confidence = 1.0
+    runtime._healthy_reference_raw_power_linear = baseline_power_linear
+    runtime._healthy_reference_cal_power_linear = baseline_power_linear
+    return normalized
+
+
 def test_uniform_weights_are_raw_sum_coefficients() -> None:
     weights = uniform_weights(4)
 
@@ -73,30 +102,6 @@ def test_uniform_combiner_rejects_wrong_weight_count() -> None:
         apply_beamformer(x, uniform_weights(3))
 
 
-def test_lcmv_test_weights_are_finite_and_satisfy_constraints() -> None:
-    null_angle = 72.0
-    result = legacy_constraint_null_ideal_weights(
-        n_channels=4,
-        null_angle_deg=null_angle,
-        rf_freq_hz=1.57542e9,
-        array_spacing_m=0.07,
-    )
-    unity = np.ones((4,), dtype=np.complex128)
-    null_steering = steering_vector(
-        np.asarray([null_angle], dtype=np.float64),
-        1.57542e9,
-        0.07,
-    ).reshape(-1)
-
-    assert result.weights.shape == (4,)
-    assert np.all(np.isfinite(result.weights))
-    assert result.weight_norm <= 8.0
-    assert np.vdot(unity, result.weights) == pytest.approx(4.0 + 0.0j, abs=1e-10)
-    assert abs(np.vdot(null_steering, result.weights)) < 1e-10
-    assert abs(result.unity_residual) < 1e-10
-    assert abs(result.null_residual) < 1e-10
-
-
 def test_display_bearing_to_internal_angle_convention_is_invertible() -> None:
     assert operator_bearing_to_internal_angle_deg(170.0) == pytest.approx(280.0)
     assert operator_bearing_to_internal_angle_deg(290.0) == pytest.approx(160.0)
@@ -111,7 +116,8 @@ def test_lcmv_steering_vector_uses_internal_angle_not_display_bearing() -> None:
     display_bearing = 170.0
     internal_angle = operator_bearing_to_internal_angle_deg(display_bearing)
     wrong_internal = display_bearing
-    result = legacy_constraint_null_ideal_weights(
+    result = covariance_lcmv_ideal_null_weights(
+        covariance=np.eye(4, dtype=np.complex128),
         n_channels=4,
         null_angle_deg=internal_angle,
         rf_freq_hz=1.57542e9,
@@ -144,7 +150,7 @@ def test_covariance_lcmv_ideal_weights_satisfy_constraints() -> None:
         steering.conj(),
     )
 
-    result = uniform_preserving_covariance_lcmv_null_weights(
+    result = covariance_lcmv_ideal_null_weights(
         covariance=covariance,
         n_channels=4,
         null_angle_deg=null_angle,
@@ -170,7 +176,7 @@ def test_covariance_lcmv_measured_vector_weights_satisfy_constraints() -> None:
         null_norm.conj(),
     )
 
-    result = uniform_preserving_covariance_vector_null_weights(
+    result = covariance_lcmv_vector_null_weights(
         covariance=covariance,
         null_vector=null_vector,
         diagonal_loading_rel=1e-3,
@@ -184,54 +190,13 @@ def test_covariance_lcmv_measured_vector_weights_satisfy_constraints() -> None:
     assert abs(np.vdot(null_norm, result.weights)) < 1e-8
 
 
-def test_ideal_angle_fan_weights_null_each_internal_fan_angle() -> None:
-    result = legacy_angle_fan_diagnostic_weights(
-        n_channels=4,
-        center_angle_deg=280.0,
-        offsets_deg=[-4.0, 0.0, 4.0],
-        rf_freq_hz=1.57542e9,
-        array_spacing_m=0.07,
-    )
-    steering = steering_vector(
-        result.fan_internal_angles_deg,
-        1.57542e9,
-        0.07,
-    )
-
-    assert result.fan_display_bearings_deg.tolist() == pytest.approx(
-        [
-            internal_angle_to_operator_bearing_deg(angle)
-            for angle in result.fan_internal_angles_deg
-        ]
-    )
-    assert np.vdot(np.ones((4,), dtype=np.complex128), result.weights) == pytest.approx(
-        4.0 + 0.0j,
-        abs=1e-9,
-    )
-    assert np.max(np.abs(steering.conj().T @ result.weights)) < 1e-8
-
-
-def test_measured_vector_lcmv_weights_are_finite_and_satisfy_constraints() -> None:
-    null_vector = np.array([1.0, 1.0j, -1.0, -1.0j], dtype=np.complex128)
-    result = uniform_preserving_vector_null_weights(null_vector=null_vector)
-    unity = np.ones((4,), dtype=np.complex128)
-    null_norm = null_vector / np.linalg.norm(null_vector)
-
-    assert result.weights.shape == (4,)
-    assert np.all(np.isfinite(result.weights))
-    assert result.weight_norm <= 8.0
-    assert np.vdot(unity, result.weights) == pytest.approx(4.0 + 0.0j, abs=1e-10)
-    assert abs(np.vdot(null_norm, result.weights)) < 1e-10
-    assert abs(result.unity_residual) < 1e-10
-    assert abs(result.null_residual) < 1e-10
-
-
 def test_lcmv_test_combiner_outputs_complex64_single_stream() -> None:
     rng = np.random.default_rng(17)
     x = (
         rng.standard_normal((4, 128)) + 1j * rng.standard_normal((4, 128))
     ).astype(np.complex128)
-    result = legacy_constraint_null_ideal_weights(
+    result = covariance_lcmv_ideal_null_weights(
+        covariance=np.eye(4, dtype=np.complex128),
         n_channels=4,
         null_angle_deg=120.0,
         rf_freq_hz=1.57542e9,
@@ -319,6 +284,49 @@ def test_backend_gnss_weighted_sum_fast_path_matches_effective_weights() -> None
     assert np.allclose(y, expected, atol=1e-6)
 
 
+def test_beamformer_weight_ramp_preserves_measured_u1_response_each_chunk() -> None:
+    cfg = StreamConfig(
+        phase_correction_vector=None,
+        lcmv_weight_transition_s=(3.0 * 32768.0 / 4_000_000.0),
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    preserve = np.array(
+        [1.0 + 0.0j, 0.55 + 0.35j, -0.25 + 0.80j, -0.65 - 0.15j],
+        dtype=np.complex128,
+    )
+    preserve /= np.linalg.norm(preserve)
+    null_vector = steering_vector(
+        np.asarray([150.0], dtype=np.float64),
+        cfg.center_freq_hz,
+        cfg.array_spacing_m,
+    ).reshape(-1)
+    target = covariance_lcmv_vector_null_weights(
+        covariance=np.eye(4, dtype=np.complex128),
+        null_vector=null_vector,
+        preserve_vector=preserve,
+    ).weights
+    uniform = uniform_weights(4)
+    preserve_target = np.vdot(preserve, uniform)
+    chunk = np.ones((4, 16), dtype=np.complex64)
+
+    runtime._schedule_beamformer_weights(target, reason="unit-test smooth ramp")
+    before = runtime._beamformer_transition_payload()
+    assert before["weight_transition_active"] is True
+    assert before["weight_transition_total_chunks"] == 3
+
+    for step in range(1, 4):
+        runtime._gnss_output_vector(chunk)
+        applied = runtime._get_beamformer_weights_copy()
+        expected = uniform + (step / 3.0) * (target - uniform)
+        assert np.allclose(applied, expected, atol=1e-10)
+        assert abs(np.vdot(preserve, applied) - preserve_target) < 1e-10
+
+    after = runtime._beamformer_transition_payload()
+    assert after["weight_transition_active"] is False
+    assert after["weight_transition_progress"] == pytest.approx(1.0)
+    assert np.allclose(runtime._get_beamformer_weights_copy(), target)
+
+
 def test_worker_gnss_output_uses_uniform_combiner_by_default() -> None:
     cfg = StreamConfig(phase_correction_vector=None)
     worker = StreamWorker(cfg, _build_loggers())
@@ -402,6 +410,9 @@ def test_backend_gnss_handoff_label_is_uniform_array_sum() -> None:
 def test_backend_lcmv_test_missing_music_bearing_falls_back_to_uniform() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
+        lcmv_weight_transition_s=0.0,
         phase_correction_vector=None,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
@@ -465,6 +476,9 @@ def test_backend_lcmv_test_valid_music_bearing_updates_gnss_weights() -> None:
     rng = np.random.default_rng(24)
     cfg = StreamConfig(
         lcmv_test_enabled=True,
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
+        lcmv_weight_transition_s=0.0,
         phase_correction_vector=None,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
@@ -490,7 +504,7 @@ def test_backend_lcmv_test_valid_music_bearing_updates_gnss_weights() -> None:
     y = runtime._gnss_output_vector(x)
 
     assert status["mode"] == "on"
-    assert status["description"] == "Nulling strongest MUSIC peak"
+    assert status["description"] == "Covariance LCMV null active"
     assert status["active_lcmv_null_method"] == "covariance_lcmv_ideal"
     assert status["active_lcmv_method"] == "covariance_lcmv_ideal"
     assert status["active_lcmv_weights_source"] == "covariance_lcmv_ideal"
@@ -501,10 +515,9 @@ def test_backend_lcmv_test_valid_music_bearing_updates_gnss_weights() -> None:
     assert lcmv_response_abs.shape == (cfg.doa_points,)
     assert np.all(np.isfinite(lcmv_response_db))
     assert np.all(np.isfinite(lcmv_response_abs))
-    assert status["suppression_db_alias_of"] == "measured_output_reduction_vs_uniform_db"
-    assert output_metrics["measured_output_reduction_vs_uniform_db"] == pytest.approx(
-        status["suppression_db"]
-    )
+    assert "suppression_db" not in status
+    assert "suppression_db_alias_of" not in status
+    assert output_metrics["measured_output_reduction_vs_uniform_db"] is not None
     assert "lcmv_model_summary" in status
     assert runtime._gnss_handoff_mode_label() == "lcmv_test_nulling_continuous"
     active_weights = np.asarray(
@@ -524,6 +537,8 @@ def test_backend_lcmv_protects_bladerf_bearing_from_nulling() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
         lcmv_desired_loss_guard_enabled=True,
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
         phase_correction_vector=None,
         experiment={
             "bladeRF_expected_bearing_deg_min": 280.0,
@@ -551,6 +566,8 @@ def test_backend_lcmv_jammer_bearing_bypasses_desired_loss_guard() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
         lcmv_desired_loss_guard_enabled=True,
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
         phase_correction_vector=None,
         experiment={
             "bladeRF_expected_bearing_deg_min": 280.0,
@@ -596,6 +613,8 @@ def test_backend_lcmv_unclassified_bearing_keeps_desired_loss_guard() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
         lcmv_desired_loss_guard_enabled=True,
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
         phase_correction_vector=None,
         experiment={
             "bladeRF_expected_bearing_deg_min": 280.0,
@@ -632,6 +651,8 @@ def test_backend_lcmv_disabled_desired_loss_guard_keeps_lcmv_active() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
         lcmv_desired_loss_guard_enabled=False,
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
         phase_correction_vector=None,
         experiment={
             "bladeRF_expected_bearing_deg_min": 280.0,
@@ -675,6 +696,8 @@ def test_backend_lcmv_keeps_covariance_active_when_wng_exceeds_limit() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
         lcmv_test_null_method="covariance_lcmv_ideal",
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
         lcmv_max_white_noise_gain_db=-100.0,
         phase_correction_vector=None,
     )
@@ -713,11 +736,13 @@ def test_backend_lcmv_keeps_covariance_active_when_wng_exceeds_limit() -> None:
     ]
 
 
-def test_backend_lcmv_measured_vector_mode_uses_u1_candidate_weights() -> None:
+def test_backend_covariance_lcmv_measured_u1_mode_uses_covariance_weights() -> None:
     rng = np.random.default_rng(51)
     cfg = StreamConfig(
         lcmv_test_enabled=True,
-        lcmv_test_null_method="measured_dominant_eigenvector",
+        lcmv_test_null_method="covariance_lcmv_measured_u1",
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
         phase_correction_vector=None,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
@@ -738,9 +763,10 @@ def test_backend_lcmv_measured_vector_mode_uses_u1_candidate_weights() -> None:
     spatial = status["spatial_vector_diagnostics"]
 
     assert status["mode"] == "on"
-    assert status["active_lcmv_null_method"] == "measured_dominant_eigenvector"
-    assert status["active_lcmv_weights_source"] == "measured_dominant_eigenvector"
-    assert spatial["candidate_u1_lcmv_available"] is True
+    assert status["active_lcmv_null_method"] == "covariance_lcmv_measured_u1"
+    assert status["active_lcmv_weights_source"] == "covariance_lcmv_measured_u1"
+    assert "covariance_lcmv_measured_u1" in spatial["candidate_methods_valid"]
+    assert spatial["candidate_covariance_lcmv_measured_u1_condition_number_R"] is not None
     assert spatial["active_lcmv_weights"]["real"] == status["output_metrics"]["lcmv_weights"]["real"]
 
 
@@ -749,6 +775,8 @@ def test_backend_lcmv_logs_all_candidate_methods_and_angle_fields() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
         lcmv_test_null_method="covariance_lcmv_ideal",
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
         phase_correction_vector=None,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
@@ -783,7 +811,6 @@ def test_backend_lcmv_logs_all_candidate_methods_and_angle_fields() -> None:
     assert spatial["steering_vector_angle_used_display_deg"] == pytest.approx(170.0)
     assert spatial["display_bearing_formula"] == "(90 - internal_angle_deg) % 360"
     assert set(spatial["candidate_methods_computed"]) == {
-        "measured_dominant_eigenvector",
         "covariance_lcmv_ideal",
         "covariance_lcmv_measured_u1",
     }
@@ -814,6 +841,8 @@ def test_backend_lcmv_candidate_methods_do_not_feed_fifo_when_disabled() -> None
     cfg = StreamConfig(
         lcmv_test_enabled=True,
         lcmv_test_null_method="covariance_lcmv_ideal",
+        lcmv_preserve_constraint_mode="uniform",
+        lcmv_target_selection_mode="strongest_music_peak",
         lcmv_candidate_methods_enabled=False,
         phase_correction_vector=None,
     )
@@ -844,6 +873,232 @@ def test_backend_lcmv_candidate_methods_do_not_feed_fifo_when_disabled() -> None
         runtime._gnss_output_vector(x),
         apply_beamformer(x, runtime._get_beamformer_weights_copy()),
     )
+
+
+def test_realtime_bladerf_tracker_wraps_angles_and_freezes_only_when_stable() -> None:
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        lcmv_target_selection_mode="realtime_non_preserve_peak",
+        lcmv_realtime_preserve_window_samples=8,
+        lcmv_realtime_preserve_min_samples=4,
+        lcmv_realtime_preserve_max_circular_std_deg=5.0,
+        lcmv_realtime_preserve_max_step_deg=15.0,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+
+    for angle in (359.0, 1.0, 0.0, 2.0):
+        payload = runtime._update_realtime_bladerf_angle_tracker(
+            {"doa_peaks": [{"angle_deg": angle}]},
+            primary_internal_deg=angle,
+        )
+
+    center = float(payload["realtime_bladerf_tracker_center_internal_deg"])
+    assert payload["realtime_bladerf_tracker_sample_count"] == 4
+    assert payload["realtime_bladerf_tracker_stable"] is True
+    assert min(center, 360.0 - center) < 1.0
+
+    _prime_realtime_bladerf_reference(
+        runtime,
+        cfg,
+        internal_angle_deg=center,
+    )
+    runtime.set_lcmv_test_enabled(True)
+    frozen = runtime._realtime_preserve_tracker_payload()
+    armed_status = runtime._lcmv_status_copy()
+    frozen_angle = float(frozen["realtime_bladerf_frozen_internal_deg"])
+    assert frozen["realtime_bladerf_angle_frozen"] is True
+    assert frozen_angle == pytest.approx(center)
+    assert armed_status["mode"] == "fallback"
+    assert armed_status["spatial_vector_diagnostics"][
+        "lcmv_jammer_activation_armed"
+    ] is True
+
+    after_jammer_like_peak = runtime._update_realtime_bladerf_angle_tracker(
+        {"doa_peaks": [{"angle_deg": 140.0}]},
+        primary_internal_deg=140.0,
+    )
+    assert after_jammer_like_peak["realtime_bladerf_frozen_internal_deg"] == pytest.approx(
+        frozen_angle
+    )
+    assert after_jammer_like_peak["realtime_bladerf_tracker_center_internal_deg"] == pytest.approx(
+        center
+    )
+    assert "frozen while LCMV is enabled" in str(
+        after_jammer_like_peak["realtime_bladerf_tracker_reason"]
+    )
+
+
+def test_realtime_lcmv_target_ignores_peaks_inside_frozen_bladerf_guard() -> None:
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        lcmv_target_selection_mode="realtime_non_preserve_peak",
+        lcmv_realtime_preserve_min_samples=3,
+        lcmv_realtime_preserve_max_circular_std_deg=5.0,
+        lcmv_realtime_preserve_guard_deg=20.0,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    for angle in (39.0, 40.0, 41.0):
+        runtime._update_realtime_bladerf_angle_tracker(
+            {"doa_peaks": [{"angle_deg": angle}]},
+            primary_internal_deg=angle,
+        )
+    _prime_realtime_bladerf_reference(
+        runtime,
+        cfg,
+        internal_angle_deg=40.0,
+    )
+    runtime.set_lcmv_test_enabled(True)
+
+    internal, display, source = runtime._select_lcmv_target_from_doa_metrics(
+        {
+            "doa_peaks": [
+                {"angle_deg": 42.0},
+                {"angle_deg": 150.0},
+            ]
+        },
+        primary_internal_deg=42.0,
+        primary_display_deg=48.0,
+    )
+
+    assert internal == pytest.approx(150.0)
+    assert display == pytest.approx(internal_angle_to_operator_bearing_deg(150.0))
+    assert source == "strongest_music_peak_outside_frozen_bladerf_guard"
+
+
+def test_realtime_lcmv_stays_uniform_for_angle_jump_without_jammer_evidence() -> None:
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        lcmv_target_selection_mode="realtime_non_preserve_peak",
+        lcmv_realtime_preserve_min_samples=3,
+        lcmv_realtime_preserve_max_circular_std_deg=5.0,
+        lcmv_realtime_preserve_guard_deg=20.0,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    for angle in (39.0, 40.0, 41.0):
+        runtime._update_realtime_bladerf_angle_tracker(
+            {"doa_peaks": [{"angle_deg": angle}]},
+            primary_internal_deg=angle,
+        )
+    _prime_realtime_bladerf_reference(
+        runtime,
+        cfg,
+        internal_angle_deg=40.0,
+        baseline_power_linear=1.0,
+    )
+    runtime.set_lcmv_test_enabled(True)
+    x = 0.1 * np.ones((4, 1024), dtype=np.complex128)
+
+    runtime._update_lcmv_test_from_music(
+        x,
+        150.0,
+        internal_angle_to_operator_bearing_deg(150.0),
+        raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
+        target_selection_source="strongest_music_peak_outside_frozen_bladerf_guard",
+    )
+
+    status = runtime._lcmv_status_copy()
+    spatial = status["spatial_vector_diagnostics"]
+    assert status["mode"] == "fallback"
+    assert "armed with frozen measured bladeRF U1" in status["fallback_reason"]
+    assert spatial["lcmv_jammer_activation_evidence_now"] is False
+    assert spatial["lcmv_jammer_detected_latched"] is False
+    assert spatial["lcmv_jammer_activation_angle_only_forbidden"] is True
+    assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
+
+
+def test_realtime_lcmv_preserves_frozen_bladerf_angle_and_nulls_other_peak() -> None:
+    rng = np.random.default_rng(645)
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_test_null_method="covariance_lcmv_ideal",
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        lcmv_target_selection_mode="realtime_non_preserve_peak",
+        lcmv_realtime_preserve_min_samples=3,
+        lcmv_realtime_preserve_max_circular_std_deg=5.0,
+        lcmv_realtime_preserve_guard_deg=20.0,
+        lcmv_desired_loss_guard_enabled=False,
+        lcmv_weight_transition_s=0.0,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    for angle in (39.0, 40.0, 41.0):
+        runtime._update_realtime_bladerf_angle_tracker(
+            {"doa_peaks": [{"angle_deg": angle}]},
+            primary_internal_deg=angle,
+        )
+    measured_preserve_vector = np.array(
+        [1.0 + 0.0j, 0.55 + 0.35j, -0.25 + 0.80j, -0.65 - 0.15j],
+        dtype=np.complex128,
+    )
+    preserve_vector = _prime_realtime_bladerf_reference(
+        runtime,
+        cfg,
+        internal_angle_deg=40.0,
+        baseline_power_linear=0.01,
+        measured_vector=measured_preserve_vector,
+    )
+    runtime.set_lcmv_test_enabled(True)
+    tracker = runtime._realtime_preserve_tracker_payload()
+    preserve_angle = float(tracker["realtime_bladerf_frozen_internal_deg"])
+    null_angle = 150.0
+
+    null_vector = steering_vector(
+        np.asarray([null_angle], dtype=np.float64),
+        cfg.center_freq_hz,
+        cfg.array_spacing_m,
+    ).reshape(-1)
+    desired = rng.standard_normal(2048) + 1j * rng.standard_normal(2048)
+    jammer = rng.standard_normal(2048) + 1j * rng.standard_normal(2048)
+    noise = 0.01 * (
+        rng.standard_normal((4, 2048)) + 1j * rng.standard_normal((4, 2048))
+    )
+    x = (
+        0.5 * preserve_vector[:, None] * desired[None, :]
+        + 2.0 * null_vector[:, None] * jammer[None, :]
+        + noise
+    ).astype(np.complex128)
+
+    runtime._update_lcmv_test_from_music(
+        x,
+        null_angle,
+        internal_angle_to_operator_bearing_deg(null_angle),
+        raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
+        target_selection_source="strongest_music_peak_outside_frozen_bladerf_guard",
+    )
+
+    status = runtime._lcmv_status_copy()
+    spatial = status["spatial_vector_diagnostics"]
+    weights = runtime._get_beamformer_weights_copy()
+    preserve_norm = preserve_vector / np.linalg.norm(preserve_vector)
+    null_norm = null_vector / np.linalg.norm(null_vector)
+    uniform = uniform_weights(4)
+
+    assert status["mode"] == "on"
+    assert spatial["lcmv_jammer_activation_evidence_now"] is True
+    assert spatial["lcmv_jammer_detected_latched"] is True
+    assert spatial["lcmv_preserve_constraint_mode"] == "realtime_bladerf_measured_u1"
+    assert spatial["lcmv_preserve_internal_angle_deg"] == pytest.approx(preserve_angle)
+    assert spatial["null_internal_angle_deg"] == pytest.approx(null_angle)
+    assert abs(np.vdot(preserve_norm, weights) - np.vdot(preserve_norm, uniform)) < 1e-6
+    assert abs(np.vdot(null_norm, weights)) < 1e-6
+    assert status["preserve_residual_abs"] < 1e-6
+    assert status["null_residual_abs"] < 1e-6
+
+    after_drop = runtime._lcmv_jammer_activation_evidence(
+        covariance=np.eye(4, dtype=np.complex128),
+        raw_power_metrics={"raw_avg_channel_power_linear": 0.01},
+        cal_power_metrics={"cal_avg_channel_power_linear": 0.01},
+    )
+    assert after_drop["lcmv_jammer_activation_evidence_now"] is False
+    assert after_drop["lcmv_jammer_detected_latched"] is True
 
 
 def test_healthy_reference_updates_during_lcmv_off_healthy_baseline() -> None:

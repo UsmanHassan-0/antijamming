@@ -79,9 +79,19 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_test_max_weight_norm == 8.0
     assert cfg.lcmv_test_condition_number_limit == 100_000_000.0
     assert cfg.lcmv_test_null_method == "covariance_lcmv_ideal"
+    assert cfg.lcmv_preserve_constraint_mode == "realtime_bladerf_measured_u1"
+    assert cfg.lcmv_target_selection_mode == "realtime_non_preserve_peak"
+    assert cfg.lcmv_realtime_preserve_window_samples == 40
+    assert cfg.lcmv_realtime_preserve_min_samples == 20
+    assert cfg.lcmv_realtime_preserve_max_circular_std_deg == 15.0
+    assert cfg.lcmv_realtime_preserve_max_step_deg == 30.0
+    assert cfg.lcmv_realtime_preserve_guard_deg == 20.0
+    assert cfg.lcmv_realtime_preserve_max_reference_age_s == 2.0
+    assert cfg.lcmv_jammer_activation_min_input_power_jump_db == 3.0
+    assert cfg.lcmv_jammer_activation_min_generalized_gain_db == 6.0
+    assert cfg.lcmv_weight_transition_s == 1.0
     assert VALID_LCMV_METHODS == {
         "covariance_lcmv_ideal",
-        "measured_dominant_eigenvector",
         "covariance_lcmv_measured_u1",
     }
     assert cfg.lcmv_candidate_methods_enabled is True
@@ -153,7 +163,9 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
         "reimport",
     )
     assert cfg.experiment["rx_chain"] == "antenna->cable->BPF->LNA->DC_block->cable->TwinRX"
-    assert cfg.experiment["jammer_attenuation_db"] == 50.0
+    assert "jammer_attenuation_db" not in cfg.experiment
+    assert cfg.experiment["jammer_attenuation_db_min"] == 0.0
+    assert cfg.experiment["jammer_attenuation_db_max"] == 90.0
 
 
 def test_runtime_config_experiment_section_is_optional(tmp_path) -> None:
@@ -248,7 +260,10 @@ def test_runtime_config_lcmv_method_defaults_to_covariance_ideal(tmp_path) -> No
     assert cfg.lcmv_test_null_method == "covariance_lcmv_ideal"
 
 
-@pytest.mark.parametrize("method", ["ideal_steering", "ideal_angle_fan"])
+@pytest.mark.parametrize(
+    "method",
+    ["ideal_steering", "ideal_angle_fan", "measured_dominant_eigenvector"],
+)
 def test_runtime_config_rejects_legacy_lcmv_methods(tmp_path, method) -> None:
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     payload["lcmv_test_null_method"] = method

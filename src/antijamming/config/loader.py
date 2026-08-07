@@ -10,6 +10,8 @@ from antijamming.config.paths import REPO_ROOT
 from antijamming.config.schemas.runtime import (
     DEFAULT_RUNTIME_CONFIG_PATH,
     VALID_LCMV_METHODS,
+    VALID_LCMV_PRESERVE_MODES,
+    VALID_LCMV_TARGET_MODES,
     StreamConfig,
 )
 
@@ -46,6 +48,17 @@ _EXPERIMENT_SAMPLE_RATE_FIELDS = (
 _OPTIONAL_JSON_DEFAULTS: dict[str, Any] = {
     "calibration_correction_mode": "complex_gain",
     "lcmv_test_null_method": "covariance_lcmv_ideal",
+    "lcmv_preserve_constraint_mode": "uniform",
+    "lcmv_target_selection_mode": "strongest_music_peak",
+    "lcmv_realtime_preserve_window_samples": 40,
+    "lcmv_realtime_preserve_min_samples": 20,
+    "lcmv_realtime_preserve_max_circular_std_deg": 15.0,
+    "lcmv_realtime_preserve_max_step_deg": 30.0,
+    "lcmv_realtime_preserve_guard_deg": 20.0,
+    "lcmv_realtime_preserve_max_reference_age_s": 2.0,
+    "lcmv_jammer_activation_min_input_power_jump_db": 3.0,
+    "lcmv_jammer_activation_min_generalized_gain_db": 6.0,
+    "lcmv_weight_transition_s": 1.0,
     "lcmv_candidate_methods_enabled": True,
     "lcmv_covariance_diagonal_loading_rel": 0.001,
     "lcmv_covariance_diagonal_loading_abs": 0.0,
@@ -235,6 +248,24 @@ def _coerce_config_value(key: str, value: Any) -> Any:
                 f"Invalid lcmv_test_null_method {value!r}; allowed values: {allowed}"
             )
         return method
+
+    if key == "lcmv_preserve_constraint_mode":
+        mode = str(value).strip().lower()
+        if mode not in VALID_LCMV_PRESERVE_MODES:
+            allowed = ", ".join(sorted(VALID_LCMV_PRESERVE_MODES))
+            raise ValueError(
+                f"Invalid lcmv_preserve_constraint_mode {value!r}; allowed values: {allowed}"
+            )
+        return mode
+
+    if key == "lcmv_target_selection_mode":
+        mode = str(value).strip().lower()
+        if mode not in VALID_LCMV_TARGET_MODES:
+            allowed = ", ".join(sorted(VALID_LCMV_TARGET_MODES))
+            raise ValueError(
+                f"Invalid lcmv_target_selection_mode {value!r}; allowed values: {allowed}"
+            )
+        return mode
 
     return value
 

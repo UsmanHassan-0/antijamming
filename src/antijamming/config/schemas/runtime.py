@@ -30,8 +30,18 @@ DEFAULT_RUNTIME_CONFIG_PATH = REPO_ROOT / "configs/antijamming/x300_realtime.jso
 VALID_LCMV_METHODS = frozenset(
     {
         "covariance_lcmv_ideal",
-        "measured_dominant_eigenvector",
         "covariance_lcmv_measured_u1",
+    }
+)
+
+VALID_LCMV_PRESERVE_MODES = frozenset(
+    {"uniform", "healthy_reference", "realtime_bladerf_measured_u1"}
+)
+VALID_LCMV_TARGET_MODES = frozenset(
+    {
+        "strongest_music_peak",
+        "expected_jammer_range_peak_or_center",
+        "realtime_non_preserve_peak",
     }
 )
 
@@ -246,6 +256,17 @@ class StreamConfig:
     lcmv_test_max_weight_norm: float
     lcmv_test_condition_number_limit: float
     lcmv_test_null_method: str
+    lcmv_preserve_constraint_mode: str
+    lcmv_target_selection_mode: str
+    lcmv_realtime_preserve_window_samples: int
+    lcmv_realtime_preserve_min_samples: int
+    lcmv_realtime_preserve_max_circular_std_deg: float
+    lcmv_realtime_preserve_max_step_deg: float
+    lcmv_realtime_preserve_guard_deg: float
+    lcmv_realtime_preserve_max_reference_age_s: float
+    lcmv_jammer_activation_min_input_power_jump_db: float
+    lcmv_jammer_activation_min_generalized_gain_db: float
+    lcmv_weight_transition_s: float
     lcmv_candidate_methods_enabled: bool
     lcmv_covariance_diagonal_loading_rel: float
     lcmv_covariance_diagonal_loading_abs: float

@@ -49,22 +49,21 @@ def test_summarize_lcmv_run_parses_small_fake_logs(tmp_path) -> None:
         "active_lcmv_method": "covariance_lcmv_ideal",
         "active_lcmv_null_method": "covariance_lcmv_ideal",
         "candidate_methods_valid": [
-            "measured_dominant_eigenvector",
             "covariance_lcmv_ideal",
+            "covariance_lcmv_measured_u1",
         ],
         "candidate_methods_rejected": {},
         "run_state_label": "jammer_like_event",
-        "candidate_u1_lcmv_available": False,
-        "candidate_measured_u1_valid": False,
-        "candidate_measured_u1_rejected_reason": "desired_loss_db 125.00 exceeds 6.00",
-        "candidate_measured_u1_u1_component_reduction_vs_reference_db": 120.0,
-        "candidate_measured_u1_ideal_component_reduction_vs_reference_db": 5.0,
-        "candidate_measured_u1_total_output_reduction_vs_reference_db": 9.0,
-        "candidate_measured_u1_desired_loss_vs_reference_db": 125.0,
-        "candidate_measured_u1_white_noise_gain_db": 7.2,
-        "candidate_measured_u1_noise_gain_vs_reference_db": 10.0,
-        "candidate_measured_u1_effective_js_improvement_u1_db": -5.0,
-        "candidate_measured_u1_effective_receiver_improvement_u1_db": -15.0,
+        "candidate_covariance_lcmv_measured_u1_valid": False,
+        "candidate_covariance_lcmv_measured_u1_rejected_reason": "desired_loss_db 125.00 exceeds 6.00",
+        "candidate_covariance_lcmv_measured_u1_u1_component_reduction_vs_reference_db": 120.0,
+        "candidate_covariance_lcmv_measured_u1_ideal_component_reduction_vs_reference_db": 5.0,
+        "candidate_covariance_lcmv_measured_u1_total_output_reduction_vs_reference_db": 9.0,
+        "candidate_covariance_lcmv_measured_u1_desired_loss_vs_reference_db": 125.0,
+        "candidate_covariance_lcmv_measured_u1_white_noise_gain_db": 7.2,
+        "candidate_covariance_lcmv_measured_u1_noise_gain_vs_reference_db": 10.0,
+        "candidate_covariance_lcmv_measured_u1_effective_js_improvement_u1_db": -5.0,
+        "candidate_covariance_lcmv_measured_u1_effective_receiver_improvement_u1_db": -15.0,
         "candidate_covariance_lcmv_ideal_valid": True,
         "candidate_covariance_lcmv_ideal_u1_component_reduction_vs_reference_db": 55.0,
         "candidate_covariance_lcmv_ideal_ideal_component_reduction_vs_reference_db": 50.0,
@@ -113,8 +112,8 @@ def test_summarize_lcmv_run_parses_small_fake_logs(tmp_path) -> None:
     assert "R is not jammer-only; u1 is not always jammer" in result.stdout
     assert "candidate_methods_valid distribution" in result.stdout
     assert "candidate_metrics_by_method" in result.stdout
-    assert "best_by_dominant_vector_suppression: measured_dominant_eigenvector" in result.stdout
-    assert "best_by_total_output_reduction: measured_dominant_eigenvector" in result.stdout
+    assert "best_by_dominant_vector_suppression: covariance_lcmv_measured_u1" in result.stdout
+    assert "best_by_total_output_reduction: covariance_lcmv_measured_u1" in result.stdout
     assert "best_by_effective_receiver_improvement: covariance_lcmv_ideal" in result.stdout
     assert "active_method_was_best_by_effective_receiver_improvement: True" in result.stdout
     assert "run_state_label distribution" in result.stdout
