@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from antijamming.dsp.beamforming import apply_beamformer, uniform_weights
+from antijamming.dsp.beamforming import apply_beamformer
 from antijamming.dsp.doa.music import (
-    bartlett_spectrum,
-    music_spectrum,
-    source_count_diagnostics,
+    bartlett_spectrum_from_covariance,
+    covariance_eigendecomposition_from_matrix,
+    music_spectrum_from_eigenvectors,
+    source_count_diagnostics_from_eigenvalues,
+    spatial_covariance,
 )
 from antijamming.dsp.phase.alignment import apply_phase_calibration, phase_offsets_deg
 
@@ -237,12 +239,14 @@ def compute_doa_metrics(
     corrected = np.asarray(corrected_buffer, dtype=np.complex128)
     n_channels = int(corrected.shape[0]) if corrected.ndim >= 1 else 1
     source_count = min(max(int(n_sources), 1), max(n_channels - 1, 1))
-    source_diagnostics = source_count_diagnostics(
-        corrected,
+    covariance = spatial_covariance(corrected)
+    eigenvalues, eigenvectors = covariance_eigendecomposition_from_matrix(covariance)
+    source_diagnostics = source_count_diagnostics_from_eigenvalues(
+        eigenvalues,
         noise_tail_sources=source_count,
     )
-    doa_raw_spectrum = music_spectrum(
-        x=corrected,
+    doa_raw_spectrum = music_spectrum_from_eigenvectors(
+        eigenvectors=eigenvectors,
         rf_freq_hz=center_freq_hz,
         scan_angles_deg=scan_angles_deg,
         array_spacing_m=array_spacing_m,
@@ -252,8 +256,8 @@ def compute_doa_metrics(
     normalized_for_peaks = doa_raw_spectrum / (np.max(doa_raw_spectrum) + 1e-12)
     doa_deg = float(scan_angles_deg[int(np.argmax(doa_raw_spectrum))])
     doa_peaks = _dominant_spectrum_peaks(scan_angles_deg, normalized_for_peaks)
-    bartlett_raw_spectrum = bartlett_spectrum(
-        x=corrected,
+    bartlett_raw_spectrum = bartlett_spectrum_from_covariance(
+        covariance=covariance,
         rf_freq_hz=center_freq_hz,
         scan_angles_deg=scan_angles_deg,
         array_spacing_m=array_spacing_m,
@@ -278,6 +282,8 @@ def compute_doa_metrics(
         "bartlett_deg": bartlett_deg,
         "bartlett_peaks": bartlett_peaks,
         "bartlett_peak_count": len(bartlett_peaks),
+        "covariance_matrix": covariance,
+        "covariance_eigenvectors": eigenvectors,
         **source_diagnostics,
     }
 

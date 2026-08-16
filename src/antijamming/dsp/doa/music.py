@@ -66,7 +66,15 @@ def spatial_covariance(x: np.ndarray) -> np.ndarray:
 def covariance_eigendecomposition(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return covariance eigenvalues/eigenvectors sorted strongest first."""
 
-    r = spatial_covariance(x)
+    return covariance_eigendecomposition_from_matrix(spatial_covariance(x))
+
+
+def covariance_eigendecomposition_from_matrix(
+    covariance: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Diagonalize an already-computed covariance matrix strongest first."""
+
+    r = np.asarray(covariance, dtype=np.complex128)
     if r.size == 0:
         return (
             np.zeros((0,), dtype=np.float64),
@@ -139,9 +147,23 @@ def source_count_diagnostics(
 ) -> dict[str, object]:
     """Estimate live spatial rank before MUSIC selects a noise subspace."""
 
-    x = np.asarray(x, dtype=np.complex128)
     evals, _ = covariance_eigendecomposition(x)
-    evals_safe = np.maximum(evals, 1e-30)
+    return source_count_diagnostics_from_eigenvalues(
+        evals,
+        noise_tail_sources=noise_tail_sources,
+    )
+
+
+def source_count_diagnostics_from_eigenvalues(
+    eigenvalues: np.ndarray,
+    noise_tail_sources: int = 1,
+) -> dict[str, object]:
+    """Estimate spatial rank from a previously computed eigendecomposition."""
+
+    evals_safe = np.maximum(
+        np.asarray(eigenvalues, dtype=np.float64).reshape(-1),
+        1e-30,
+    )
     if evals_safe.size == 0:
         return {
             "covariance_eigenvalues": evals_safe,
@@ -199,7 +221,29 @@ def bartlett_spectrum(
         raise ValueError(
             f"Bartlett steering model expects the fixed 4-channel array, got {n_channels}"
         )
-    r = spatial_covariance(x)
+    return bartlett_spectrum_from_covariance(
+        spatial_covariance(x),
+        rf_freq_hz,
+        scan_angles_deg,
+        array_spacing_m,
+        normalize=normalize,
+    )
+
+
+def bartlett_spectrum_from_covariance(
+    covariance: np.ndarray,
+    rf_freq_hz: float,
+    scan_angles_deg: np.ndarray,
+    array_spacing_m: float,
+    normalize: bool = True,
+) -> np.ndarray:
+    """Evaluate Bartlett using an already-computed channel covariance."""
+
+    r = np.asarray(covariance, dtype=np.complex128)
+    if r.shape != (4, 4):
+        raise ValueError(
+            f"Bartlett steering model expects a 4x4 covariance, got {r.shape}"
+        )
     a = steering_vector(scan_angles_deg, rf_freq_hz, array_spacing_m)
     ra = r @ a
     numerator = np.real(np.sum(a.conj() * ra, axis=0))
@@ -224,10 +268,36 @@ def music_spectrum(
         raise ValueError(
             f"MUSIC steering model expects the fixed 4-channel array, got {n_channels}"
         )
-    n_sources = min(max(int(n_sources), 1), max(n_channels - 1, 1))
     # x is shaped [channels, samples]. The covariance is intentionally estimated
     # from the current processing chunk so the GUI reflects live array state.
     _, evecs = covariance_eigendecomposition(x)
+    return music_spectrum_from_eigenvectors(
+        evecs,
+        rf_freq_hz,
+        scan_angles_deg,
+        array_spacing_m,
+        n_sources=n_sources,
+        normalize=normalize,
+    )
+
+
+def music_spectrum_from_eigenvectors(
+    eigenvectors: np.ndarray,
+    rf_freq_hz: float,
+    scan_angles_deg: np.ndarray,
+    array_spacing_m: float,
+    n_sources: int = 1,
+    normalize: bool = True,
+) -> np.ndarray:
+    """Evaluate MUSIC using previously computed covariance eigenvectors."""
+
+    evecs = np.asarray(eigenvectors, dtype=np.complex128)
+    if evecs.shape != (4, 4):
+        raise ValueError(
+            f"MUSIC steering model expects 4x4 eigenvectors, got {evecs.shape}"
+        )
+    n_channels = int(evecs.shape[0])
+    n_sources = min(max(int(n_sources), 1), max(n_channels - 1, 1))
     # The largest eigenvectors are treated as the signal subspace; the remaining
     # vectors form the noise subspace used by the MUSIC denominator.
     n_noise = max(n_channels - n_sources, 1)

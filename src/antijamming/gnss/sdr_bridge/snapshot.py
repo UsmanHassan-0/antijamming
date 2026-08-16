@@ -388,10 +388,3 @@ class SnapshotMixin:
             return int(path.stat().st_size)
         except OSError:
             return 0
-
-    @staticmethod
-    def _file_age_s(path: Path) -> float | None:
-        try:
-            return max(0.0, time.time() - path.stat().st_mtime)
-        except OSError:
-            return None

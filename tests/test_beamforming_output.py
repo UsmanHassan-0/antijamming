@@ -210,23 +210,6 @@ def test_lcmv_test_combiner_outputs_complex64_single_stream() -> None:
     assert np.all(np.isfinite(y))
 
 
-def test_received_iq_power_uses_channel_sample_power() -> None:
-    cfg = StreamConfig()
-    runtime = BackendRuntime(cfg, _build_loggers())
-    x = np.array(
-        [
-            [1 + 0j, 2 + 0j],
-            [0 + 3j, 0 + 4j],
-        ],
-        dtype=np.complex128,
-    )
-
-    power_db = runtime._received_iq_power_db(x)
-    expected_power_db = 10.0 * np.log10(np.mean(np.abs(x) ** 2))
-
-    assert np.isclose(power_db, expected_power_db)
-
-
 def test_rx_signal_health_does_not_flag_quiet_iq_as_near_full_scale() -> None:
     x = np.array(
         [

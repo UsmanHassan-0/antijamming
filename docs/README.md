@@ -8,3 +8,4 @@ Project documentation lives in this directory.
 - `architecture_refactor_notes.md` - architecture/refactoring working notes
 - `07_one_run_test_method.md` - implemented one-run state/reference method
 - `15_self_run_live_evidence.md` - exact independent live-test markers, retained evidence, and audit commands
+- `16_shared_u1_optimization_provenance.md` - source-to-PVT provenance, removed duplication, benchmarks, and verification for the shared measured-U1 fanout

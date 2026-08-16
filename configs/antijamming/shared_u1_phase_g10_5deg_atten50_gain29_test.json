@@ -1,0 +1,19 @@
+{
+  "_description": "G10-rising validation of the shared measured-U1 covariance-LCMV stream with per-PRN pre-jammer complex-response continuity; no independent per-PRN LCMV solver.",
+  "gnss_shared_u1_phase_compensation_enabled": true,
+  "gnss_shared_u1_phase_satellites": [5, 10, 13, 15, 16, 18, 23, 25, 26, 29],
+  "gnss_shared_u1_phase_transition_s": 1.0,
+  "gnss_shared_u1_phase_min_quality_measurements": 3,
+  "gnss_1c_channel_count": 10,
+  "gnss_channels_in_acquisition": 10,
+  "gnss_pvt_elevation_mask_deg": 5.0,
+  "lcmv_test_enabled": false,
+  "lcmv_test_null_method": "covariance_lcmv_ideal",
+  "experiment": {
+    "name": "g10_rise_shared_measured_u1_phase_continuity_atten50_gain29",
+    "usrp_rx_gain_db": 45.0,
+    "calibration_file_expected_gain_db": 45.0,
+    "bladeRF_tx_gain_db": 29.0,
+    "jammer_attenuation_db": 50.0
+  }
+}

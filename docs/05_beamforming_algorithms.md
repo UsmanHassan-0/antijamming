@@ -32,7 +32,26 @@ The current product config uses `lcmv_test_null_method: "covariance_lcmv_ideal"`
 
 Enabling LCMV first arms the runtime while the FIFO remains on uniform weights. Angular movement alone cannot activate covariance weights. Activation requires both an input-power rise and a generalized covariance-mode rise against the exact frozen arm-time baseline. Detection then latches until LCMV is disabled, so a long jammer interval cannot silently return the system to unprotected uniform weights.
 
-The product applies target weights with a one-second complex linear chunk ramp. The uniform and LCMV endpoints have the same complex response to the frozen measured bladeRF U1, so every interpolated weight has that same response. Repeated covariance updates do not restart an active ramp; the current ramp finishes before a later target can be scheduled. This avoids holding the applied weights indefinitely near the uniform starting point.
+The ordinary one-stream product path applies target weights with a one-second
+complex linear chunk ramp. The uniform and LCMV endpoints have the same complex
+response to the frozen measured bladeRF U1, so every interpolated weight has
+that same response. Repeated covariance updates do not restart an active ramp;
+the current ramp finishes before a later target can be scheduled.
+
+The optional shared measured-U1 GNSS fanout is deliberately different. It
+publishes every newly accepted measured-U1 covariance solution immediately so
+the spatial null can follow the live covariance. Before applying that row to a
+PRN, it multiplies the row by the exact complex scalar that keeps that PRN's
+previous response unchanged. Jammer-off recovery to the common/uniform row is
+the configured one-second ramp, and its two endpoints have the same complex
+response, so every intermediate chunk has the same response too. The fanout is
+one shared spatial beam followed by PRN-specific complex scalars; it contains
+no per-PRN covariance or LCMV solver.
+
+When this fanout is enabled, the GNSS FIFO protection row comes from the
+accepted `covariance_lcmv_measured_u1` candidate even if the ordinary active
+method displayed in the GUI is `covariance_lcmv_ideal`. The status log therefore
+records the FIFO path independently from the ordinary active-method label.
 
 There is no desired-loss guard or desired-loss configuration threshold in the
 product path. The frozen measured bladeRF U1 is an explicit equality

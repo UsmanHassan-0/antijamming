@@ -228,6 +228,9 @@ class ConfigRendererMixin:
             )
         rows = [
             f"GNSS-SDR.num_sources={len(satellites)}",
+            # GNSS-SDR normally derives its observables clock from conditioner
+            # zero only. Per-PRN FIFOs are independent scheduler branches, so
+            # that clock must consume every branch in lockstep.
             "GNSS-SDR.synchronize_signal_sources=true",
         ]
         for idx, (prn, path) in enumerate(zip(satellites, self._fifo_paths)):

@@ -1893,7 +1893,6 @@ def test_receiver_projection_clears_stable_prn_during_tracking_monitor_gap(qtbot
     assert window._current_used_in_pvt_prns == []
     assert window._skyplot_monitor._plotted_prns == []
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 1 (G09)"
-    assert window._prn_display_hold == {}
     window._on_data_ready(transient_gap_snapshot)
 
     assert window._prn_monitor._displayed_prns == []
@@ -1945,7 +1944,6 @@ def test_receiver_projection_does_not_hold_tracked_placeholder(qtbot) -> None:
 
     window._on_data_ready(locked_snapshot)
     assert window._prn_monitor._displayed_prns == [9]
-    assert window._prn_display_hold == {}
 
     window._on_data_ready(transient_gap_snapshot)
 

@@ -187,9 +187,6 @@ class OutputMonitorMixin:
             sys.stdout.write(text + output_delimiter)
             sys.stdout.flush()
 
-    def _should_echo_stdout_line(self, text: str) -> bool:
-        return not self._should_route_to_receiver_log(text)
-
     def _should_route_to_receiver_log(self, text: str) -> bool:
         if _GLOG_LINE_RE.search(text) is not None:
             return True

@@ -942,11 +942,10 @@ def print_diagnostic_coverage(
             logs / "lcmv_pattern_absolute.jsonl",
             "lcmv_model_response_absolute",
         ),
-        "spatial_vector_diagnostics_analysis": contains_text(
-            logs / "analysis.log",
+        "spatial_vector_diagnostics_jsonl": contains_text(
+            logs / "spatial_vector_diagnostics.jsonl",
             '"event":"spatial_vector_diagnostics"',
         ),
-        "spatial_vector_diagnostics_jsonl": bool(spatial_events),
         "fifo_output_power_linear": contains_text(
             logs / "gnss_handoff.log",
             "fifo_output_power_linear",

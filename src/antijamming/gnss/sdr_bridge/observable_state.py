@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from .models import (
     _SatKey,
-    _sat_constellation,
     _sat_label,
-    _sat_prn,
     _sat_public_fields,
 )
 
@@ -18,22 +16,6 @@ class ObservableStateMixin:
         except (TypeError, ValueError):
             return None
         return number if number > 0 else None
-
-    def _sat_key_for_observable_prn_locked(self, prn: int) -> _SatKey | None:
-        candidates = [
-            sat_key
-            for sat_key, entry in self._prn_states.items()
-            if _sat_prn(sat_key) == prn
-            and str(entry.get("state", "")).lower() in {"tracking", "acquired", "assigned"}
-        ]
-        if len(candidates) == 1:
-            return candidates[0]
-        gps_candidates = [sat_key for sat_key in candidates if _sat_constellation(sat_key) == "gps"]
-        if len(gps_candidates) == 1:
-            return gps_candidates[0]
-        if candidates:
-            return None
-        return prn
 
     def _observable_prn_fields(self, observable: dict[str, object]) -> dict[str, object]:
         return self._prefixed_synchro_fields(

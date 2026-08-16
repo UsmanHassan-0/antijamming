@@ -12,14 +12,6 @@ from antijamming.gnss.constellations import (
     satellite_sort_key as constellation_sort_key,
 )
 
-_PRN_DISPLAY_HOLD_S = 8.0
-_PRN_DISPLAY_HOLD_REASONS = {
-    "missing_cno",
-    "too_few_samples",
-    "awaiting_nav",
-}
-
-
 @dataclass(frozen=True)
 class ReceiverViewState:
     """Coherent operator projection derived from one GNSS bridge snapshot."""
@@ -43,17 +35,9 @@ class ReceiverViewState:
 class ReceiverProjection:
     """Project GNSS bridge snapshots into operator-facing receiver state."""
 
-    def __init__(self) -> None:
-        self.display_hold: dict[str, tuple[dict[str, object], float]] = {}
-
-    def clear_display_hold(self) -> None:
-        self.display_hold.clear()
-
     def build_view_state(
         self,
         gnss_snapshot: dict[str, object],
-        *,
-        now: float,
     ) -> ReceiverViewState:
         prns = gnss_snapshot.get("prns", [])
         sky_prns = gnss_snapshot.get("sky_prns", [])
@@ -95,9 +79,8 @@ class ReceiverProjection:
                 if sat_id != "--"
             )
 
-        # Count the receiver's current tracking state before applying the
-        # display hold.  The hold is intentionally presentation-only and must
-        # not turn a previously tracked satellite into a current one.
+        # Count only the receiver's current tracking state. Never turn a
+        # previously tracked satellite into a current one.
         current_tracking_satellite_ids = {
             sat_id
             for entry in prn_entries
@@ -121,7 +104,6 @@ class ReceiverProjection:
         # colour, but must not delay the first honest C/N0 bar.  Never carry a
         # prior value through a missing sample: that produced labelled PRNs
         # with a "--" bar and made a lost or pending channel look current.
-        self.display_hold.clear()
         stable_prns = sorted(
             {
                 prn
@@ -209,75 +191,6 @@ class ReceiverProjection:
             pvt_current=pvt_current,
             used_for_pvt_count=used_for_pvt_count,
         )
-
-    def _apply_prn_display_hold(
-        self,
-        prn_entries: list[dict[str, object]],
-        pvt_current: bool,
-        raw_used_in_fix_satellites: set[str],
-        *,
-        now: float,
-    ) -> list[dict[str, object]]:
-        if not pvt_current:
-            self.display_hold.clear()
-            return prn_entries
-
-        entries_by_satellite = {
-            sat_id: dict(entry)
-            for entry in prn_entries
-            for sat_id in [satellite_id(entry)]
-            if sat_id != "--"
-        }
-        displayed_by_satellite = dict(entries_by_satellite)
-        expired: list[str] = []
-
-        for sat_id, entry in entries_by_satellite.items():
-            state = str(entry.get("state", "")).lower()
-            if state != "tracking":
-                self.display_hold.pop(sat_id, None)
-                continue
-            if is_stable_tracking_entry(entry):
-                self.display_hold[sat_id] = (dict(entry), now)
-                continue
-
-            held = self.display_hold.get(sat_id)
-            if held is None:
-                continue
-            held_entry, held_at = held
-            pvt_used = sat_id in raw_used_in_fix_satellites
-            if not pvt_used and (now - held_at) > _PRN_DISPLAY_HOLD_S:
-                expired.append(sat_id)
-                continue
-            reason = str(entry.get("cno_unstable_reason", ""))
-            if pvt_used or reason in _PRN_DISPLAY_HOLD_REASONS:
-                merged = dict(held_entry)
-                merged["used_in_fix"] = pvt_used or bool(
-                    entry.get("used_in_fix", held_entry.get("used_in_fix", False))
-                )
-                merged["display_hold_active"] = True
-                merged["display_hold_reason"] = reason
-                displayed_by_satellite[sat_id] = merged
-
-        for sat_id, (held_entry, held_at) in list(self.display_hold.items()):
-            pvt_used = sat_id in raw_used_in_fix_satellites
-            if not pvt_used and (now - held_at) > _PRN_DISPLAY_HOLD_S:
-                expired.append(sat_id)
-                continue
-            if sat_id not in displayed_by_satellite:
-                merged = dict(held_entry)
-                merged["display_hold_active"] = True
-                merged["display_hold_reason"] = "missing_snapshot_entry"
-                merged["used_in_fix"] = pvt_used or bool(held_entry.get("used_in_fix", False))
-                displayed_by_satellite[sat_id] = merged
-
-        for sat_id in expired:
-            self.display_hold.pop(sat_id, None)
-
-        return [
-            displayed_by_satellite[sat_id]
-            for sat_id in sorted(displayed_by_satellite, key=satellite_sort_key)
-        ]
-
 
 def prn_monitor_entries(prns: list[object]) -> list[dict[str, object]]:
     entries: dict[str, dict[str, object]] = {}

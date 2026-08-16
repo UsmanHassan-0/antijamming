@@ -1373,6 +1373,11 @@ def test_bridge_archives_tracking_carrier_code_iq_and_cycle_slip(tmp_path: Path)
     assert record["code_phase_samples"] == pytest.approx(12.0)
     assert record["code_phase_seconds"] == pytest.approx(12.0 / record["fs"])
     assert record["tracking_sample_counter"] == 123456
+    assert record["valid_acquisition"] is False
+    assert record["valid_symbol_output"] is True
+    assert record["valid_word"] is False
+    assert record["valid_pseudorange"] is False
+    assert record["pll_180_deg_phase_locked"] is True
     assert record["cycle_slip"] is True
     assert bridge.snapshot()["tracking_state_archive_rows"] == 1
 
@@ -1812,7 +1817,7 @@ def test_bridge_reads_observables_monitor_udp_into_snapshot_and_prn_fields(tmp_p
     assert prn["observable_cno_db_hz"] == pytest.approx(43.25)
 
 
-def test_bridge_builds_pvt_accuracy_summary_from_truth_and_dops(tmp_path: Path) -> None:
+def test_bridge_builds_pvt_accuracy_snapshot_from_truth_and_dops(tmp_path: Path) -> None:
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_truth_static_lat_deg=33.6844,
@@ -1834,8 +1839,6 @@ def test_bridge_builds_pvt_accuracy_summary_from_truth_and_dops(tmp_path: Path) 
             }
         ]
     )
-    summary = bridge._format_accuracy_summary(accuracy)
-
     assert accuracy["fix_type"] == "3D Fix"
     assert accuracy["truth_available"] is True
     assert accuracy["utm_easting_m"] == pytest.approx(319050.1875)
@@ -1847,13 +1850,6 @@ def test_bridge_builds_pvt_accuracy_summary_from_truth_and_dops(tmp_path: Path) 
     assert "local_up_m" not in accuracy
     assert "horizontal_error_m" in accuracy
     assert "three_d_uncertainty_1sigma_m" not in accuracy
-    assert "PVT accuracy: fix=3D Fix fixes=1" in summary
-    assert "position=lat 33.6844050, lon 73.0478990, alt 538.00 m" in summary
-    assert "utm=43N east 319050.188, north 3728874.354" in summary
-    assert "epoch_error=H" in summary
-    assert "cumulative_error(1 fixes)=H" in summary
-    assert "DOP_uncertainty" not in summary
-    assert "DOP=HDOP 2.50, VDOP 4.00, PDOP 4.70, GDOP 5.10" in summary
 
 
 def test_bridge_reports_empirical_cep_only_after_accuracy_window_is_full(
@@ -1884,7 +1880,6 @@ def test_bridge_reports_empirical_cep_only_after_accuracy_window_is_full(
     assert warming["cep_scope"] == "run_cumulative"
     assert "cep50_m" not in warming
     assert "cep95_m" not in warming
-    assert "CEP=warming 3/4 fixes" in bridge._format_accuracy_summary(warming)
 
     ready = bridge._build_accuracy_snapshot(
         [point(3.0), point(1.0), point(100.0), point(2.0)]
@@ -1893,9 +1888,6 @@ def test_bridge_reports_empirical_cep_only_after_accuracy_window_is_full(
     assert ready["cep_sample_count"] == 4
     assert ready["cep50_m"] == pytest.approx(2.0)
     assert ready["cep95_m"] == pytest.approx(100.0)
-    assert "CEP(4 fixes)=50% 2.00 m, 95% 100.00 m" in bridge._format_accuracy_summary(
-        ready
-    )
 
     # A fifth fix must be included instead of retaining only the configured
     # four-point warm-up count. With all five radii the median is 3 m; a

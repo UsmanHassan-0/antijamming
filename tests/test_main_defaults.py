@@ -545,3 +545,37 @@ def test_runtime_config_applies_opt_in_partial_overlay(
     assert cfg.phase_calibration_file is not None
     assert cfg.phase_calibration_file.is_absolute()
     assert cfg.phase_correction_vector is not None
+
+
+def test_shared_u1_g10_lab_overlay_builds_complete_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overlay = (
+        REPO_ROOT
+        / "configs/antijamming/shared_u1_phase_g10_5deg_atten50_gain29_test.json"
+    )
+    monkeypatch.setenv("ANTIJAM_RUNTIME_OVERLAY", str(overlay))
+
+    cfg = build_runtime_config()
+
+    assert cfg.gnss_shared_u1_phase_compensation_enabled is True
+    assert cfg.gnss_shared_u1_phase_satellites == (
+        5,
+        10,
+        13,
+        15,
+        16,
+        18,
+        23,
+        25,
+        26,
+        29,
+    )
+    assert cfg.gnss_1c_channel_count == 10
+    assert cfg.gnss_channels_in_acquisition == 10
+    assert cfg.gnss_pvt_elevation_mask_deg == 5.0
+    assert cfg.gain_db == 45.0
+    assert cfg.experiment["bladeRF_tx_gain_db"] == 29.0
+    assert cfg.experiment["jammer_attenuation_db"] == 50.0
+    assert cfg.sample_rate == 4_000_000.0
+    assert cfg.center_freq_hz == 1_575_420_000.0

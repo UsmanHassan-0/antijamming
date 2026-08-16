@@ -1,8 +1,8 @@
 # Diagnostics And Metrics
 
-The backend writes candidate diagnostics into `spatial_vector_diagnostics.jsonl` and `analysis.log`. Full LCMV JSON diagnostics are throttled by `lcmv_heavy_diagnostics_interval_s`; concise LCMV status can still update more often. `tools/summarize_lcmv_run.py` summarizes them.
+The backend writes candidate diagnostics once into `spatial_vector_diagnostics.jsonl`. Full LCMV response JSON is written once into `lcmv_pattern_absolute.jsonl`; both are throttled by `lcmv_heavy_diagnostics_interval_s`, while concise LCMV status can still update more often. `analysis.log` retains the full-angle MUSIC/Bartlett snapshots without duplicating those dedicated records. `tools/summarize_lcmv_run.py` reads both current dedicated files and legacy duplicated runs.
 
-Only `covariance_lcmv_ideal` and `covariance_lcmv_measured_u1` are live candidates. Both call the same full-covariance LCMV solver. The first is the configured product method; the measured-u1 method is diagnostic/optional unless explicitly selected.
+Only `covariance_lcmv_ideal` and `covariance_lcmv_measured_u1` are live candidates. Both call the same full-covariance LCMV solver. The first is the configured ordinary product method. The measured-u1 method is diagnostic/optional in the ordinary one-stream path, but its accepted row is deliberately used by the optional shared measured-U1 phase-continuous GNSS fanout.
 
 Important metrics:
 

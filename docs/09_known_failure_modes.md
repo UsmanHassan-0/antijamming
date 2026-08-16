@@ -5,7 +5,7 @@
 - SOI included in covariance: full covariance LCMV can suppress useful signal if the desired constraint is wrong or missing.
 - Ideal desired steering does not equal the OTA bladeRF vector: observed live on 2026-08-07 as a 7-9 dB C/N0 loss with jammer off even though the ideal preserve residual was approximately zero. The product now freezes measured bladeRF U1 instead.
 - False activation from angle motion: angle jumps and covariance-vector changes can occur without the jammer. The product gate therefore requires a positive input-power rise plus generalized covariance gain; angle alone is forbidden.
-- Abrupt or continually changing weights: one-chunk changes can disturb GNSS carrier/code tracking. Product weights now use a logged one-second complex ramp.
+- Abrupt or continually changing weights: one-chunk changes can disturb GNSS carrier/code tracking. The ordinary one-stream path uses a logged one-second complex ramp. The shared measured-U1 fanout instead permits an immediate spatial update only after applying an exact per-PRN complex-response continuity scalar; jammer-off recovery remains a ramp.
 - Noise gain due to large weights: high `||w||^2` can make the receiver noisier even if a null looks deep.
 - Total output reduction misleading: total output includes desired, jammer, sky GNSS, noise, multipath, and artifacts.
 - Stale RF metadata: J/S conclusions are only as good as the logged RF budget and attenuation basis.

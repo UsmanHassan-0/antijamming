@@ -78,6 +78,53 @@ def phase_invariant_coherence(a: np.ndarray, b: np.ndarray) -> float:
     )
 
 
+def apply_shared_phase_fanout(
+    raw_channels: np.ndarray,
+    logical_rows: np.ndarray,
+    phase_correction: np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    """Apply shared spatial rows, using one beamformer when rows are collinear.
+
+    The GNSS convention is ``y = (conj(w) * correction) @ x``.  If every row
+    is ``gamma_i * w_shared``, then every output is exactly
+    ``conj(gamma_i) * y_shared``.  During a non-collinear recovery transition
+    the function automatically uses the general matrix product.
+    """
+
+    source = np.asarray(raw_channels, dtype=np.complex64)
+    rows = np.asarray(logical_rows, dtype=np.complex128)
+    correction = np.asarray(phase_correction, dtype=np.complex64).reshape(-1)
+    if source.ndim != 2 or rows.ndim != 2:
+        raise ValueError("shared phase fanout expects 2-D rows and raw channels")
+    if source.shape[0] != rows.shape[1] or correction.size != source.shape[0]:
+        raise ValueError("shared phase fanout channel dimensions do not match")
+    if rows.shape[0] == 0 or source.shape[1] == 0:
+        return np.zeros((rows.shape[0], source.shape[1]), dtype=np.complex64), True
+
+    base = rows[0]
+    base_power = float(np.vdot(base, base).real)
+    if base_power > np.finfo(np.float64).tiny:
+        scales = np.asarray(rows @ np.conj(base) / base_power, dtype=np.complex128)
+        reconstructed = scales[:, None] * base[None, :]
+        if np.allclose(rows, reconstructed, rtol=1e-7, atol=1e-9):
+            effective_base = np.asarray(
+                np.conj(base) * correction,
+                dtype=np.complex64,
+            )
+            shared_output = np.asarray(
+                effective_base @ source,
+                dtype=np.complex64,
+            )
+            outputs = np.conj(scales).astype(np.complex64)[:, None] * shared_output
+            return np.ascontiguousarray(outputs, dtype=np.complex64), True
+
+    effective = np.asarray(
+        np.conj(rows) * correction[None, :],
+        dtype=np.complex64,
+    )
+    return np.ascontiguousarray(effective @ source, dtype=np.complex64), False
+
+
 def _align_common_phase(vector: np.ndarray) -> np.ndarray:
     values = np.asarray(vector, dtype=np.complex128).reshape(-1)
     if values.size == 0:
@@ -170,6 +217,7 @@ class SharedU1PhaseCompensationBank:
         self._states: dict[str, _PhaseState] = {}
         self._enabled_previous = False
         self._activation_monotonic: float | None = None
+        self._last_shared_protection: np.ndarray | None = None
 
     @staticmethod
     def _valid_vector(value: object, size: int) -> np.ndarray | None:
@@ -292,6 +340,7 @@ class SharedU1PhaseCompensationBank:
         enabled_now: bool,
         now_monotonic: float | None = None,
         max_vector_age_s: float = 2.5,
+        emit_status: bool = True,
     ) -> tuple[np.ndarray, dict[str, object]]:
         common = np.asarray(shared_common_weights, dtype=np.complex128).reshape(-1)
         protection = np.asarray(
@@ -308,10 +357,27 @@ class SharedU1PhaseCompensationBank:
         elif falling:
             self._activation_monotonic = None
         self._enabled_previous = enabled
+        protection_changed = bool(
+            shared_measured_u1_available
+            and (
+                self._last_shared_protection is None
+                or not np.allclose(
+                    self._last_shared_protection,
+                    protection,
+                    rtol=1e-7,
+                    atol=1e-9,
+                )
+            )
+        )
+        if protection_changed:
+            self._last_shared_protection = np.array(protection, copy=True)
 
-        rows: list[np.ndarray] = []
+        rows = np.empty(
+            (len(self._satellites), self._channel_count),
+            dtype=np.complex128,
+        )
         status: dict[str, object] = {}
-        for prn in self._satellites:
+        for row_index, prn in enumerate(self._satellites):
             satellite = f"G{prn:02d}"
             state = self._states.get(satellite)
             if state is None:
@@ -373,10 +439,17 @@ class SharedU1PhaseCompensationBank:
                     state.desired = self._align_to_reference(aligned, None)
                     post_onset_adopted = True
 
-            protection_already_applied = state.source.startswith(
-                "phase_compensated_shared_measured_u1"
+            protection_needs_update = bool(
+                shared_measured_u1_available
+                and state.desired is not None
+                and (
+                    not state.source.startswith(
+                        "phase_compensated_shared_measured_u1"
+                    )
+                    or protection_changed
+                )
             )
-            if rising and shared_measured_u1_available:
+            if rising and protection_needs_update:
                 self._start_transition(
                     state,
                     requested=protection,
@@ -385,9 +458,7 @@ class SharedU1PhaseCompensationBank:
                 )
             elif (
                 enabled
-                and shared_measured_u1_available
-                and state.desired is not None
-                and not protection_already_applied
+                and protection_needs_update
             ):
                 # The jammer latch and covariance worker are concurrent. If
                 # the latch reaches this thread one chunk before measured-U1
@@ -423,7 +494,9 @@ class SharedU1PhaseCompensationBank:
                 state.completed_chunks = 0
 
             self._advance_transition(state)
-            rows.append(np.array(state.current, copy=True))
+            rows[row_index] = state.current
+            if not emit_status:
+                continue
             response = (
                 complex(np.vdot(state.current, state.desired))
                 if state.desired is not None
@@ -449,6 +522,9 @@ class SharedU1PhaseCompensationBank:
                 "post_onset_desired_step_deg": desired_step_deg,
                 "phase_compensation_applied": state.source.startswith(
                     "phase_compensated_"
+                ),
+                "shared_protection_bridge_applied": state.source.startswith(
+                    "phase_compensated_shared_measured_u1"
                 ),
                 "phase_compensation_guard_reason": state.guard_reason,
                 "weight_phase_correction_deg": float(np.degrees(np.angle(state.scale))),
@@ -479,7 +555,7 @@ class SharedU1PhaseCompensationBank:
                     else None
                 ),
             }
-        return np.vstack(rows), status
+        return rows, status
 
 
 class SharedU1DesiredVectorMonitor:
@@ -881,6 +957,7 @@ class SharedU1DesiredVectorMonitor:
 
 
 __all__ = [
+    "apply_shared_phase_fanout",
     "SharedU1DesiredVectorMonitor",
     "SharedU1PhaseCompensationBank",
     "gps_l1_ca_code",

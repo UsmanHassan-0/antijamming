@@ -19,6 +19,7 @@ from antijamming.gnss import (
     GnssSdrBridge,
     SharedU1DesiredVectorMonitor,
     SharedU1PhaseCompensationBank,
+    apply_shared_phase_fanout,
 )
 from antijamming.gnss.sdr_bridge.constants import (
     PVT_DEGRADED_PDOP_THRESHOLD,
@@ -58,7 +59,7 @@ from antijamming.dsp.diagnostics import (
     spatial_vector_coherence_metrics,
 )
 from antijamming.dsp.doa import (
-    covariance_eigendecomposition,
+    covariance_eigendecomposition_from_matrix,
     music_spectrum,
     spatial_covariance,
     steering_vector,
@@ -66,7 +67,6 @@ from antijamming.dsp.doa import (
 from antijamming.dsp.models import (
     internal_angle_to_operator_bearing_deg,
     operator_bearing_to_internal_angle_deg,
-    operator_bearing_axis_for_internal_scan,
 )
 from antijamming.dsp.pipeline import (
     compute_doa_metrics,
@@ -74,6 +74,48 @@ from antijamming.dsp.pipeline import (
     compute_phase_metrics,
 )
 from antijamming.rf import compute_rf_budget, manifest_from_config
+
+_RUNTIME_POWER_AGGREGATE_KEYS = frozenset(
+    {
+        "raw_channel_powers_linear",
+        "raw_channel_powers_db",
+        "raw_avg_channel_power_linear",
+        "raw_sum_channel_power_linear",
+        "raw_power_spread_db",
+        "cal_channel_powers_linear",
+        "cal_channel_powers_db",
+        "cal_avg_channel_power_linear",
+        "cal_sum_channel_power_linear",
+        "cal_power_spread_db",
+        "measured_output_reduction_vs_uniform_db",
+        "measured_output_reduction_vs_raw_avg_channel_db",
+        "measured_output_reduction_vs_raw_sum_channels_db",
+        "fifo_output_source",
+        "fifo_matches_lcmv_output",
+        "fifo_matches_uniform_output",
+    }
+)
+_RUNTIME_POWER_SCALAR_KEYS = frozenset(
+    f"{prefix}{suffix}"
+    for prefix in (
+        *(f"raw_ch{index}" for index in range(4)),
+        *(f"cal_ch{index}" for index in range(4)),
+        "uniform_output",
+        "lcmv_output",
+        "fifo_output",
+    )
+    for suffix in (
+        "_power_linear",
+        "_rms_complex",
+        "_peak_component",
+        "_near_full_scale_pct",
+        "_mean_i",
+        "_mean_q",
+        "_i_to_q_power_imbalance_db",
+        "_iq_correlation_coefficient",
+        "_noncircularity_abs",
+    )
+)
 
 # =============================================================================
 # Threaded Backend Runtime
@@ -160,7 +202,10 @@ class BackendRuntime:
         self._shared_u1_phase_monitor: SharedU1DesiredVectorMonitor | None = None
         self._shared_u1_phase_bank: SharedU1PhaseCompensationBank | None = None
         self._last_shared_u1_phase_status_log_ts = 0.0
-        self._gnss_fifo_samples_written = 0
+        self._shared_u1_desired_vectors_cache: dict[str, dict[str, object]] = {}
+        self._shared_u1_scalar_fanout_chunks = 0
+        self._shared_u1_matrix_fallback_chunks = 0
+        self._gnss_fifo_samples_written: int = 0
         self._gnss_raw_drops: int = 0
         self._gnss_raw_q_highwater: int = 0
         self._gnss_raw_q_interval_highwater: int = 0
@@ -497,32 +542,45 @@ class BackendRuntime:
                 self._gnss_raw_q_interval_highwater = 0
                 self._gnss_raw_q_marks_logged.clear()
                 self._gnss_fifo_samples_written = 0
-                shared_phase_enabled = bool(
-                    getattr(
-                        self._config,
-                        "gnss_shared_u1_phase_compensation_enabled",
-                        False,
-                    )
+                shared_phase_fanout = self._shared_phase_fanout_enabled()
+                satellites = tuple(
+                    int(value)
+                    for value in self._config.gnss_shared_u1_phase_satellites
                 )
-                if shared_phase_enabled:
-                    if self._log_session is None:
-                        raise RuntimeError(
-                            "shared-U1 phase compensation requires an active log session"
-                        )
-                    satellites = tuple(
-                        int(value)
-                        for value in self._config.gnss_shared_u1_phase_satellites
-                    )
+                shared_phase_transition_s = float(
+                    self._config.gnss_shared_u1_phase_transition_s
+                )
+                if shared_phase_fanout:
                     self._shared_u1_phase_bank = SharedU1PhaseCompensationBank(
                         satellites=satellites,
                         channel_count=len(self._config.channels),
                         sample_rate_hz=float(self._config.sample_rate),
                         samples_per_chunk=int(self._config.samples_per_chunk),
-                        transition_s=float(
-                            self._config.gnss_shared_u1_phase_transition_s
-                        ),
+                        transition_s=shared_phase_transition_s,
                         max_weight_norm=self._lcmv_weight_norm_limit(),
                     )
+                    self._handoff_log.info(
+                        "Shared measured-U1 phase fanout enabled: satellites=%s "
+                        "sources=%d transition_s=%.3f min_suppression_db=%.1f "
+                        "independent_per_prn_lcmv=false",
+                        ",".join(f"G{value:02d}" for value in satellites),
+                        len(satellites),
+                        shared_phase_transition_s,
+                        float(
+                            self._config.lcmv_min_predicted_jammer_suppression_db
+                        ),
+                    )
+                else:
+                    self._shared_u1_phase_bank = None
+                self._last_shared_u1_phase_status_log_ts = 0.0
+                self._shared_u1_desired_vectors_cache = {}
+                self._shared_u1_scalar_fanout_chunks = 0
+                self._shared_u1_matrix_fallback_chunks = 0
+                if shared_phase_fanout:
+                    if self._log_session is None:
+                        raise RuntimeError(
+                            "shared-U1 phase monitoring requires an active log session"
+                        )
                     self._shared_u1_phase_monitor = SharedU1DesiredVectorMonitor(
                         sample_rate_hz=float(self._config.sample_rate),
                         channel_count=len(self._config.channels),
@@ -531,22 +589,14 @@ class BackendRuntime:
                         session_dir=self._log_session.session_dir,
                         session_id=self._log_session.session_id,
                         logger=self._handoff_log,
-                        satellites=satellites,
                         min_quality_measurements=int(
                             self._config.gnss_shared_u1_phase_min_quality_measurements
                         ),
+                        satellites=satellites,
                     )
                     self._shared_u1_phase_monitor.start()
-                    self._handoff_log.info(
-                        "Shared measured-U1 phase compensation enabled: "
-                        "satellites=%s sources=%d independent_per_prn_lcmv=false",
-                        ",".join(f"G{value:02d}" for value in satellites),
-                        len(satellites),
-                    )
                 else:
-                    self._shared_u1_phase_bank = None
                     self._shared_u1_phase_monitor = None
-                self._last_shared_u1_phase_status_log_ts = 0.0
                 self._gnss_handoff_thread = threading.Thread(
                     target=self._gnss_beamform_loop,
                     name="gnss_ordered_handoff",
@@ -649,6 +699,7 @@ class BackendRuntime:
                 self._shared_u1_phase_monitor.stop()
                 self._shared_u1_phase_monitor = None
             self._shared_u1_phase_bank = None
+            self._shared_u1_desired_vectors_cache = {}
             if self._config.gnss_sdr_enable:
                 self._loggers["transport"].info(
                     "GNSS queue summary: raw_highwater=%d/%d raw_rejections=%d",
@@ -1255,19 +1306,6 @@ class BackendRuntime:
             "active_lcmv_method": lcmv.get("active_lcmv_method"),
             "active_lcmv_weights_source": lcmv.get("active_lcmv_weights_source"),
             "lcmv_fallback_reason": lcmv.get("fallback_reason"),
-            "weight_transition": {
-                key: beamformer.get(key)
-                for key in (
-                    "weight_transition_active",
-                    "weight_transition_duration_s",
-                    "weight_transition_total_chunks",
-                    "weight_transition_completed_chunks",
-                    "weight_transition_progress",
-                    "weight_transition_reason",
-                    "weight_transition_current_weights",
-                    "weight_transition_target_weights",
-                )
-            },
             "beamformer": beamformer,
             "array_alignment": {
                 "phase_offsets_raw_deg": self._json_float_list(phase_offsets_raw),
@@ -1310,11 +1348,11 @@ class BackendRuntime:
                     "jammer_only_power_after_applied_linear",
                 )
             },
-            "powers": {
-                **raw_power,
-                **calibrated_power,
-                **output_power,
-            },
+            "powers": self._runtime_power_evidence(
+                raw_power,
+                calibrated_power,
+                output_power,
+            ),
             "gnss": {
                 key: gnss.get(key)
                 for key in (
@@ -1332,11 +1370,66 @@ class BackendRuntime:
                     "tracking_state_archive_rows",
                     "udp_tracking_age_s",
                     "stale_reason",
-                    "accuracy",
+                )
+            }
+            | {
+                "accuracy": self._runtime_accuracy_evidence(
+                    gnss.get("accuracy", {})
                 )
             },
         }
         return self._json_ready_mapping(context)
+
+    @staticmethod
+    def _runtime_power_evidence(
+        raw_power: dict[str, object],
+        calibrated_power: dict[str, object],
+        output_power: dict[str, object],
+    ) -> dict[str, object]:
+        """Keep synchronized IQ evidence without copying every derived alias."""
+
+        metrics = {**raw_power, **calibrated_power, **output_power}
+        return {
+            key: value
+            for key, value in metrics.items()
+            if key in _RUNTIME_POWER_AGGREGATE_KEYS
+            or key in _RUNTIME_POWER_SCALAR_KEYS
+        }
+
+    @staticmethod
+    def _runtime_accuracy_evidence(accuracy: object) -> dict[str, object]:
+        """Retain PVT/CEP facts while omitting the duplicated protobuf dump."""
+
+        if not isinstance(accuracy, dict):
+            return {}
+        keys = (
+            "fix_count",
+            "accuracy_scope",
+            "cep_sample_count",
+            "cep_scope",
+            "cep_ready",
+            "fix_type",
+            "lat_deg",
+            "lon_deg",
+            "alt_m",
+            "truth_available",
+            "hdop",
+            "vdop",
+            "pdop",
+            "gdop",
+            "east_error_m",
+            "north_error_m",
+            "up_error_m",
+            "horizontal_error_m",
+            "three_d_error_m",
+            "cep50_m",
+            "cep95_m",
+            "accuracy_source",
+            "valid_sats",
+            "solution_status",
+            "solution_type",
+        )
+        return {key: accuracy.get(key) for key in keys if key in accuracy}
 
     def _automatic_rf_inference(
         self,
@@ -2839,14 +2932,16 @@ class BackendRuntime:
             return np.array(self._target_beamformer_weights, copy=True)
 
     def _set_shared_measured_u1_protection_weights(
-        self, weights: np.ndarray, *, available: bool = True
+        self,
+        weights: np.ndarray,
+        *,
+        available: bool = True,
     ) -> None:
-        """Publish the one shared covariance-LCMV measured-U1 onset target."""
+        """Publish the one shared covariance-LCMV measured-U1 target."""
 
         selected = np.asarray(weights, dtype=np.complex128).reshape(-1)
-        if (
-            selected.size != len(self._config.channels)
-            or not np.all(np.isfinite(selected))
+        if selected.size != len(self._config.channels) or not np.all(
+            np.isfinite(selected)
         ):
             return
         with self._beamformer_lock:
@@ -2857,17 +2952,23 @@ class BackendRuntime:
 
     def _get_shared_measured_u1_protection_weights_copy(self) -> np.ndarray:
         with self._beamformer_lock:
-            return np.array(self._shared_measured_u1_protection_weights, copy=True)
+            return np.array(
+                self._shared_measured_u1_protection_weights,
+                copy=True,
+            )
 
     def _shared_measured_u1_protection_is_available(self) -> bool:
         with self._beamformer_lock:
             return bool(self._shared_measured_u1_protection_available)
 
     def _get_gnss_monitor_logical_weights_copy(self) -> np.ndarray:
+        """Return the weights that produced the IQ streams GNSS-SDR received."""
+
         with self._beamformer_lock:
             if self._latest_shared_u1_phase_logical_weights.size:
                 return np.array(
-                    self._latest_shared_u1_phase_logical_weights, copy=True
+                    self._latest_shared_u1_phase_logical_weights,
+                    copy=True,
                 )
             return np.array(self._latest_beamformer_weights, copy=True)
 
@@ -2897,18 +2998,21 @@ class BackendRuntime:
         return out
 
     def _gnss_output_vector(self, chunk: np.ndarray) -> np.ndarray:
-        if bool(
+        if self._shared_phase_fanout_enabled():
+            return self._gnss_shared_u1_phase_output_matrix(chunk)
+        return self._gnss_beamformed_output_vector(chunk)
+
+    def _shared_phase_fanout_enabled(self) -> bool:
+        return bool(
             getattr(
                 self._config,
                 "gnss_shared_u1_phase_compensation_enabled",
                 False,
             )
-        ):
-            return self._gnss_shared_u1_phase_output_matrix(chunk)
-        return self._gnss_beamformed_output_vector(chunk)
+        )
 
     def _gnss_shared_u1_phase_output_matrix(self, chunk: np.ndarray) -> np.ndarray:
-        """Return pinned PRN streams sharing one phase-compensated LCMV null."""
+        """Return phase-aligned copies of one shared beam for pinned GPS PRNs."""
 
         self._advance_beamformer_transition()
         source = np.asarray(chunk, dtype=np.complex64)
@@ -2917,16 +3021,18 @@ class BackendRuntime:
         bank = self._shared_u1_phase_bank
         if bank is None:
             raise RuntimeError("shared-U1 phase compensation bank is unavailable")
-        monitor = self._shared_u1_phase_monitor
-        desired_vectors = (
-            monitor.desired_vectors_snapshot() if monitor is not None else {}
+        now = time.monotonic()
+        emit_status = bool(
+            now - self._last_shared_u1_phase_status_log_ts >= 1.0
         )
+        monitor = self._shared_u1_phase_monitor
+        if emit_status and monitor is not None:
+            self._shared_u1_desired_vectors_cache = (
+                monitor.desired_vectors_snapshot()
+            )
         with self._results_lock:
             jammer_latched = bool(self._lcmv_jammer_detected_latched)
         enabled_now = bool(self._lcmv_test_enabled and jammer_latched)
-        # Use the common target, not an intermediate common-ramp sample. This
-        # makes jammer-OFF return each phase-compensated source all the way to
-        # a scalar multiple of uniform combining while preserving continuity.
         common = self._get_beamformer_target_weights_copy()
         protection = self._get_shared_measured_u1_protection_weights_copy()
         logical, status = bank.advance(
@@ -2935,12 +3041,21 @@ class BackendRuntime:
             shared_measured_u1_available=(
                 self._shared_measured_u1_protection_is_available()
             ),
-            desired_vectors=desired_vectors,
+            # The monitor itself updates at 1 Hz. Re-reading and normalizing
+            # the same ten vectors on every 8.2 ms IQ chunk is pure overhead.
+            desired_vectors=(
+                self._shared_u1_desired_vectors_cache if emit_status else {}
+            ),
             enabled_now=enabled_now,
+            now_monotonic=now,
+            emit_status=emit_status,
         )
+        # Retain the exact phase-aligned shared-beam rows.  The spatial monitor
+        # must correlate each PRN through the same row GNSS-SDR received.
         with self._beamformer_lock:
             self._latest_shared_u1_phase_logical_weights = np.array(
-                logical, copy=True
+                logical,
+                copy=True,
             )
         correction_vector = self._config.phase_correction_vector
         correction = (
@@ -2950,17 +3065,26 @@ class BackendRuntime:
         )
         if correction.size != source.shape[0]:
             raise ValueError("shared-U1 phase correction length mismatch")
-        effective = np.asarray(
-            np.conj(logical) * correction[None, :], dtype=np.complex64
+        outputs, scalar_fast_path = apply_shared_phase_fanout(
+            source,
+            logical,
+            correction,
         )
-        outputs = np.ascontiguousarray(effective @ source, dtype=np.complex64)
-        now = time.monotonic()
-        if now - self._last_shared_u1_phase_status_log_ts >= 1.0:
+        if scalar_fast_path:
+            self._shared_u1_scalar_fanout_chunks += 1
+        else:
+            self._shared_u1_matrix_fallback_chunks += 1
+        if emit_status:
             self._last_shared_u1_phase_status_log_ts = now
-            compensated_count = sum(
+            bridge_count = sum(
                 1
                 for payload in status.values()
-                if bool(payload.get("phase_compensation_applied", False))
+                if bool(payload.get("shared_protection_bridge_applied", False))
+            )
+            transitioning_count = sum(
+                1
+                for payload in status.values()
+                if bool(payload.get("transition_active", False))
             )
             self._handoff_log.info(
                 "shared_u1_phase_compensation_status %s",
@@ -2968,13 +3092,23 @@ class BackendRuntime:
                     {
                         "event": "shared_u1_phase_compensation_status",
                         "applied_to_gnss_sdr": True,
+                        "common_pvt_solver": True,
                         "jammer_latched": jammer_latched,
                         "enabled_now": enabled_now,
-                        "shared_spatial_solution": (
-                            "covariance_lcmv_measured_u1"
-                        ),
                         "independent_per_prn_lcmv": False,
-                        "phase_compensated_source_count": compensated_count,
+                        "active_per_prn_source_count": 0,
+                        "phase_compensated_shared_protection_count": bridge_count,
+                        "transitioning_source_count": transitioning_count,
+                        "phase_compensation": "per_prn_complex_response_continuity",
+                        "scalar_fanout_chunks": self._shared_u1_scalar_fanout_chunks,
+                        "matrix_fallback_chunks": (
+                            self._shared_u1_matrix_fallback_chunks
+                        ),
+                        "latest_output_path": (
+                            "one_shared_beam_plus_prn_scalars"
+                            if scalar_fast_path
+                            else "general_transition_matrix"
+                        ),
                         "sources": status,
                     },
                     allow_nan=False,
@@ -3046,14 +3180,11 @@ class BackendRuntime:
             return apply_beamformer(source, uniform_weights(source.shape[0]))
 
     def _gnss_handoff_mode_label(self) -> str:
-        if bool(
-            getattr(
-                self._config,
-                "gnss_shared_u1_phase_compensation_enabled",
-                False,
-            )
-        ):
-            return "shared_measured_u1_lcmv_per_prn_phase_compensated"
+        if self._shared_phase_fanout_enabled():
+            # This names the fixed transport architecture. The current
+            # uniform/measured-U1 state is recorded separately by
+            # _fifo_output_source_label().
+            return "shared_prn_phase_continuity_fanout"
         if self._lcmv_test_enabled:
             status = self._lcmv_status_copy()
             if str(status.get("mode", "")).lower() == "on":
@@ -3068,11 +3199,13 @@ class BackendRuntime:
     def _reset_lcmv_test_for_run(self) -> None:
         self._spatial_diag_seq = 0
         self._set_shared_measured_u1_protection_weights(
-            uniform_weights(len(self._config.channels)), available=False
+            uniform_weights(len(self._config.channels)),
+            available=False,
         )
         with self._beamformer_lock:
             self._latest_shared_u1_phase_logical_weights = np.empty(
-                (0, len(self._config.channels)), dtype=np.complex128
+                (0, len(self._config.channels)),
+                dtype=np.complex128,
             )
         self._last_lcmv_heavy_diag_ts = None
         self._latest_lcmv_heavy_diag_payload = {
@@ -3702,6 +3835,7 @@ class BackendRuntime:
         u1: np.ndarray,
         raw_power_metrics: dict[str, object] | None = None,
         cal_power_metrics: dict[str, object] | None = None,
+        covariance_matrix: np.ndarray | None = None,
     ) -> dict[str, object]:
         if not bool(getattr(self._config, "healthy_reference_capture_enabled", True)):
             self._healthy_reference_freeze_reason = "disabled by config"
@@ -3868,7 +4002,13 @@ class BackendRuntime:
             else:
                 updated = current_u1
             self._healthy_reference_vector = updated
-            self._healthy_reference_covariance = spatial_covariance(corrected_chunk)
+            self._healthy_reference_covariance = np.array(
+                spatial_covariance(corrected_chunk)
+                if covariance_matrix is None
+                else covariance_matrix,
+                dtype=np.complex128,
+                copy=True,
+            )
             self._healthy_reference_internal_angle_deg = music_internal_deg
             self._healthy_reference_display_bearing_deg = music_bearing_deg
             self._healthy_reference_updated_monotonic_s = time.monotonic()
@@ -3952,6 +4092,7 @@ class BackendRuntime:
         u1: np.ndarray,
         raw_power_metrics: dict[str, object] | None,
         cal_power_metrics: dict[str, object] | None,
+        covariance_matrix: np.ndarray | None = None,
     ) -> dict[str, object]:
         if not bool(getattr(self._config, "one_run_segmentation_enabled", True)):
             return {
@@ -3969,6 +4110,7 @@ class BackendRuntime:
             u1=u1,
             raw_power_metrics=raw_power_metrics,
             cal_power_metrics=cal_power_metrics,
+            covariance_matrix=covariance_matrix,
         )
 
     def _lcmv_jammer_activation_evidence(
@@ -4105,13 +4247,26 @@ class BackendRuntime:
         music_bearing_deg: float,
         raw_power_metrics: dict[str, object] | None = None,
         cal_power_metrics: dict[str, object] | None = None,
+        covariance_matrix: np.ndarray | None = None,
+        covariance_eigenvectors: np.ndarray | None = None,
     ) -> dict[str, object]:
         """Track and log the healthy reference while the active combiner is uniform."""
 
         if self._lcmv_test_enabled:
             return {}
         corrected = np.asarray(corrected_chunk, dtype=np.complex128)
-        _, eigenvectors = covariance_eigendecomposition(corrected)
+        covariance = (
+            spatial_covariance(corrected)
+            if covariance_matrix is None
+            else np.asarray(covariance_matrix, dtype=np.complex128)
+        )
+        if covariance_eigenvectors is None:
+            _, eigenvectors = covariance_eigendecomposition_from_matrix(covariance)
+        else:
+            eigenvectors = np.asarray(
+                covariance_eigenvectors,
+                dtype=np.complex128,
+            )
         u1 = (
             np.asarray(eigenvectors[:, 0], dtype=np.complex128).reshape(-1)
             if eigenvectors.ndim == 2 and eigenvectors.shape[1] > 0
@@ -4124,12 +4279,12 @@ class BackendRuntime:
             u1=u1,
             raw_power_metrics=raw_power_metrics,
             cal_power_metrics=cal_power_metrics,
+            covariance_matrix=covariance,
         )
         heavy_diag = self._lcmv_heavy_diagnostics_decision()
         uniform_w = uniform_weights(corrected.shape[0])
-        current_covariance = spatial_covariance(corrected)
         current_output_power = covariance_output_power(
-            covariance=current_covariance,
+            covariance=covariance,
             weights=uniform_w,
         )
         healthy_baseline_output_power = covariance_output_power(
@@ -4210,10 +4365,23 @@ class BackendRuntime:
         heavy_diagnostics_payload: dict[str, object] | None = None,
         raw_power_metrics: dict[str, object] | None = None,
         cal_power_metrics: dict[str, object] | None = None,
+        covariance_matrix: np.ndarray | None = None,
+        covariance_eigenvalues: np.ndarray | None = None,
+        covariance_eigenvectors: np.ndarray | None = None,
     ) -> dict[str, object]:
         corrected = np.asarray(corrected_chunk, dtype=np.complex128)
-        covariance = spatial_covariance(corrected)
-        eigenvalues, eigenvectors = covariance_eigendecomposition(corrected)
+        covariance = (
+            spatial_covariance(corrected)
+            if covariance_matrix is None
+            else np.asarray(covariance_matrix, dtype=np.complex128)
+        )
+        if covariance_eigenvalues is None or covariance_eigenvectors is None:
+            eigenvalues, eigenvectors = covariance_eigendecomposition_from_matrix(
+                covariance
+            )
+        else:
+            eigenvalues = np.asarray(covariance_eigenvalues, dtype=np.float64)
+            eigenvectors = np.asarray(covariance_eigenvectors, dtype=np.complex128)
         if eigenvectors.ndim == 2 and eigenvectors.shape[1] > 0:
             u1 = np.asarray(eigenvectors[:, 0], dtype=np.complex128).reshape(-1)
         else:
@@ -4549,9 +4717,7 @@ class BackendRuntime:
 
     def _log_spatial_vector_diagnostics(self, payload: dict[str, object]) -> None:
         line = json.dumps(payload, separators=(",", ":"))
-        self._analysis_log.info("%s", line)
-        if self._spatial_vector_log is not self._analysis_log:
-            self._spatial_vector_log.info("%s", line)
+        self._spatial_vector_log.info("%s", line)
 
     def _update_lcmv_test_from_music(
         self,
@@ -4561,6 +4727,9 @@ class BackendRuntime:
         raw_power_metrics: dict[str, object] | None = None,
         cal_power_metrics: dict[str, object] | None = None,
         target_selection_source: str = "strongest_music_peak",
+        covariance_matrix: np.ndarray | None = None,
+        covariance_eigenvalues: np.ndarray | None = None,
+        covariance_eigenvectors: np.ndarray | None = None,
     ) -> None:
         if not self._lcmv_test_enabled:
             return
@@ -4689,8 +4858,18 @@ class BackendRuntime:
                         f"correction={correction.size} channels={expected_channels}"
                     )
 
-            covariance = spatial_covariance(corrected)
-            _, eigenvectors = covariance_eigendecomposition(corrected)
+            covariance = (
+                spatial_covariance(corrected)
+                if covariance_matrix is None
+                else np.asarray(covariance_matrix, dtype=np.complex128)
+            )
+            if covariance_eigenvalues is None or covariance_eigenvectors is None:
+                eigenvalues, eigenvectors = covariance_eigendecomposition_from_matrix(
+                    covariance
+                )
+            else:
+                eigenvalues = np.asarray(covariance_eigenvalues, dtype=np.float64)
+                eigenvectors = np.asarray(covariance_eigenvectors, dtype=np.complex128)
             u1 = (
                 np.asarray(eigenvectors[:, 0], dtype=np.complex128).reshape(-1)
                 if eigenvectors.ndim == 2 and eigenvectors.shape[1] > 0
@@ -4703,6 +4882,7 @@ class BackendRuntime:
                 u1=u1,
                 raw_power_metrics=raw_power_metrics,
                 cal_power_metrics=cal_power_metrics,
+                covariance_matrix=covariance,
             )
             if preserve_mode == "realtime_bladerf_measured_u1":
                 activation_payload = self._lcmv_jammer_activation_evidence(
@@ -4911,10 +5091,9 @@ class BackendRuntime:
                     enforce_white_noise_gain=enforce_white_noise_gain,
                 )
 
-            # The phase-continuity fan-out always uses this one shared spatial
-            # solution. Publish it as soon as the full-covariance measured-U1
-            # candidate passes the same runtime safety checks. No PRN-specific
-            # covariance or LCMV solve occurs here.
+            # Publish every accepted measured-U1 covariance update.  Each PRN
+            # receives this one spatial row with a scalar that preserves its
+            # previous complex response; no PRN-specific LCMV solve exists.
             if covariance_u1_result is not None:
                 protection_rejection = _preflight_rejection(
                     "covariance_lcmv_measured_u1",
@@ -4989,6 +5168,9 @@ class BackendRuntime:
                 heavy_diagnostics_payload=heavy_diag,
                 raw_power_metrics=raw_power_metrics,
                 cal_power_metrics=cal_power_metrics,
+                covariance_matrix=covariance,
+                covariance_eigenvalues=eigenvalues,
+                covariance_eigenvectors=eigenvectors,
             )
             spatial_diag.update(self._beamformer_transition_payload())
             self._spatial_diag_seq += 1
@@ -5119,22 +5301,6 @@ class BackendRuntime:
         output_diag["uniform_weights"] = complex_vector_payload(uniform_w)
         output_diag["lcmv_weights"] = complex_vector_payload(lcmv_weights)
         return output_diag
-
-    def _lcmv_response_db(self, weights: np.ndarray) -> np.ndarray:
-        """Return current LCMV response over the configured MUSIC scan angles."""
-        w = np.asarray(weights, dtype=np.complex128).reshape(-1)
-        if w.size != len(self._config.channels):
-            return np.zeros((0,), dtype=np.float64)
-        steering = steering_vector(
-            self._scan_angles_deg,
-            self._config.center_freq_hz,
-            self._config.array_spacing_m,
-        )
-        response = np.abs(w.conj() @ steering)
-        return np.asarray(
-            20.0 * np.log10(np.maximum(response, 1e-300)),
-            dtype=np.float64,
-        )
 
     def _lcmv_model_summary_payload(self, model: object) -> dict[str, object]:
         return {
@@ -5378,7 +5544,6 @@ class BackendRuntime:
             active_lcmv_fallback_used=active_lcmv_fallback_used,
         )
         line = json.dumps(payload, separators=(",", ":"))
-        self._analysis_log.info("%s", line)
         self._lcmv_pattern_log.info("%s", line)
 
     def _lcmv_pattern_payload(
@@ -5601,16 +5766,10 @@ class BackendRuntime:
                 break
 
     def _fifo_output_source_label(self) -> str:
-        if bool(
-            getattr(
-                self._config,
-                "gnss_shared_u1_phase_compensation_enabled",
-                False,
-            )
-        ):
+        if self._shared_phase_fanout_enabled():
             if self._lcmv_test_enabled and self._lcmv_jammer_detected_latched:
-                return "shared_measured_u1_phase_compensated_fanout"
-            return "pinned_prn_shared_common_weights"
+                return "shared_measured_u1_phase_compensated_prn_fanout"
+            return "shared_uniform_phase_reference_prn_fanout"
         if bool(self._beamformer_transition_payload().get("weight_transition_active")):
             return "weight_transition"
         mode = self._gnss_handoff_mode_label()
@@ -5945,6 +6104,14 @@ class BackendRuntime:
                 music_bearing_deg=doa_display_deg,
                 raw_power_metrics=phase_result.raw_power_metrics,
                 cal_power_metrics=phase_result.cal_power_metrics,
+                covariance_matrix=np.asarray(
+                    doa_metrics["covariance_matrix"],
+                    dtype=np.complex128,
+                ),
+                covariance_eigenvectors=np.asarray(
+                    doa_metrics["covariance_eigenvectors"],
+                    dtype=np.complex128,
+                ),
             )
             lcmv_internal_deg, lcmv_display_deg, lcmv_target_source = (
                 self._select_lcmv_target_from_doa_metrics(
@@ -5960,6 +6127,18 @@ class BackendRuntime:
                 raw_power_metrics=phase_result.raw_power_metrics,
                 cal_power_metrics=phase_result.cal_power_metrics,
                 target_selection_source=lcmv_target_source,
+                covariance_matrix=np.asarray(
+                    doa_metrics["covariance_matrix"],
+                    dtype=np.complex128,
+                ),
+                covariance_eigenvalues=np.asarray(
+                    doa_metrics["covariance_eigenvalues"],
+                    dtype=np.float64,
+                ),
+                covariance_eigenvectors=np.asarray(
+                    doa_metrics["covariance_eigenvectors"],
+                    dtype=np.complex128,
+                ),
             )
             now = time.monotonic()
             if (now - self._last_doa_log_ts) >= self._doa_log_interval_s:
@@ -6075,8 +6254,6 @@ class BackendRuntime:
             else np.zeros_like(music_rel_db)
         )
         display_scan = np.asarray((90.0 - scan_internal) % 360.0, dtype=np.float64)
-        display_sorted, display_order = operator_bearing_axis_for_internal_scan(scan_internal)
-
         status = self._lcmv_status_copy()
         lcmv_response = np.asarray(
             status.get("lcmv_response_db", np.zeros((0,), dtype=np.float64)),
@@ -6103,8 +6280,18 @@ class BackendRuntime:
         if lcmv_response_power_db.size != raw.size:
             lcmv_response_power_db = np.zeros((0,), dtype=np.float64)
         corrected = np.asarray(calibrated_chunk, dtype=np.complex128)
-        covariance = spatial_covariance(corrected)
-        eigenvalues, eigenvectors = covariance_eigendecomposition(corrected)
+        covariance = np.asarray(
+            doa_metrics.get("covariance_matrix", np.zeros((0, 0))),
+            dtype=np.complex128,
+        )
+        eigenvalues = np.asarray(
+            doa_metrics.get("covariance_eigenvalues", np.zeros((0,))),
+            dtype=np.float64,
+        )
+        eigenvectors = np.asarray(
+            doa_metrics.get("covariance_eigenvectors", np.zeros((0, 0))),
+            dtype=np.complex128,
+        )
         eigenvalues_safe = np.maximum(eigenvalues, 1e-300)
         eigenvalues_db = 10.0 * np.log10(eigenvalues_safe)
         eigenvalues_relative_db = (
@@ -6143,6 +6330,7 @@ class BackendRuntime:
 
         payload: dict[str, object] = {
             "event": "full_angle_analysis",
+            "schema_version": 2,
             **self._calibration_context_payload(),
             "raw_power_spread_db": self._json_float(raw_metrics.get("raw_power_spread_db")),
             "cal_power_spread_db": self._json_float(cal_metrics.get("cal_power_spread_db")),
@@ -6163,33 +6351,13 @@ class BackendRuntime:
             "array_spacing_m": self._json_float(self._config.array_spacing_m),
             "scan_internal_deg": self._json_float_list(scan_internal),
             "scan_display_deg": self._json_float_list(display_scan),
-            "scan_display_sorted_deg": self._json_float_list(display_sorted),
-            "music_scan_internal_angles_deg": self._json_float_list(scan_internal),
-            "music_scan_display_bearings_deg": self._json_float_list(display_scan),
             "music_spectrum_linear": self._json_float_list(raw),
             "music_spectrum_db": self._json_float_list(music_db),
             "music_spectrum_relative_db": self._json_float_list(music_rel_db),
-            "music_raw_spectrum": self._json_float_list(raw),
-            "music_rel_db": self._json_float_list(music_rel_db),
             "music_rel_db_polar_radius": self._json_float_list(music_rel_db_polar_radius),
-            "music_raw_display_sorted": self._json_float_list(raw[display_order]),
-            "music_rel_db_display_sorted": self._json_float_list(music_rel_db[display_order]),
-            "music_rel_db_polar_radius_display_sorted": self._json_float_list(
-                music_rel_db_polar_radius[display_order]
-            ),
-            "bartlett_scan_internal_angles_deg": self._json_float_list(scan_internal),
-            "bartlett_scan_display_bearings_deg": self._json_float_list(display_scan),
             "bartlett_spectrum_linear": self._json_float_list(bartlett_raw),
             "bartlett_spectrum_db": self._json_float_list(bartlett_db),
             "bartlett_spectrum_relative_db": self._json_float_list(bartlett_rel_db),
-            "bartlett_raw_spectrum": self._json_float_list(bartlett_raw),
-            "bartlett_rel_db": self._json_float_list(bartlett_rel_db),
-            "bartlett_raw_display_sorted": self._json_float_list(
-                bartlett_raw[display_order]
-            ),
-            "bartlett_rel_db_display_sorted": self._json_float_list(
-                bartlett_rel_db[display_order]
-            ),
             "doa": {
                 "index": int(doa_index),
                 "internal_deg": self._json_float(doa_internal_deg),
@@ -6320,10 +6488,6 @@ class BackendRuntime:
                 "lcmv_model_summary": self._json_ready_mapping(
                     status.get("lcmv_model_summary", {})
                 ),
-                "response_db": self._json_float_list(lcmv_response),
-                "response_db_display_sorted": self._json_float_list(
-                    lcmv_response[display_order] if lcmv_response.size else lcmv_response
-                ),
                 "null_match": self._lcmv_null_match_payload(
                     scan_internal=scan_internal,
                     display_scan=display_scan,
@@ -6334,8 +6498,10 @@ class BackendRuntime:
                     doa_index=doa_index,
                 ),
             },
-            "spatial_vector_diagnostics": self._json_ready_mapping(
-                status.get("spatial_vector_diagnostics", {})
+            "spatial_vector_diagnostics_sequence": self._json_float(
+                status.get("spatial_vector_diagnostics", {}).get("sequence")
+                if isinstance(status.get("spatial_vector_diagnostics"), dict)
+                else None
             ),
         }
         self._analysis_log.info("%s", json.dumps(payload, separators=(",", ":")))
@@ -6545,18 +6711,6 @@ class BackendRuntime:
     # -------------------------------------------------------------------------
     # Power and Formatting Helpers
     # -------------------------------------------------------------------------
-
-    def _received_iq_power_db(self, channel_samples: np.ndarray) -> float:
-        return self._power_db(channel_samples)
-
-    def _power_db(self, samples: np.ndarray) -> float:
-        values = np.asarray(samples, dtype=np.complex128)
-        if values.size == 0:
-            return float("nan")
-        power = float(np.mean(np.abs(values) ** 2))
-        if power <= 0.0 or not np.isfinite(power):
-            return float("nan")
-        return 10.0 * float(np.log10(power + 1e-30))
 
     def _format_vector_deg(self, values: object) -> str:
         arr = np.asarray(values, dtype=np.float64).reshape(-1)

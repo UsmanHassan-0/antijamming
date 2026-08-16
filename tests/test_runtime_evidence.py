@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 import time
 
+import numpy as np
+
 from antijamming.logging import (
     finalize_session_logs,
     record_event,
@@ -12,6 +14,7 @@ from antijamming.logging import (
     setup_logging,
 )
 from antijamming.config import StreamConfig
+from antijamming.dsp.pipeline import compute_doa_metrics
 from antijamming.runtime.backend import BackendRuntime
 from tools.audit_live_session import audit_session
 from tools.summarize_lcmv_run import parse_json_line
@@ -169,10 +172,98 @@ def test_automatic_runtime_evidence_records_weights_inference_and_gnss(tmp_path)
     assert context["beamformer"]["uniform_logical_weights"]["real"] == [1.0] * 4
     assert context["beamformer"]["current_logical_weights"]["real"] == [1.0] * 4
     assert context["beamformer"]["weight_transition_active"] is False
+    assert "weight_transition" not in context
     assert any(
         payload["event"] == "automatic_runtime_state_transition"
         for payload in payloads
     )
+
+
+def test_runtime_evidence_compacts_derived_power_and_pvt_aliases() -> None:
+    powers = BackendRuntime._runtime_power_evidence(
+        {
+            "raw_ch0_power_linear": 1.0,
+            "raw_ch0_peak_component": 0.25,
+            "raw_ch0_dc_power_linear": 0.01,
+            "raw_channel_powers_linear": [1.0, 2.0, 3.0, 4.0],
+        },
+        {"cal_power_spread_db": 0.2},
+        {
+            "fifo_output_power_linear": 2.5,
+            "fifo_output_source": "shared",
+            "lcmv_weights": {"real": [1.0] * 4},
+        },
+    )
+    accuracy = BackendRuntime._runtime_accuracy_evidence(
+        {
+            "fix_count": 100,
+            "lat_deg": 37.0,
+            "cep50_m": 1.2,
+            "pvt_solution": {"monitor_pvt": {"duplicated": True}},
+        }
+    )
+
+    assert powers["raw_ch0_power_linear"] == 1.0
+    assert powers["raw_ch0_peak_component"] == 0.25
+    assert powers["fifo_output_power_linear"] == 2.5
+    assert "raw_ch0_dc_power_linear" not in powers
+    assert "lcmv_weights" not in powers
+    assert accuracy == {"fix_count": 100, "lat_deg": 37.0, "cep50_m": 1.2}
+
+
+def test_spatial_diagnostics_are_not_duplicated_into_analysis_log(tmp_path) -> None:
+    loggers = setup_logging(tmp_path)
+    backend = BackendRuntime(StreamConfig(log_dir=tmp_path), loggers)
+
+    backend._log_spatial_vector_diagnostics(
+        {"event": "spatial_vector_diagnostics", "sequence": 7}
+    )
+    for logger in loggers.values():
+        for handler in logger.handlers:
+            handler.flush()
+
+    assert '"sequence":7' in (
+        tmp_path / "spatial_vector_diagnostics.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "spatial_vector_diagnostics" not in (
+        tmp_path / "analysis.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_full_angle_log_keeps_one_copy_of_each_spectrum(tmp_path) -> None:
+    loggers = setup_logging(tmp_path)
+    cfg = StreamConfig(log_dir=tmp_path)
+    backend = BackendRuntime(cfg, loggers)
+    scan = np.linspace(0.0, 330.0, 12)
+    samples = np.ones((4, 128), dtype=np.complex128)
+    backend._scan_angles_deg = scan
+    doa = compute_doa_metrics(
+        samples,
+        cfg.center_freq_hz,
+        scan,
+        cfg.array_spacing_m,
+        n_sources=1,
+    )
+
+    backend._log_full_angle_analysis(
+        doa_metrics=doa,
+        raw_spec=doa["doa_raw_spectrum"],
+        doa_internal_deg=float(doa["doa_deg"]),
+        doa_display_deg=backend._internal_angle_to_display(doa["doa_deg"]),
+        calibrated_chunk=samples,
+    )
+    for handler in loggers["analysis"].handlers:
+        handler.flush()
+    record = parse_json_line((tmp_path / "analysis.log").read_text())
+
+    assert record is not None
+    assert record["schema_version"] == 2
+    assert len(record["music_spectrum_linear"]) == scan.size
+    assert len(record["bartlett_spectrum_linear"]) == scan.size
+    assert "music_raw_spectrum" not in record
+    assert "music_raw_display_sorted" not in record
+    assert "bartlett_raw_spectrum" not in record
+    assert "scan_display_sorted_deg" not in record
 
 
 def test_session_audit_reports_scenario_and_carrier_continuity(tmp_path) -> None:

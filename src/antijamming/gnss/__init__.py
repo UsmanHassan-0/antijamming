@@ -4,10 +4,12 @@ from .gnss_sdr import GnssSdrBridge
 from .shared_u1_phase_compensation import (
     SharedU1DesiredVectorMonitor,
     SharedU1PhaseCompensationBank,
+    apply_shared_phase_fanout,
 )
 
 __all__ = [
     "GnssSdrBridge",
     "SharedU1DesiredVectorMonitor",
     "SharedU1PhaseCompensationBank",
+    "apply_shared_phase_fanout",
 ]

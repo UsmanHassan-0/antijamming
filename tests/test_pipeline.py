@@ -4,12 +4,17 @@ import numpy as np
 
 from antijamming.dsp.doa.music import (
     bartlett_spectrum,
+    covariance_eigendecomposition,
+    music_spectrum,
     source_count_diagnostics,
     steering_vector,
 )
 from antijamming.dsp.phase import correction_vector_from_phase_offsets_deg
 from antijamming.dsp.pipeline import compute_realtime_metrics
-from antijamming.dsp.pipeline.stages import _dominant_spectrum_peaks
+from antijamming.dsp.pipeline.stages import (
+    _dominant_spectrum_peaks,
+    compute_doa_metrics,
+)
 
 
 def test_compute_realtime_metrics_shapes_and_ranges() -> None:
@@ -57,6 +62,62 @@ def test_compute_realtime_metrics_shapes_and_ranges() -> None:
     assert metrics["doa_peak_count"] >= 1
     assert isinstance(metrics["bartlett_peaks"], list)
     assert metrics["bartlett_peak_count"] == len(metrics["bartlett_peaks"])
+
+
+def test_doa_shared_covariance_matches_independent_reference_formulas() -> None:
+    """One shared covariance must not change MUSIC, Bartlett, or eigenvalues."""
+
+    rng = np.random.default_rng(20260816)
+    samples = (
+        rng.standard_normal((4, 4096))
+        + 1j * rng.standard_normal((4, 4096))
+    ).astype(np.complex128)
+    scan_angles = np.linspace(0.0, 359.0, 720)
+
+    actual = compute_doa_metrics(
+        samples,
+        center_freq_hz=1.57542e9,
+        scan_angles_deg=scan_angles,
+        array_spacing_m=0.095,
+        n_sources=2,
+    )
+    expected_music = music_spectrum(
+        samples,
+        1.57542e9,
+        scan_angles,
+        0.095,
+        n_sources=2,
+        normalize=False,
+    )
+    expected_bartlett = bartlett_spectrum(
+        samples,
+        1.57542e9,
+        scan_angles,
+        0.095,
+        normalize=False,
+    )
+    expected_eigenvalues, expected_eigenvectors = covariance_eigendecomposition(
+        samples
+    )
+
+    np.testing.assert_allclose(actual["doa_raw_spectrum"], expected_music, rtol=1e-13)
+    np.testing.assert_allclose(
+        actual["bartlett_raw_spectrum"],
+        expected_bartlett,
+        rtol=1e-13,
+        atol=1e-15,
+    )
+    np.testing.assert_allclose(
+        actual["covariance_eigenvalues"],
+        expected_eigenvalues,
+        rtol=1e-14,
+    )
+    np.testing.assert_allclose(
+        np.abs(actual["covariance_eigenvectors"]),
+        np.abs(expected_eigenvectors),
+        rtol=1e-14,
+        atol=1e-15,
+    )
 
 
 def test_dominant_spectrum_peaks_reports_separated_music_peaks() -> None:

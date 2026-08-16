@@ -169,7 +169,6 @@ class MainWindow(QMainWindow):
         self._tracking_without_geometry: list[int] = []
         self._latest_gnss_snapshot: dict[str, object] = {}
         self._receiver_projection = ReceiverProjection()
-        self._prn_display_hold = self._receiver_projection.display_hold
         self._latest_pending_metrics: dict | None = None
         self._metrics_refresh_in_progress = False
         self._pending_metrics_received_monotonic_s = 0.0
@@ -834,21 +833,6 @@ class MainWindow(QMainWindow):
         self._refresh_system_health_row()
         self._refresh_operator_summaries()
         self._refresh_system_info()
-
-    def _set_summary_chip(
-        self,
-        summary_attr: str,
-        chip: QLabel,
-        detail_label: QLabel,
-        detail_title: str,
-        value: str,
-        color: str,
-    ) -> None:
-        setattr(self, summary_attr, value)
-        if chip.text() != value:
-            chip.setText(value)
-        self._set_status_row(detail_label, detail_title, value, color)
-        self._refresh_operator_summaries()
 
     def _set_fix_chip(
         self,
@@ -1742,7 +1726,6 @@ class MainWindow(QMainWindow):
 
     def _clear_gnss_operator_state(self) -> None:
         self._latest_gnss_snapshot = {}
-        self._receiver_projection.clear_display_hold()
         if self._prn_monitor is not None:
             self._prn_monitor.update_snapshot([])
         self._update_skyplot_monitors([])
@@ -1775,7 +1758,6 @@ class MainWindow(QMainWindow):
         gnss_snapshot = metrics.get("gnss_snapshot", {}) if isinstance(metrics, dict) else {}
         if not isinstance(gnss_snapshot, dict) or not gnss_snapshot:
             self._latest_gnss_snapshot = {}
-            self._receiver_projection.clear_display_hold()
             self._prn_monitor.update_snapshot([])
             self._update_skyplot_monitors([])
             self._last_prn_chart_signature = None
@@ -1788,10 +1770,7 @@ class MainWindow(QMainWindow):
 
         self._latest_gnss_snapshot = dict(gnss_snapshot)
         now = time.monotonic()
-        receiver_state = self._receiver_projection.build_view_state(
-            gnss_snapshot,
-            now=now,
-        )
+        receiver_state = self._receiver_projection.build_view_state(gnss_snapshot)
         self._current_tracking_prns = receiver_state.current_tracking_prns
         self._current_tracking_satellite_ids = (
             receiver_state.current_tracking_satellite_ids
@@ -1980,10 +1959,6 @@ class MainWindow(QMainWindow):
             return
         self._set_status_row(self._cep50_label, "CEP50", "--", INFO)
         self._set_status_row(self._cep95_label, "CEP95", "--", INFO)
-
-    @staticmethod
-    def _format_meter_value(value: float | None) -> str:
-        return f"{value:.2f} m" if value is not None else "--"
 
     def _prn_chart_signature(self, prn_entries: list[dict[str, object]]) -> tuple[object, ...]:
         return tuple(
@@ -2326,20 +2301,6 @@ class MainWindow(QMainWindow):
         )
 
 
-    def _format_db_threshold(
-        self,
-        value: float | None,
-        threshold: float | None,
-        *,
-        alert_on_threshold: bool = False,
-    ) -> tuple[str, str]:
-        if value is None:
-            return "--", INFO
-        if threshold is None:
-            return f"{value:.1f} dB", INFO
-        color = ALERT if alert_on_threshold and value >= threshold else INFO
-        return f"{value:.1f} / {threshold:.1f} dB", color
-
     def _format_fix_value(self, fix_type: str) -> str:
         normalized = fix_type.strip().lower()
         if "3d" in normalized:
@@ -2437,19 +2398,6 @@ class MainWindow(QMainWindow):
         hours, rem_minutes = divmod(minutes, 60)
         return f"{hours:02d}:{rem_minutes:02d}:{rem_seconds:02d}"
 
-    def _format_prn_list(self, value: object) -> str:
-        if not isinstance(value, (list, tuple, set)):
-            return "--"
-        prns = sorted(
-            prn
-            for raw_prn in value
-            for prn in [valid_prn(raw_prn)]
-            if prn is not None
-        )
-        if not prns:
-            return "--"
-        return ", ".join(f"G{prn:02d}" for prn in prns)
-
     def _format_satellite_list(self, labels_obj: object, fallback_prns_obj: object = None) -> str:
         labels: list[str] = []
         if isinstance(labels_obj, (list, tuple, set)):
@@ -2515,15 +2463,6 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     # Numeric Helpers
     # -------------------------------------------------------------------------
-
-    def _set_positive_dynamic_y_range(self, plot, values: np.ndarray) -> None:
-        finite = np.asarray(values, dtype=np.float64)
-        finite = finite[np.isfinite(finite)]
-        if finite.size == 0:
-            return
-        ymax = max(float(np.max(finite)) * 1.05, 1.0)
-        plot.setLimits(yMin=0.0, yMax=ymax)
-        plot.setYRange(0.0, ymax, padding=0.0)
 
     def _finite_vector(self, value: object) -> np.ndarray:
         try:

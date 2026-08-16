@@ -433,11 +433,12 @@ class GnssSdrBridge(
                                 )
                             self._fifo_source_bytes[source_index] += written
                             if len(self._fifo_source_bytes) > 1:
-                                lead = max(self._fifo_source_bytes) - min(
+                                source_lead = max(self._fifo_source_bytes) - min(
                                     self._fifo_source_bytes
                                 )
                                 self._fifo_max_source_lead_bytes = max(
-                                    self._fifo_max_source_lead_bytes, lead
+                                    self._fifo_max_source_lead_bytes,
+                                    source_lead,
                                 )
                             payload = payload[written:]
             elapsed_s = time.monotonic() - started_at
@@ -536,13 +537,20 @@ class GnssSdrBridge(
         if self._write_count > 0 or self._drop_count > 0:
             avg_ms = 1000.0 * (self._write_time_total_s / max(1, self._write_count))
             self._log.info(
-                "GNSS FIFO summary: writes=%d bytes=%d drops=%d avg_write_ms=%.2f max_write_ms=%.2f pipe=%s",
+                "GNSS FIFO summary: writes=%d bytes=%d drops=%d avg_write_ms=%.2f max_write_ms=%.2f pipe=%s source_byte_spread=%d max_source_lead_samples=%d stripe_samples=%d",
                 self._write_count,
                 self._write_bytes,
                 self._drop_count,
                 avg_ms,
                 self._write_max_latency_s * 1000.0,
                 self._pipe_size_bytes if self._pipe_size_bytes is not None else "unknown",
+                (
+                    max(self._fifo_source_bytes) - min(self._fifo_source_bytes)
+                    if self._fifo_source_bytes
+                    else 0
+                ),
+                self._fifo_max_source_lead_bytes // np.dtype(np.complex64).itemsize,
+                PER_SOURCE_FIFO_STRIPE_SAMPLES if len(self._fifo_paths) > 1 else 0,
             )
 
         self._cleanup_fifo()
