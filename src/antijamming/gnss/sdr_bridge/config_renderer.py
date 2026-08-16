@@ -78,9 +78,12 @@ class ConfigRendererMixin:
             ),
             pvt_nmea_tty_enable=str(bool(self._cfg.gnss_pvt_nmea_tty_enable)).lower(),
             pvt_positioning_mode=str(self._cfg.gnss_pvt_positioning_mode),
+            pvt_elevation_mask_deg=max(
+                -90.0, min(90.0, float(self._cfg.gnss_pvt_elevation_mask_deg))
+            ),
             sample_type=self._cfg.gnss_sdr_sample_type,
-            signal_conditioner_config=self._render_signal_conditioner_config(),
             signal_source_dump_path="./outputs/signal_source/signal_source.dat",
+            signal_conditioner_config=self._render_signal_conditioner_config(),
             telemetry_dump_prefix="./outputs/telemetry/telemetry_decoder_1C.dat",
             tracking_1c_dll_bw_hz=max(
                 0.1, float(self._cfg.gnss_tracking_1c_dll_bw_hz)
@@ -168,6 +171,7 @@ class ConfigRendererMixin:
             f"pvt_nmea_tty={value_for('PVT.flag_nmea_tty_port')}:{value_for('PVT.nmea_dump_devname')} "
             f"pvt_nmea_file={value_for('PVT.nmea_output_file_enabled')} "
             f"pvt_nmea_rate_ms={value_for('PVT.nmea_rate_ms')} "
+            f"pvt_elevation_mask_deg={value_for('PVT.elevation_mask')} "
             f"pvt_rtklib_residuals={value_for('PVT.log_rtklib_residuals')}:"
             f"{value_for('PVT.rtklib_residual_log_period_ms')} "
             f"monitor={value_for('Monitor.enable_monitor')}:{value_for('Monitor.udp_port')} "

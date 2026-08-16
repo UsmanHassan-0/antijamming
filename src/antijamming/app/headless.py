@@ -116,7 +116,23 @@ class HeadlessRuntimeService:
             enabled = bool(arguments["enabled"])
             self._backend.set_lcmv_test_enabled(enabled)
             return {"accepted": True, "enabled": enabled}
+        if normalized == "mark_rf_event":
+            event = str(arguments["event"])
+            result = self._backend.mark_rf_event(
+                event,
+                attenuation_db=self._optional_float(arguments.get("attenuation_db")),
+                bladeRF_gain_db=self._optional_float(arguments.get("bladeRF_gain_db")),
+                notes=str(arguments.get("notes", "")),
+                source=str(arguments.get("source", "gui")),
+            )
+            return {"accepted": True, "event": result}
         raise ValueError(f"unknown antijamming command: {command!r}")
+
+    @staticmethod
+    def _optional_float(value: object) -> float | None:
+        if value is None or value == "":
+            return None
+        return float(value)
 
     def _start_backend(self, reason: str) -> bool:
         with self._lifecycle_lock:

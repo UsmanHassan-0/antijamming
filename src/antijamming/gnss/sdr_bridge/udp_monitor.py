@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import math
 import socket
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from google.protobuf.message import DecodeError
 
@@ -156,7 +158,10 @@ class UdpMonitorMixin:
         valid_sats = self._valid_positive_int(message.valid_sats)
         with self._state_lock:
             self._pvt_udp_points.append(point)
-            del self._pvt_udp_points[:-max(1, int(self._cfg.gnss_accuracy_window_points))]
+            # Keep every fix for the lifetime of this receiver run. Exact
+            # cumulative CEP50/CEP95 cannot be reconstructed after discarding
+            # older fixes; gnss_accuracy_window_points is now the minimum sample
+            # count before publishing CEP, not a rolling retention limit.
             accuracy = self._build_accuracy_snapshot(list(self._pvt_udp_points))
             accuracy.update(
                 {
@@ -267,6 +272,12 @@ class UdpMonitorMixin:
         cno_db_hz = self._finite_float(observable.cn0_db_hz)
 
         if source == "tracking":
+            self._persist_tracking_observable_locked(
+                observable,
+                sat_key=sat_key,
+                channel=channel,
+                now=now,
+            )
             previous_key = self._channel_prn.get(channel)
             if previous_key is not None and previous_key != sat_key:
                 previous_entry = self._prn_states.get(previous_key)
@@ -319,6 +330,109 @@ class UdpMonitorMixin:
             return
 
         self._latest_observables_by_prn[sat_key] = synchro_entry
+
+    def _persist_tracking_observable_locked(
+        self,
+        observable: gnss_synchro_pb2.GnssSynchro,
+        *,
+        sat_key: _SatKey,
+        channel: int,
+        now: float,
+    ) -> None:
+        """Archive carrier/code tracking state received from TrackingMonitor."""
+
+        handle = getattr(self, "_tracking_state_handle", None)
+        if handle is None:
+            return
+
+        wall_time_ns = time.time_ns()
+        monotonic_ns = time.monotonic_ns()
+        self._tracking_state_sequence = int(
+            getattr(self, "_tracking_state_sequence", 0)
+        ) + 1
+        fs = int(observable.fs)
+        carrier_phase_rads = self._finite_float(observable.carrier_phase_rads)
+        code_phase_samples = self._finite_float(observable.code_phase_samples)
+        prompt_i = self._finite_float(observable.prompt_i)
+        prompt_q = self._finite_float(observable.prompt_q)
+        fields = {
+            "schema_version": 1,
+            "session_id": getattr(self, "_runtime_session_id", None),
+            "sequence": self._tracking_state_sequence,
+            "timestamp_utc": datetime.fromtimestamp(
+                wall_time_ns / 1e9,
+                timezone.utc,
+            ).isoformat(),
+            "timestamp_local": datetime.fromtimestamp(
+                wall_time_ns / 1e9,
+            ).astimezone().isoformat(),
+            "wall_time_unix_ns": wall_time_ns,
+            "wall_time_unix_s": wall_time_ns / 1e9,
+            "monotonic_s": now,
+            "monotonic_ns": monotonic_ns,
+            "session_elapsed_s": (
+                (monotonic_ns - self._tracking_state_started_monotonic_ns) / 1e9
+                if getattr(self, "_tracking_state_started_monotonic_ns", 0) > 0
+                else None
+            ),
+            "receiver_time_s": self._finite_float(observable.rx_time),
+            "tow_s": self._finite_float(observable.tow_at_current_symbol_ms / 1000.0),
+            "system": str(observable.system or "G"),
+            "signal": str(observable.signal),
+            "satellite_id": _sat_label(sat_key),
+            "prn": int(observable.prn),
+            "channel": channel,
+            "fs": fs,
+            "prompt_i": prompt_i,
+            "prompt_q": prompt_q,
+            "prompt_magnitude": (
+                math.hypot(prompt_i, prompt_q)
+                if prompt_i is not None and prompt_q is not None
+                else None
+            ),
+            "prompt_phase_rads": (
+                math.atan2(prompt_q, prompt_i)
+                if prompt_i is not None and prompt_q is not None
+                else None
+            ),
+            "cn0_db_hz": self._finite_float(observable.cn0_db_hz),
+            "carrier_doppler_hz": self._finite_float(observable.carrier_doppler_hz),
+            "carrier_phase_rads": carrier_phase_rads,
+            "carrier_phase_cycles": (
+                carrier_phase_rads / (2.0 * math.pi)
+                if carrier_phase_rads is not None
+                else None
+            ),
+            "code_phase_samples": code_phase_samples,
+            "code_phase_seconds": (
+                code_phase_samples / fs
+                if code_phase_samples is not None and fs > 0
+                else None
+            ),
+            "tracking_sample_counter": int(observable.tracking_sample_counter),
+            "correlation_length_ms": int(observable.correlation_length_ms),
+            "pseudorange_m": self._finite_float(observable.pseudorange_m),
+            "valid_acquisition": bool(observable.flag_valid_acquisition),
+            "valid_symbol_output": bool(observable.flag_valid_symbol_output),
+            "valid_word": bool(observable.flag_valid_word),
+            "valid_pseudorange": bool(observable.flag_valid_pseudorange),
+            "pll_180_deg_phase_locked": bool(observable.flag_PLL_180_deg_phase_locked),
+            "cycle_slip": bool(observable.flag_cycle_slip),
+        }
+        try:
+            handle.write(json.dumps(fields, allow_nan=False, separators=(",", ":")) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            self._udp_monitor_stats["tracking_archive_write_errors"] = int(
+                self._udp_monitor_stats.get("tracking_archive_write_errors", 0)
+            ) + 1
+            previous = float(self._udp_parse_error_log_ts.get("tracking_archive", 0.0))
+            if (now - previous) >= 5.0:
+                self._udp_parse_error_log_ts["tracking_archive"] = now
+                self._err_log.warning("GNSS tracking-state archive write failed: %s", exc)
+            return
+        self._udp_monitor_stats["tracking_archive_rows"] = int(
+            self._udp_monitor_stats.get("tracking_archive_rows", 0)
+        ) + 1
 
     def _synchro_entry_from_message(
         self,
@@ -392,7 +506,26 @@ class UdpMonitorMixin:
             "udp_observables_packets": int(stats.get("observables_packets", 0)),
             "udp_tracking_packets": int(stats.get("tracking_packets", 0)),
             "udp_parse_errors": int(stats.get("parse_errors", 0)),
+            "tracking_state_archive_rows": int(stats.get("tracking_archive_rows", 0)),
+            "tracking_state_archive_write_errors": int(
+                stats.get("tracking_archive_write_errors", 0)
+            ),
         }
+        archive_path = getattr(self, "_tracking_state_log_path", None)
+        metrics["tracking_state_archive_path"] = (
+            None if archive_path is None else str(archive_path)
+        )
+        try:
+            metrics["tracking_state_archive_bytes"] = (
+                0 if archive_path is None else int(archive_path.stat().st_size)
+            )
+        except OSError:
+            metrics["tracking_state_archive_bytes"] = 0
+        metrics["tracking_state_session_id"] = getattr(
+            self,
+            "_runtime_session_id",
+            None,
+        )
         for key, output_key in (
             ("pvt_last_monotonic_s", "udp_pvt_age_s"),
             ("observables_last_monotonic_s", "udp_observables_age_s"),

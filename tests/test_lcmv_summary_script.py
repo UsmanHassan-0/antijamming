@@ -8,7 +8,10 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from tools.summarize_lcmv_run import estimate_jammer_only_suppression
+from tools.summarize_lcmv_run import (
+    estimate_jammer_only_suppression,
+    operator_marked_rf_budget,
+)
 
 
 def test_summarize_lcmv_run_parses_small_fake_logs(tmp_path) -> None:
@@ -217,3 +220,98 @@ def test_jammer_only_estimate_requires_and_uses_marked_windows() -> None:
     assert estimate["jammer_before_power_linear"] == pytest.approx(20.0)
     assert estimate["jammer_after_power_linear"] == pytest.approx(5.0)
     assert estimate["suppression_db"] == pytest.approx(10.0 * math.log10(4.0))
+
+
+def test_jammer_only_estimate_prefers_same_covariance_runtime_samples() -> None:
+    start = datetime(2026, 7, 4, 5, 44, 0)
+    operator_events = [
+        (start, {"event": "jammer_off"}),
+        (start + timedelta(seconds=2), {"event": "jammer_on"}),
+        (start + timedelta(seconds=5), {"event": "jammer_off"}),
+    ]
+    spatial_events = [
+        (
+            start + timedelta(seconds=1),
+            {
+                "jammer_only_suppression_estimate_available": True,
+                "jammer_only_suppression_db": 99.0,
+                "jammer_only_power_before_uniform_linear": 100.0,
+                "jammer_only_power_after_applied_linear": 1.0,
+            },
+        ),
+        (
+            start + timedelta(seconds=3),
+            {
+                "jammer_only_suppression_estimate_available": True,
+                "jammer_only_suppression_db": 10.0,
+                "jammer_only_power_before_uniform_linear": 10.0,
+                "jammer_only_power_after_applied_linear": 1.0,
+            },
+        ),
+        (
+            start + timedelta(seconds=4),
+            {
+                "jammer_only_suppression_estimate_available": True,
+                "jammer_only_suppression_db": 20.0,
+                "jammer_only_power_before_uniform_linear": 100.0,
+                "jammer_only_power_after_applied_linear": 1.0,
+            },
+        ),
+        (
+            start + timedelta(seconds=6),
+            {
+                "jammer_only_suppression_estimate_available": True,
+                "jammer_only_suppression_db": 88.0,
+                "jammer_only_power_before_uniform_linear": 100.0,
+                "jammer_only_power_after_applied_linear": 1.0,
+            },
+        ),
+    ]
+
+    estimate = estimate_jammer_only_suppression(operator_events, spatial_events)
+
+    assert estimate["available"] is True
+    assert estimate["method"].startswith("same-covariance")
+    assert estimate["sample_count"] == 2
+    assert estimate["suppression_db"] == pytest.approx(10.0 * math.log10(55.0))
+    assert estimate["mean_per_snapshot_suppression_db"] == pytest.approx(15.0)
+    assert estimate["jammer_before_power_linear"] == pytest.approx(55.0)
+    assert estimate["jammer_after_power_linear"] == pytest.approx(1.0)
+
+
+def test_operator_marked_rf_budget_uses_explicit_attenuation() -> None:
+    start = datetime(2026, 7, 4, 5, 44, 0)
+    manifest = {
+        "center_freq_hz": 1_575_420_000.0,
+        "jammer_distance_m": 4.2672,
+        "bladeRF_distance_m": 3.4798,
+        "jammer_l1_4mhz_avg_dbm": 9.51,
+        "jammer_peak_dbm": 21.4,
+        "bladeRF_tx_power_dbm_est": -42.2691,
+        "jammer_tx_antenna_gain_dbi": 2.0,
+        "bladeRF_tx_antenna_gain_dbi": 2.0,
+        "rx_antenna_gain_dbi": 5.0,
+        "jammer_tx_cable_loss_db": 0.0,
+        "bladeRF_tx_cable_loss_db": 0.0,
+        "pre_bpf_cable_loss_db": 1.0,
+        "bpf_l1_loss_db": 2.0,
+        "lna_gain_db": 50.0,
+        "lna_input_p1db_dbm": -30.2,
+        "dc_block_loss_db": 0.5,
+        "post_lna_cable_loss_db": 1.0,
+        "twinrx_max_rf_input_dbm": 10.0,
+    }
+    events = [
+        (
+            start,
+            {"event": "jammer_on", "attenuation_db": 30.0},
+        )
+    ]
+
+    budget, basis = operator_marked_rf_budget(manifest, events)
+
+    assert "explicit jammer_on marker" in basis
+    assert budget["jammer_avg_usrp_rf_input_ideal_dbm"] == pytest.approx(
+        -16.989, abs=0.002
+    )
+    assert budget["jammer_peak_usrp_above_twinrx_max"] is False

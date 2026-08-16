@@ -327,6 +327,60 @@ def test_beamformer_weight_ramp_preserves_measured_u1_response_each_chunk() -> N
     assert np.allclose(runtime._get_beamformer_weights_copy(), target)
 
 
+def test_covariance_target_update_does_not_restart_active_weight_ramp() -> None:
+    cfg = StreamConfig(
+        phase_correction_vector=None,
+        lcmv_weight_transition_s=(3.0 * 32768.0 / 4_000_000.0),
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    first_target = np.array(
+        [0.8 + 0.1j, 0.6 - 0.2j, 1.1 + 0.3j, 0.7 - 0.1j],
+        dtype=np.complex128,
+    )
+    newer_target = np.array(
+        [0.5 - 0.2j, 1.2 + 0.1j, 0.4 + 0.5j, 0.9 - 0.3j],
+        dtype=np.complex128,
+    )
+    chunk = np.ones((4, 16), dtype=np.complex64)
+
+    runtime._schedule_beamformer_weights(
+        first_target,
+        reason="first covariance target",
+        preempt_active_transition=False,
+    )
+    runtime._gnss_output_vector(chunk)
+    one_chunk = runtime._beamformer_transition_payload()
+    assert one_chunk["weight_transition_completed_chunks"] == 1
+
+    returned_target = runtime._schedule_beamformer_weights(
+        newer_target,
+        reason="new covariance target while ramping",
+        preempt_active_transition=False,
+    )
+    deferred = runtime._beamformer_transition_payload()
+    assert np.allclose(returned_target, first_target)
+    assert deferred["weight_transition_completed_chunks"] == 1
+    assert deferred["weight_transition_total_chunks"] == 3
+    assert np.allclose(runtime._target_beamformer_weights, first_target)
+
+    runtime._gnss_output_vector(chunk)
+    runtime._gnss_output_vector(chunk)
+    completed = runtime._beamformer_transition_payload()
+    assert completed["weight_transition_active"] is False
+    assert np.allclose(runtime._get_beamformer_weights_copy(), first_target)
+
+    runtime._schedule_beamformer_weights(
+        newer_target,
+        reason="new covariance target after completed ramp",
+        preempt_active_transition=False,
+    )
+    next_ramp = runtime._beamformer_transition_payload()
+    assert next_ramp["weight_transition_active"] is True
+    assert next_ramp["weight_transition_completed_chunks"] == 0
+    assert np.allclose(runtime._beamformer_transition_start_weights, first_target)
+    assert np.allclose(runtime._target_beamformer_weights, newer_target)
+
+
 def test_worker_gnss_output_uses_uniform_combiner_by_default() -> None:
     cfg = StreamConfig(phase_correction_vector=None)
     worker = StreamWorker(cfg, _build_loggers())
@@ -536,7 +590,6 @@ def test_backend_lcmv_test_valid_music_bearing_updates_gnss_weights() -> None:
 def test_backend_lcmv_protects_bladerf_bearing_from_nulling() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
-        lcmv_desired_loss_guard_enabled=True,
         lcmv_preserve_constraint_mode="uniform",
         lcmv_target_selection_mode="strongest_music_peak",
         phase_correction_vector=None,
@@ -561,11 +614,10 @@ def test_backend_lcmv_protects_bladerf_bearing_from_nulling() -> None:
     assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
 
 
-def test_backend_lcmv_jammer_bearing_bypasses_desired_loss_guard() -> None:
+def test_backend_lcmv_jammer_bearing_keeps_desired_loss_diagnostic_only() -> None:
     rng = np.random.default_rng(241)
     cfg = StreamConfig(
         lcmv_test_enabled=True,
-        lcmv_desired_loss_guard_enabled=True,
         lcmv_preserve_constraint_mode="uniform",
         lcmv_target_selection_mode="strongest_music_peak",
         phase_correction_vector=None,
@@ -598,59 +650,14 @@ def test_backend_lcmv_jammer_bearing_bypasses_desired_loss_guard() -> None:
     assert status["mode"] == "on"
     assert spatial["lcmv_target_classification"] == "expected_jammer"
     assert spatial["lcmv_target_confirmed_jammer_bearing"] is True
-    assert spatial["lcmv_desired_loss_guard_enforced"] is False
-    assert spatial["active_desired_loss_guard_enforced"] is False
-    assert (
-        spatial["candidate_covariance_lcmv_ideal_desired_loss_vs_reference_db"]
-        > cfg.lcmv_max_desired_loss_db
-    )
-    assert spatial["candidate_covariance_lcmv_ideal_desired_loss_guard_enforced"] is False
+    assert spatial["candidate_covariance_lcmv_ideal_desired_loss_vs_reference_db"] > 6.0
     assert "covariance_lcmv_ideal" in spatial["candidate_methods_valid"]
 
 
-def test_backend_lcmv_unclassified_bearing_keeps_desired_loss_guard() -> None:
+def test_backend_lcmv_unclassified_bearing_does_not_gate_on_desired_loss() -> None:
     rng = np.random.default_rng(242)
     cfg = StreamConfig(
         lcmv_test_enabled=True,
-        lcmv_desired_loss_guard_enabled=True,
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
-        phase_correction_vector=None,
-        experiment={
-            "bladeRF_expected_bearing_deg_min": 280.0,
-            "bladeRF_expected_bearing_deg_max": 300.0,
-            "jammer_expected_bearing_deg_min": 160.0,
-            "jammer_expected_bearing_deg_max": 175.0,
-        },
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    internal_angle = 200.0
-    display_bearing = internal_angle_to_operator_bearing_deg(internal_angle)
-    source_vector = steering_vector(
-        np.asarray([internal_angle], dtype=np.float64),
-        cfg.center_freq_hz,
-        cfg.array_spacing_m,
-    ).reshape(-1)
-    runtime._healthy_reference_vector = source_vector / np.linalg.norm(source_vector)
-    source = rng.standard_normal(1024) + 1j * rng.standard_normal(1024)
-    noise = 0.002 * (
-        rng.standard_normal((4, 1024)) + 1j * rng.standard_normal((4, 1024))
-    )
-    x = source_vector[:, None] * source[None, :] + noise
-
-    runtime._update_lcmv_test_from_music(x, internal_angle, display_bearing)
-
-    status = runtime._lcmv_status_copy()
-    assert status["mode"] == "fallback"
-    assert "desired_loss_db" in status["fallback_reason"]
-    assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
-
-
-def test_backend_lcmv_disabled_desired_loss_guard_keeps_lcmv_active() -> None:
-    rng = np.random.default_rng(243)
-    cfg = StreamConfig(
-        lcmv_test_enabled=True,
-        lcmv_desired_loss_guard_enabled=False,
         lcmv_preserve_constraint_mode="uniform",
         lcmv_target_selection_mode="strongest_music_peak",
         phase_correction_vector=None,
@@ -684,10 +691,7 @@ def test_backend_lcmv_disabled_desired_loss_guard_keeps_lcmv_active() -> None:
     assert status["active_lcmv_fallback_used"] is False
     assert status["active_lcmv_fallback_reason"] == ""
     assert spatial["lcmv_target_classification"] == "unclassified"
-    assert spatial["lcmv_desired_loss_guard_enabled"] is False
-    assert spatial["lcmv_desired_loss_guard_enforced"] is False
-    assert spatial["active_desired_loss_guard_enforced"] is False
-    assert spatial["active_desired_loss_vs_reference_db"] > cfg.lcmv_max_desired_loss_db
+    assert spatial["active_desired_loss_vs_reference_db"] > 6.0
     assert "covariance_lcmv_ideal" in spatial["candidate_methods_valid"]
 
 
@@ -1023,7 +1027,6 @@ def test_realtime_lcmv_preserves_frozen_bladerf_angle_and_nulls_other_peak() -> 
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
         lcmv_realtime_preserve_guard_deg=20.0,
-        lcmv_desired_loss_guard_enabled=False,
         lcmv_weight_transition_s=0.0,
         phase_correction_vector=None,
     )
@@ -1132,6 +1135,41 @@ def test_healthy_reference_updates_during_lcmv_off_healthy_baseline() -> None:
     assert runtime._healthy_reference_vector is not None
 
 
+def test_healthy_reference_does_not_treat_music_local_peaks_as_emitters() -> None:
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        expected_sources=1,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    runtime._gnss_bridge = SimpleNamespace(
+        snapshot=lambda: {
+            "pvt_current": True,
+            "pvt_gui_status": "FIX",
+            "pvt_observation_count": 7,
+            "avg_tracking_cno_db_hz": 45.3,
+        }
+    )
+    runtime._latest_source_count_diagnostics = {
+        "source_estimate_gap": 1,
+        "peak_count": 4,
+        "source_effective_rank": 2.66,
+    }
+    u1 = np.ones((4,), dtype=np.complex128) / 2.0
+    x = np.tile(u1[:, None], (1, 64))
+
+    payload = runtime._update_healthy_reference_from_chunk(
+        corrected_chunk=x,
+        music_internal_deg=307.0,
+        music_bearing_deg=143.0,
+        u1=u1,
+    )
+
+    assert payload["suspicious_source_structure"] is False
+    assert payload["healthy_reference_update_allowed"] is True
+    assert payload["healthy_reference_updated"] is True
+
+
 def test_healthy_reference_freezes_during_lcmv_on_even_with_good_gnss() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
@@ -1192,8 +1230,11 @@ def test_healthy_reference_does_not_treat_no_fix_as_fix() -> None:
     assert "pvt_not_healthy" in payload["healthy_reference_freeze_reasons"]
 
 
-def test_backend_candidate_payload_computes_noise_gain_and_desired_loss() -> None:
-    cfg = StreamConfig(phase_correction_vector=None)
+def test_backend_candidate_payload_keeps_desired_loss_diagnostic_only() -> None:
+    cfg = StreamConfig(
+        phase_correction_vector=None,
+        lcmv_min_predicted_jammer_suppression_db=3.0,
+    )
     runtime = BackendRuntime(cfg, _build_loggers())
     weights = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)
     reference = np.ones((4,), dtype=np.complex128)
@@ -1223,4 +1264,52 @@ def test_backend_candidate_payload_computes_noise_gain_and_desired_loss() -> Non
     assert payload["candidate_test_desired_loss_vs_reference_db"] == pytest.approx(
         10.0 * np.log10(4.0 / 0.25)
     )
-    assert "desired_loss_db" in rejection
+    assert rejection == ""
+
+
+def test_jammer_excess_covariance_reports_applied_and_target_suppression() -> None:
+    cfg = StreamConfig(phase_correction_vector=None)
+    runtime = BackendRuntime(cfg, _build_loggers())
+    jammer_vector = steering_vector(
+        np.asarray([150.0], dtype=np.float64),
+        cfg.center_freq_hz,
+        cfg.array_spacing_m,
+    ).reshape(-1)
+    jammer_vector /= np.linalg.norm(jammer_vector)
+    baseline = 0.01 * np.eye(4, dtype=np.complex128)
+    current = baseline + 10.0 * np.outer(jammer_vector, jammer_vector.conj())
+    target = covariance_lcmv_vector_null_weights(
+        covariance=current,
+        null_vector=jammer_vector,
+        preserve_vector=np.ones((4,), dtype=np.complex128),
+    ).weights
+    runtime._realtime_preserve_frozen_covariance = baseline
+    runtime._set_beamformer_weights(target)
+
+    payload = runtime._jammer_excess_covariance_payload(
+        current_covariance=current,
+        uniform_weights_vector=uniform_weights(4),
+        target_weights=target,
+        jammer_latched=True,
+    )
+
+    assert payload["jammer_only_suppression_estimate_available"] is True
+    assert payload["jammer_only_suppression_db"] > 100.0
+    assert payload["jammer_only_target_suppression_db"] > 100.0
+    assert payload["jammer_only_power_before_uniform_linear"] > 0.0
+    assert payload["jammer_only_power_after_applied_linear"] >= 0.0
+
+
+def test_jammer_excess_covariance_is_unavailable_before_jammer_latch() -> None:
+    cfg = StreamConfig(phase_correction_vector=None)
+    runtime = BackendRuntime(cfg, _build_loggers())
+    payload = runtime._jammer_excess_covariance_payload(
+        current_covariance=np.eye(4, dtype=np.complex128),
+        uniform_weights_vector=uniform_weights(4),
+        target_weights=uniform_weights(4),
+        jammer_latched=False,
+    )
+
+    assert payload["jammer_only_suppression_estimate_available"] is False
+    assert payload["jammer_only_suppression_db"] is None
+    assert "not latched" in payload["jammer_only_suppression_unavailable_reason"]

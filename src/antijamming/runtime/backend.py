@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -21,7 +22,12 @@ from antijamming.gnss.sdr_bridge.constants import (
     PVT_LOW_USED_SATELLITE_COUNT,
 )
 from antijamming.radio.transport import collect_host_transport_report
-from antijamming.logging import reset_session_logs
+from antijamming.logging import (
+    RuntimeLogSession,
+    finalize_session_logs,
+    record_event,
+    reset_session_logs,
+)
 from .latest_queue import put_latest
 from .ui_metrics import RuntimeUiMetrics
 from .work_items import PhaseResult, PhaseWorkItem
@@ -93,9 +99,19 @@ class BackendRuntime:
         self._analysis_log = loggers.get("analysis", loggers["doa"])
         self._lcmv_pattern_log = loggers.get("lcmv_pattern", self._analysis_log)
         self._spatial_vector_log = loggers.get("spatial_vector", self._analysis_log)
+        self._runtime_evidence_log = loggers.get("runtime_evidence", self._analysis_log)
         self._experiment_manifest = manifest_from_config(config)
         self._rf_budget = compute_rf_budget(self._experiment_manifest)
         self._phase_calibration_metadata = self._load_phase_calibration_metadata()
+        self._log_session: RuntimeLogSession | None = None
+        self._session_event_lock = threading.Lock()
+        self._stream_stop_event_recorded = False
+        self._operator_rf_state: dict[str, object] = {
+            "jammer": "unknown",
+            "bladeRF": "unknown",
+            "attenuation_db": None,
+            "bladeRF_gain_db": None,
+        }
         self._running = False
         self._thread: threading.Thread | None = None
         self._angle_scan = config.angle_scan_spec()
@@ -115,6 +131,8 @@ class BackendRuntime:
         self._spatial_diag_seq = 0
         self._last_lcmv_heavy_diag_ts: float | None = None
         self._last_full_angle_analysis_ts: float | None = None
+        self._last_runtime_evidence_log_ts = 0.0
+        self._last_automatic_state_key: tuple[object, ...] | None = None
         self._latest_lcmv_heavy_diag_payload: dict[str, object] = {
             "heavy_diagnostics_interval_s": self._json_float(
                 getattr(config, "lcmv_heavy_diagnostics_interval_s", 1.0)
@@ -314,6 +332,8 @@ class BackendRuntime:
         self._last_lcmv_log_ts = 0.0
         self._last_lcmv_heavy_diag_ts = None
         self._last_full_angle_analysis_ts = None
+        self._last_runtime_evidence_log_ts = 0.0
+        self._last_automatic_state_key = None
         self._latest_lcmv_heavy_diag_payload = {
             "heavy_diagnostics_interval_s": self._json_float(
                 getattr(self._config, "lcmv_heavy_diagnostics_interval_s", 1.0)
@@ -377,8 +397,17 @@ class BackendRuntime:
         self._reset_lcmv_test_for_run()
         try:
             self._emit_status("Preparing session logs")
-            reset_session_logs(self._config.log_dir, self._loggers)
+            self._log_session = reset_session_logs(
+                self._config.log_dir,
+                self._loggers,
+            )
+            self._stream_stop_event_recorded = False
             self._log_experiment_startup_context()
+            self._record_runtime_event(
+                "stream_start",
+                source="backend",
+                notes="Start command accepted; hardware and GNSS-SDR initialization begins",
+            )
             self._loggers["app"].info(
                 "Runtime startup: gnss_combiner=uniform_array_sum"
             )
@@ -396,7 +425,20 @@ class BackendRuntime:
             gnss_ok = False
             if self._config.gnss_sdr_enable:
                 self._emit_status("Starting GNSS-SDR")
-                self._gnss_bridge = GnssSdrBridge(self._config, self._loggers)
+                self._gnss_bridge = GnssSdrBridge(
+                    self._config,
+                    self._loggers,
+                    session_id=(
+                        self._log_session.session_id
+                        if self._log_session is not None
+                        else None
+                    ),
+                    session_dir=(
+                        self._log_session.session_dir
+                        if self._log_session is not None
+                        else None
+                    ),
+                )
                 gnss_ok = self._gnss_bridge.start()
             else:
                 self._emit_status("GNSS-SDR disabled")
@@ -580,12 +622,22 @@ class BackendRuntime:
                 self._startup_timeout_count,
                 self._rx_clipping_suspected_count,
             )
+            self._record_stream_stop_event_once(source="backend_finalizer")
             for logger in self._loggers.values():
                 for h in list(logger.handlers):
                     try:
                         h.flush()
                     except Exception:
                         pass
+            finalize_session_logs(
+                self._config.log_dir,
+                self._log_session,
+                self._loggers,
+                stop_reason=self._stop_reason,
+                outcome=(
+                    "failed" if self._stop_reason.startswith("exception:") else "stopped"
+                ),
+            )
 
     def _log_experiment_startup_context(self) -> None:
         manifest = dict(self._experiment_manifest)
@@ -775,12 +827,6 @@ class BackendRuntime:
             ),
             "lcmv_max_white_noise_gain_db": self._json_float(
                 getattr(self._config, "lcmv_max_white_noise_gain_db", 15.0)
-            ),
-            "lcmv_desired_loss_guard_enabled": bool(
-                getattr(self._config, "lcmv_desired_loss_guard_enabled", False)
-            ),
-            "lcmv_max_desired_loss_db": self._json_float(
-                getattr(self._config, "lcmv_max_desired_loss_db", 6.0)
             ),
             "lcmv_min_predicted_jammer_suppression_db": self._json_float(
                 getattr(self._config, "lcmv_min_predicted_jammer_suppression_db", 3.0)
@@ -1009,6 +1055,10 @@ class BackendRuntime:
 
     def stop(self, reason: str = "normal stop") -> None:
         self._set_stop_reason(reason)
+        # Capture the last live GNSS/LCMV/power snapshot before the bridge and
+        # device are detached. The finalizer calls the same guarded helper for
+        # exception paths that never enter this method.
+        self._record_stream_stop_event_once(source="backend_control")
         self._running = False
         self._signal_dsp_shutdown()
         with self._gnss_failure_lock:
@@ -1033,7 +1083,348 @@ class BackendRuntime:
         self._expected_sources = normalized
         self._config.expected_sources = normalized
         self._loggers["app"].info("Runtime action: expected_sources=%d", normalized)
+        self._record_runtime_event(
+            "expected_sources_changed",
+            source="backend_control",
+            notes=f"MUSIC expected sources set to {normalized}",
+        )
         self._emit_status(f"MUSIC sources: {normalized}")
+
+    def mark_rf_event(
+        self,
+        event: str,
+        *,
+        attenuation_db: float | None = None,
+        bladeRF_gain_db: float | None = None,
+        notes: str = "",
+        source: str = "operator",
+    ) -> dict[str, object]:
+        """Record operator-confirmed physical RF state with runtime context."""
+
+        normalized = str(event).strip()
+        if normalized == "jammer_on":
+            self._operator_rf_state["jammer"] = "on"
+        elif normalized == "jammer_off":
+            self._operator_rf_state["jammer"] = "off"
+        elif normalized == "bladeRF_on":
+            self._operator_rf_state["bladeRF"] = "on"
+        elif normalized == "bladeRF_off":
+            self._operator_rf_state["bladeRF"] = "off"
+        if attenuation_db is not None:
+            self._operator_rf_state["attenuation_db"] = float(attenuation_db)
+        if bladeRF_gain_db is not None:
+            self._operator_rf_state["bladeRF_gain_db"] = float(bladeRF_gain_db)
+        payload = self._record_runtime_event(
+            normalized,
+            source=source,
+            attenuation_db=attenuation_db,
+            bladeRF_gain_db=bladeRF_gain_db,
+            notes=notes,
+        )
+        self._loggers["app"].info(
+            "Operator RF marker: event=%s jammer=%s bladeRF=%s attenuation_db=%s "
+            "bladeRF_gain_db=%s source=%s notes=%s",
+            normalized,
+            self._operator_rf_state.get("jammer"),
+            self._operator_rf_state.get("bladeRF"),
+            self._operator_rf_state.get("attenuation_db"),
+            self._operator_rf_state.get("bladeRF_gain_db"),
+            source,
+            notes or "--",
+        )
+        return payload
+
+    def _event_context_snapshot(
+        self,
+        gnss_snapshot: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        if gnss_snapshot is not None:
+            gnss = dict(gnss_snapshot)
+        else:
+            bridge = self._gnss_bridge
+            try:
+                gnss = bridge.snapshot() if bridge is not None else {}
+            except Exception as exc:
+                gnss = {"snapshot_error": str(exc)}
+        with self._results_lock:
+            spatial = dict(self._latest_spatial_vector_diagnostics)
+            raw_power = dict(self._latest_raw_power_metrics)
+            calibrated_power = dict(self._latest_cal_power_metrics)
+            output_power = dict(self._latest_output_power_metrics)
+            phase_offsets_raw = np.array(self._latest_phase_offsets_raw, copy=True)
+            phase_offsets_calibrated = np.array(
+                self._latest_phase_offsets_calibrated,
+                copy=True,
+            )
+            source_count = dict(self._latest_source_count_diagnostics)
+            doa_internal = self._json_float(self._latest_doa_deg)
+        lcmv = self._lcmv_status_copy()
+        beamformer = self._beamformer_evidence_payload()
+        inference = self._automatic_rf_inference(spatial)
+        context = {
+            "operator_rf_state": dict(self._operator_rf_state),
+            "configured_receiver": {
+                "usrp_rx_gain_db": self._json_float(self._config.gain_db),
+                "center_freq_hz": self._json_float(self._config.center_freq_hz),
+                "sample_rate_sps": self._json_float(self._config.sample_rate),
+                "rx_bandwidth_hz": self._json_float(
+                    self._config.usrp_rx_bandwidth_hz
+                ),
+                "channels": [int(channel) for channel in self._config.channels],
+            },
+            "stream_running": bool(self._running),
+            "stream_elapsed_s": self._json_float(
+                time.monotonic() - self._stream_start_ts
+                if self._stream_start_ts > 0.0
+                else None
+            ),
+            "raw_chunk_count": int(self._raw_chunk_count),
+            "physical_state_inference": inference,
+            "lcmv_enabled": bool(self._lcmv_test_enabled),
+            "lcmv_mode": lcmv.get("mode"),
+            "active_lcmv_method": lcmv.get("active_lcmv_method"),
+            "active_lcmv_weights_source": lcmv.get("active_lcmv_weights_source"),
+            "lcmv_fallback_reason": lcmv.get("fallback_reason"),
+            "weight_transition": {
+                key: beamformer.get(key)
+                for key in (
+                    "weight_transition_active",
+                    "weight_transition_duration_s",
+                    "weight_transition_total_chunks",
+                    "weight_transition_completed_chunks",
+                    "weight_transition_progress",
+                    "weight_transition_reason",
+                    "weight_transition_current_weights",
+                    "weight_transition_target_weights",
+                )
+            },
+            "beamformer": beamformer,
+            "array_alignment": {
+                "phase_offsets_raw_deg": self._json_float_list(phase_offsets_raw),
+                "phase_offsets_calibrated_deg": self._json_float_list(
+                    phase_offsets_calibrated
+                ),
+                "calibration_correction_mode": str(
+                    self._config.calibration_correction_mode
+                ),
+            },
+            "source_count": source_count,
+            "doa_internal_deg": doa_internal,
+            "doa_display_deg": self._json_float(
+                self._internal_angle_to_display(doa_internal)
+                if doa_internal is not None
+                else None
+            ),
+            "spatial": {
+                key: spatial.get(key)
+                for key in (
+                    "sequence",
+                    "run_state_label",
+                    "run_state_reason",
+                    "run_state_confidence",
+                    "jammer_confidence_score",
+                    "healthy_confidence_score",
+                    "music_internal_angle_deg",
+                    "music_display_bearing_deg",
+                    "lcmv_jammer_detected_latched",
+                    "lcmv_jammer_activation_armed",
+                    "lcmv_jammer_activation_evidence_now",
+                    "lcmv_jammer_activation_input_power_jump_db",
+                    "lcmv_jammer_activation_generalized_gain_db",
+                    "realtime_bladerf_angle_frozen",
+                    "realtime_bladerf_tracker_stable",
+                    "realtime_bladerf_frozen_display_deg",
+                    "jammer_only_suppression_estimate_available",
+                    "jammer_only_suppression_db",
+                    "jammer_only_power_before_uniform_linear",
+                    "jammer_only_power_after_applied_linear",
+                )
+            },
+            "powers": {
+                **raw_power,
+                **calibrated_power,
+                **output_power,
+            },
+            "gnss": {
+                key: gnss.get(key)
+                for key in (
+                    "receiver_time_s",
+                    "pvt_output_seen",
+                    "pvt_current",
+                    "pvt_observation_count",
+                    "tracking_count",
+                    "tracking_satellites",
+                    "stable_tracking_satellites",
+                    "used_in_fix_count",
+                    "used_in_fix_satellites",
+                    "avg_tracking_cno_db_hz",
+                    "tracking_state_archive_path",
+                    "tracking_state_archive_rows",
+                    "udp_tracking_age_s",
+                    "stale_reason",
+                    "accuracy",
+                )
+            },
+        }
+        return self._json_ready_mapping(context)
+
+    def _automatic_rf_inference(
+        self,
+        spatial: dict[str, object],
+    ) -> dict[str, object]:
+        """Describe receiver evidence without claiming physical switch truth."""
+
+        run_state = str(spatial.get("run_state_label", "unknown"))
+        jammer_latched = bool(spatial.get("lcmv_jammer_detected_latched", False))
+        activation_now = bool(
+            spatial.get("lcmv_jammer_activation_evidence_now", False)
+        )
+        if activation_now:
+            jammer_state = "likely_present"
+            jammer_basis = "LCMV power-plus-generalized-covariance activation gate"
+        elif run_state == "jammer_like_event":
+            jammer_state = "jammer_like_change"
+            jammer_basis = "one-run covariance/power/GNSS inference"
+        elif jammer_latched:
+            jammer_state = "no_current_evidence_latch_retained"
+            jammer_basis = (
+                "the activation latch records an earlier event, but the current "
+                "power-plus-covariance gates no longer both pass"
+            )
+        elif run_state == "healthy_baseline":
+            jammer_state = "not_detected"
+            jammer_basis = "healthy uniform-combiner baseline"
+        else:
+            jammer_state = "unknown"
+            jammer_basis = "insufficient or mixed receiver evidence"
+
+        desired_signature = bool(
+            spatial.get("realtime_bladerf_tracker_stable", False)
+            or spatial.get("realtime_bladerf_angle_frozen", False)
+            or spatial.get("healthy_reference_available", False)
+        )
+        return {
+            "jammer_inferred_state": jammer_state,
+            "jammer_inference_basis": jammer_basis,
+            "bladeRF_inferred_state": (
+                "desired_spatial_signature_available"
+                if desired_signature
+                else "unknown"
+            ),
+            "physical_switch_truth_available": False,
+            "warning": (
+                "Receiver inference cannot uniquely identify an external emitter or "
+                "prove a physical jammer/bladeRF switch position"
+            ),
+        }
+
+    def _maybe_log_runtime_evidence(
+        self,
+        gnss_snapshot: dict[str, object],
+    ) -> None:
+        """Persist synchronized automatic evidence at the GUI/DSP cadence."""
+
+        now = time.monotonic()
+        interval_s = max(0.1, float(self._config.ui_update_interval_s))
+        if (now - self._last_runtime_evidence_log_ts) < interval_s:
+            return
+        self._last_runtime_evidence_log_ts = now
+        wall_time_ns = time.time_ns()
+        session = self._log_session
+        context = self._event_context_snapshot(gnss_snapshot)
+        common = {
+            "schema_version": 1,
+            "timestamp_utc": datetime.fromtimestamp(
+                wall_time_ns / 1e9,
+                timezone.utc,
+            ).isoformat(),
+            "timestamp_local": datetime.fromtimestamp(
+                wall_time_ns / 1e9,
+            ).astimezone().isoformat(),
+            "wall_time_unix_ns": wall_time_ns,
+            "monotonic_ns": time.monotonic_ns(),
+            "session_id": session.session_id if session is not None else None,
+            "session_elapsed_s": session.elapsed_s() if session is not None else None,
+        }
+        snapshot = {
+            **common,
+            "event": "automatic_runtime_evidence_snapshot",
+            "context": context,
+        }
+        self._runtime_evidence_log.info(
+            "%s",
+            json.dumps(snapshot, separators=(",", ":"), allow_nan=False),
+        )
+
+        inference = context.get("physical_state_inference", {})
+        beamformer = context.get("beamformer", {})
+        state_key = (
+            context.get("lcmv_enabled"),
+            context.get("lcmv_mode"),
+            context.get("active_lcmv_method"),
+            inference.get("jammer_inferred_state")
+            if isinstance(inference, dict)
+            else None,
+            context.get("spatial", {}).get("run_state_label")
+            if isinstance(context.get("spatial"), dict)
+            else None,
+            beamformer.get("weight_transition_active")
+            if isinstance(beamformer, dict)
+            else None,
+            beamformer.get("weight_transition_reason")
+            if isinstance(beamformer, dict)
+            else None,
+        )
+        if state_key != self._last_automatic_state_key:
+            transition = {
+                **common,
+                "event": "automatic_runtime_state_transition",
+                "previous_state_key": self._last_automatic_state_key,
+                "current_state_key": state_key,
+                "context": context,
+            }
+            self._runtime_evidence_log.info(
+                "%s",
+                json.dumps(transition, separators=(",", ":"), allow_nan=False),
+            )
+            self._last_automatic_state_key = state_key
+
+    def _record_runtime_event(
+        self,
+        event: str,
+        *,
+        source: str,
+        attenuation_db: float | None = None,
+        bladeRF_gain_db: float | None = None,
+        notes: str = "",
+    ) -> dict[str, object]:
+        session = self._log_session
+        return record_event(
+            self._config.log_dir,
+            event,
+            source=source,
+            attenuation_db=attenuation_db,
+            bladeRF_gain_db=bladeRF_gain_db,
+            notes=notes,
+            context=self._event_context_snapshot(),
+            session_id=session.session_id if session is not None else None,
+            session_elapsed_s=session.elapsed_s() if session is not None else None,
+            # Unit fixtures and pre-start backend objects have no owned session.
+            # They may exercise controls, but must not append synthetic events
+            # into an unrelated active hardware run.
+            append_current_session=session is not None,
+        )
+
+    def _record_stream_stop_event_once(self, *, source: str) -> None:
+        with self._session_event_lock:
+            if self._stream_stop_event_recorded or self._log_session is None:
+                return
+            self._stream_stop_event_recorded = True
+        self._record_runtime_event(
+            "stream_stop",
+            source=source,
+            notes=self._stop_reason,
+        )
 
     def _reset_realtime_preserve_tracker_locked(self, reason: str) -> None:
         self._realtime_preserve_angle_history.clear()
@@ -1379,6 +1770,11 @@ class BackendRuntime:
                 "lcmv_test action=operator_toggle enabled=False mode=off "
                 "weights=uniform_array_sum"
             )
+            self._record_runtime_event(
+                "lcmv_off",
+                source="backend_control",
+                notes="LCMV disabled; smooth transition to uniform weights scheduled",
+            )
             self._emit_status("LCMV Test Nulling: OFF")
             return
 
@@ -1405,6 +1801,14 @@ class BackendRuntime:
             "weight_transition=armed_uniform_waiting_for_valid_target"
             ,
             frozen_reason or "waiting_for_music_peak",
+        )
+        self._record_runtime_event(
+            "lcmv_on",
+            source="backend_control",
+            notes=(
+                frozen_reason
+                or "LCMV armed in uniform fallback while waiting for a valid target"
+            ),
         )
         self._emit_status("LCMV Test Nulling: ON")
 
@@ -2208,6 +2612,7 @@ class BackendRuntime:
         weights: np.ndarray,
         *,
         reason: str,
+        preempt_active_transition: bool = True,
     ) -> np.ndarray:
         selected = np.asarray(weights, dtype=np.complex128).reshape(-1)
         if selected.size == 0:
@@ -2230,6 +2635,18 @@ class BackendRuntime:
                     atol=1e-9,
                 )
             ):
+                return np.array(self._target_beamformer_weights, copy=True)
+            transition_active = (
+                self._beamformer_transition_total_chunks > 0
+                and self._beamformer_transition_completed_chunks
+                < self._beamformer_transition_total_chunks
+            )
+            if transition_active and not preempt_active_transition:
+                # Covariance/DoA updates arrive several times per second. A
+                # fresh full-duration ramp for every update can keep the
+                # applied weights permanently near the start of the ramp.
+                # Finish the current target first; the next DoA update after
+                # completion will schedule the newest covariance target.
                 return np.array(self._target_beamformer_weights, copy=True)
             chunk_duration_s = float(self._config.samples_per_chunk) / max(
                 float(self._config.sample_rate),
@@ -2302,9 +2719,51 @@ class BackendRuntime:
                 "weight_transition_target_weights": complex_vector_payload(target),
             }
 
+    def _beamformer_evidence_payload(self) -> dict[str, object]:
+        """Return the exact logical and effective GNSS combiner state."""
+
+        with self._beamformer_lock:
+            total = int(self._beamformer_transition_total_chunks)
+            completed = int(self._beamformer_transition_completed_chunks)
+            active = total > 0 and completed < total
+            progress = completed / float(total) if total > 0 else 1.0
+            current = np.array(self._latest_beamformer_weights, copy=True)
+            target = np.array(self._target_beamformer_weights, copy=True)
+            start = np.array(self._beamformer_transition_start_weights, copy=True)
+            effective = np.array(self._latest_gnss_effective_weights, copy=True)
+            reason = str(self._beamformer_transition_reason)
+        uniform = uniform_weights(len(self._config.channels))
+        return {
+            "combiner_equation": "y[n] = w^H C x[n]",
+            "uniform_combiner_convention": "raw channel sum; logical weights are all 1+0j",
+            "uniform_logical_weights": complex_vector_payload(uniform),
+            "current_logical_weights": complex_vector_payload(current),
+            "target_logical_weights": complex_vector_payload(target),
+            "transition_start_logical_weights": complex_vector_payload(start),
+            "effective_gnss_multiply_coefficients_conj_w_times_calibration": (
+                complex_vector_payload(effective)
+            ),
+            "weight_transition_active": bool(active),
+            "weight_transition_duration_s": self._json_float(
+                getattr(self._config, "lcmv_weight_transition_s", 0.0)
+            ),
+            "weight_transition_total_chunks": total,
+            "weight_transition_completed_chunks": completed,
+            "weight_transition_progress": self._json_float(progress),
+            "weight_transition_reason": reason,
+            "weight_transition_current_weights": complex_vector_payload(current),
+            "weight_transition_target_weights": complex_vector_payload(target),
+        }
+
     def _get_beamformer_weights_copy(self) -> np.ndarray:
         with self._beamformer_lock:
             return np.array(self._latest_beamformer_weights, copy=True)
+
+    def _get_beamformer_target_weights_copy(self) -> np.ndarray:
+        """Return the latest complete common-LCMV target, not ramp position."""
+
+        with self._beamformer_lock:
+            return np.array(self._target_beamformer_weights, copy=True)
 
     def _get_gnss_effective_weights(self) -> np.ndarray:
         with self._beamformer_lock:
@@ -2654,10 +3113,8 @@ class BackendRuntime:
         self,
         *,
         result: object | None,
-        desired_loss_db: float | None,
         target_suppression_db: float | None = None,
         enforce_white_noise_gain: bool = True,
-        enforce_desired_loss: bool = True,
     ) -> str:
         if result is None:
             return "candidate unavailable"
@@ -2682,16 +3139,6 @@ class BackendRuntime:
             and white_noise_gain_db > max_wng
         ):
             return f"white_noise_gain_db {white_noise_gain_db:.2f} exceeds {max_wng:.2f}"
-        max_desired_loss = self._finite_metric_float(
-            getattr(self._config, "lcmv_max_desired_loss_db", 6.0)
-        )
-        if (
-            enforce_desired_loss
-            and desired_loss_db is not None
-            and max_desired_loss is not None
-            and desired_loss_db > max_desired_loss
-        ):
-            return f"desired_loss_db {desired_loss_db:.2f} exceeds {max_desired_loss:.2f}"
         min_suppression = self._finite_metric_float(
             getattr(self._config, "lcmv_min_predicted_jammer_suppression_db", 3.0)
         )
@@ -2719,7 +3166,6 @@ class BackendRuntime:
         ideal_vector: np.ndarray,
         u1_vector: np.ndarray,
         healthy_reference_vector: np.ndarray,
-        enforce_desired_loss: bool = True,
     ) -> tuple[dict[str, object], str]:
         payload: dict[str, object] = {
             f"{prefix}_valid": False,
@@ -2777,10 +3223,8 @@ class BackendRuntime:
         target_suppression_db = u1_reduction_db if targets_measured_u1 else ideal_reduction_db
         rejection = self._method_safety_rejection_reason(
             result=result,
-            desired_loss_db=desired_loss_db,
             target_suppression_db=target_suppression_db,
             enforce_white_noise_gain=False,
-            enforce_desired_loss=enforce_desired_loss,
         )
 
         payload.update(
@@ -2828,7 +3272,6 @@ class BackendRuntime:
                     healthy_method_power
                 ),
                 f"{prefix}_desired_loss_vs_reference_db": desired_loss_db,
-                f"{prefix}_desired_loss_guard_enforced": bool(enforce_desired_loss),
                 f"{prefix}_effective_js_improvement_u1_db": self._json_float(
                     effective_js
                 ),
@@ -2865,6 +3308,155 @@ class BackendRuntime:
         response = complex(np.vdot(v, w))
         power = float(abs(response) ** 2)
         return power if np.isfinite(power) else None
+
+    def _jammer_excess_covariance_payload(
+        self,
+        *,
+        current_covariance: np.ndarray,
+        uniform_weights_vector: np.ndarray,
+        target_weights: np.ndarray,
+        jammer_latched: bool,
+    ) -> dict[str, object]:
+        """Estimate added-scene output power from the arm-time covariance change.
+
+        The frozen covariance is measured with bladeRF/PVT healthy during the
+        automatically classified uniform baseline. Once the automatic activation
+        gate is latched, the positive semidefinite part of
+        ``R_current - R_arm`` estimates spatial power added after arming.
+        Applying uniform, current-applied, and target weights to that same
+        excess covariance gives comparable added-power estimates without
+        treating total output reduction as jammer suppression.  A separate
+        operator marker is required only to call the added power physically
+        confirmed jammer-only; without it the result is added-scene suppression.
+        """
+
+        payload: dict[str, object] = {
+            "jammer_only_suppression_estimate_available": False,
+            "jammer_only_suppression_db": None,
+            "jammer_only_suppression_unavailable_reason": "",
+            "jammer_only_estimator": (
+                "PSD projection of current covariance minus frozen jammer-off covariance"
+            ),
+            "jammer_only_estimate_warning": (
+                "The covariance difference contains every spatial component that changed "
+                "after arming; interpret it as jammer-only only inside a separately "
+                "confirmed physical jammer-on marker window while the bladeRF scene is "
+                "otherwise unchanged. The automatic activation gate is not physical "
+                "jammer truth."
+            ),
+        }
+        if not jammer_latched:
+            payload["jammer_only_suppression_unavailable_reason"] = (
+                "automatic jammer activation gate is not latched"
+            )
+            return payload
+
+        with self._results_lock:
+            baseline_covariance = (
+                np.array(self._realtime_preserve_frozen_covariance, copy=True)
+                if self._realtime_preserve_frozen_covariance is not None
+                else np.zeros((0, 0), dtype=np.complex128)
+            )
+        current = np.asarray(current_covariance, dtype=np.complex128)
+        if (
+            current.ndim != 2
+            or current.shape[0] != current.shape[1]
+            or baseline_covariance.shape != current.shape
+        ):
+            payload["jammer_only_suppression_unavailable_reason"] = (
+                "frozen jammer-off and current covariance shapes do not match"
+            )
+            return payload
+
+        difference = 0.5 * (
+            (current - baseline_covariance)
+            + (current - baseline_covariance).conj().T
+        )
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(difference)
+        except np.linalg.LinAlgError as exc:
+            payload["jammer_only_suppression_unavailable_reason"] = (
+                f"jammer-excess covariance eigendecomposition failed: {exc}"
+            )
+            return payload
+        positive = np.maximum(eigenvalues.real, 0.0)
+        negative = np.maximum(-eigenvalues.real, 0.0)
+        excess_trace = float(np.sum(positive))
+        current_trace = max(float(np.trace(current).real), 0.0)
+        numerical_floor = max(1e-12, current_trace * 1e-9)
+        if not np.isfinite(excess_trace) or excess_trace <= numerical_floor:
+            payload.update(
+                {
+                    "jammer_excess_covariance_trace_linear": self._json_float(
+                        excess_trace
+                    ),
+                    "jammer_only_suppression_unavailable_reason": (
+                        "positive jammer-excess covariance power is below the numerical floor"
+                    ),
+                }
+            )
+            return payload
+
+        excess_covariance = (
+            eigenvectors
+            @ np.diag(positive.astype(np.complex128))
+            @ eigenvectors.conj().T
+        )
+        uniform_w = np.asarray(uniform_weights_vector, dtype=np.complex128).reshape(-1)
+        target_w = np.asarray(target_weights, dtype=np.complex128).reshape(-1)
+        applied_w = self._get_beamformer_weights_copy()
+        before_power = covariance_output_power(
+            covariance=excess_covariance,
+            weights=uniform_w,
+        )
+        applied_power = covariance_output_power(
+            covariance=excess_covariance,
+            weights=applied_w,
+        )
+        target_power = covariance_output_power(
+            covariance=excess_covariance,
+            weights=target_w,
+        )
+        applied_suppression_db = ratio_db(before_power, applied_power)
+        target_suppression_db = ratio_db(before_power, target_power)
+        if applied_suppression_db is None or target_suppression_db is None:
+            payload["jammer_only_suppression_unavailable_reason"] = (
+                "jammer-excess output power is not finite"
+            )
+            return payload
+
+        payload.update(
+            {
+                "jammer_only_suppression_estimate_available": True,
+                "jammer_only_suppression_db": applied_suppression_db,
+                "jammer_only_target_suppression_db": target_suppression_db,
+                "jammer_only_power_before_uniform_linear": self._json_float(
+                    before_power
+                ),
+                "jammer_only_power_before_uniform_db": power_db(before_power),
+                "jammer_only_power_after_applied_linear": self._json_float(
+                    applied_power
+                ),
+                "jammer_only_power_after_applied_db": power_db(applied_power),
+                "jammer_only_power_after_target_linear": self._json_float(
+                    target_power
+                ),
+                "jammer_only_power_after_target_db": power_db(target_power),
+                "jammer_excess_covariance_trace_linear": self._json_float(
+                    excess_trace
+                ),
+                "jammer_excess_covariance_removed_negative_trace_linear": self._json_float(
+                    float(np.sum(negative))
+                ),
+                "jammer_excess_covariance_positive_eigenvalues_linear": (
+                    self._json_float_list(positive[::-1])
+                ),
+                "jammer_only_suppression_unavailable_reason": "",
+                "jammer_only_applied_weights": complex_vector_payload(applied_w),
+                "jammer_only_target_weights": complex_vector_payload(target_w),
+            }
+        )
+        return payload
 
     def _healthy_reference_payload(self, current_u1: np.ndarray) -> dict[str, object]:
         healthy = (
@@ -2939,6 +3531,19 @@ class BackendRuntime:
         observations = self._optional_int(gnss_snapshot.get("pvt_observation_count"))
         if observations is None:
             observations = self._optional_int(gnss_snapshot.get("pvt_observations"))
+        # Some GNSS-SDR PVT monitor packets report valid_sats=0 even while the
+        # bridge has current per-satellite used-in-fix evidence.  Do not let
+        # that monitor-field defect veto an otherwise healthy jammer-off
+        # preservation reference.  The bridge count is derived from the same
+        # current PVT/tracking snapshot and is therefore valid corroborating
+        # evidence, not a configured or assumed satellite count.
+        used_in_fix_count = self._optional_int(
+            gnss_snapshot.get("used_in_fix_count")
+        )
+        if used_in_fix_count is not None and (
+            observations is None or used_in_fix_count > observations
+        ):
+            observations = used_in_fix_count
         avg_cno = self._finite_metric_float(gnss_snapshot.get("avg_tracking_cno_db_hz"))
         if avg_cno is None:
             avg_cno = self._finite_metric_float(gnss_snapshot.get("avg_cno_db_hz"))
@@ -2999,12 +3604,16 @@ class BackendRuntime:
         )
         peak_count = self._optional_int(source_diag.get("peak_count"))
         effective_rank = self._finite_metric_float(source_diag.get("source_effective_rank"))
+        # MUSIC local-maximum count and covariance effective rank are useful
+        # diagnostics, but neither is a physical-emitter counter. A single
+        # wideband GNSS simulator observed through multipath/noise produced four
+        # local spectrum peaks and rank 2.66 in the 2026-08-15 healthy lab
+        # baseline. Treating either as a jammer veto prevented the measured U1
+        # and covariance from ever being captured. Only a material mismatch
+        # between the configured and estimated source counts is a hard source-
+        # structure warning here; power/angle/PVT/CN0 gates remain independent.
         suspicious_source_structure = (
             source_estimate_gap is not None and source_estimate_gap > 2
-        ) or (
-            peak_count is not None and peak_count > 3
-        ) or (
-            effective_rank is not None and effective_rank > 2.5
         )
         if large_angle_jump:
             jammer_confidence = max(jammer_confidence, 0.35)
@@ -3514,11 +4123,6 @@ class BackendRuntime:
             "total_output_reduction_warning": (
                 "Total output reduction is not jammer-only suppression"
             ),
-            "jammer_only_suppression_estimate_available": False,
-            "jammer_only_suppression_unavailable_reason": (
-                "requires reliable jammer-off, jammer-on-before-null, and jammer-on-after-null "
-                "windows; per-chunk covariance R is not jammer-only"
-            ),
             **self._calibration_context_payload(),
             "raw_power_spread_db": self._json_float(raw_metrics.get("raw_power_spread_db")),
             "cal_power_spread_db": self._json_float(cal_metrics.get("cal_power_spread_db")),
@@ -3571,6 +4175,21 @@ class BackendRuntime:
         payload.update(self._healthy_reference_payload(u1_norm))
         if isinstance(run_state_payload, dict):
             payload.update(run_state_payload)
+        jammer_latched = bool(
+            payload.get("lcmv_jammer_detected_latched", False)
+            or (target_angle_policy or {}).get(
+                "lcmv_target_confirmed_jammer_bearing",
+                False,
+            )
+        )
+        payload.update(
+            self._jammer_excess_covariance_payload(
+                current_covariance=covariance,
+                uniform_weights_vector=uniform_w,
+                target_weights=active_w,
+                jammer_latched=jammer_latched,
+            )
+        )
         active_method_payload: dict[str, object] = {}
         active_method_prefix = ""
         for method_name, entry in entries.items():
@@ -3588,12 +4207,6 @@ class BackendRuntime:
                 ideal_vector=ideal_norm,
                 u1_vector=u1_norm,
                 healthy_reference_vector=healthy_norm,
-                enforce_desired_loss=bool(
-                    (target_angle_policy or {}).get(
-                        "lcmv_desired_loss_guard_enforced",
-                        True,
-                    )
-                ),
             )
             payload.update(method_payload)
             if bool(method_payload.get(f"{prefix}_valid")):
@@ -3623,7 +4236,6 @@ class BackendRuntime:
                 "dominant_vector_suppression_db",
                 "total_output_reduction_vs_reference_db",
                 "desired_loss_vs_reference_db",
-                "desired_loss_guard_enforced",
                 "white_noise_gain_db",
                 "noise_gain_vs_reference_db",
                 "effective_js_improvement_u1_db",
@@ -3823,10 +4435,6 @@ class BackendRuntime:
                     ),
                     "lcmv_target_protected_bladeRF_bearing": bool(
                         separation is None or separation < guard_deg
-                    ),
-                    "lcmv_desired_loss_guard_enforced": False,
-                    "lcmv_desired_loss_guard_bypass_reason": (
-                        "frozen measured bladeRF U1 constraint is active"
                     ),
                 }
             )
@@ -4077,7 +4685,6 @@ class BackendRuntime:
                 result: object | None,
                 *,
                 enforce_white_noise_gain: bool = True,
-                enforce_desired_loss: bool = True,
             ) -> str:
                 weights = np.asarray(
                     getattr(result, "weights", []),
@@ -4095,10 +4702,8 @@ class BackendRuntime:
                     target_suppression_db = ratio_db(ideal_ref_power, ideal_method_power)
                 return self._method_safety_rejection_reason(
                     result=result,
-                    desired_loss_db=ratio_db(healthy_ref_power, healthy_method_power),
                     target_suppression_db=target_suppression_db,
                     enforce_white_noise_gain=enforce_white_noise_gain,
-                    enforce_desired_loss=enforce_desired_loss,
                 )
 
             active_lcmv_null_method = self._lcmv_test_null_method
@@ -4122,9 +4727,6 @@ class BackendRuntime:
                 active_lcmv_method,
                 active_result,
                 enforce_white_noise_gain=False,
-                enforce_desired_loss=bool(
-                    target_angle_policy.get("lcmv_desired_loss_guard_enforced", True)
-                ),
             )
             if active_safety_reason:
                 raise ValueError(f"active LCMV method rejected: {active_safety_reason}")
@@ -4137,6 +4739,7 @@ class BackendRuntime:
             self._schedule_beamformer_weights(
                 active_weights,
                 reason="covariance LCMV target update",
+                preempt_active_transition=False,
             )
             heavy_diag = self._lcmv_heavy_diagnostics_decision()
             model = lcmv_model_response(
@@ -4464,7 +5067,7 @@ class BackendRuntime:
             "candidate_methods_computed=%s candidate_methods_valid=%s "
             "candidate_methods_rejected=%s "
             "target_classification=%s target_angle_change_from_healthy_deg=%s "
-            "desired_loss_guard_enforced=%s active_desired_loss_db=%s "
+            "active_desired_loss_db=%s "
             "heavy_diagnostics_interval_s=%s heavy_diagnostics_emitted=%s "
             "heavy_diagnostics_skipped_due_to_throttle=%s last_heavy_diagnostics_age_s=%s "
             "calibration_correction_mode_applied=%s "
@@ -4497,7 +5100,6 @@ class BackendRuntime:
             self._format_optional_float(
                 spatial_diag.get("lcmv_target_angle_change_from_healthy_deg")
             ),
-            int(bool(spatial_diag.get("lcmv_desired_loss_guard_enforced", True))),
             self._format_optional_float(
                 spatial_diag.get("active_desired_loss_vs_reference_db")
             ),
@@ -4722,8 +5324,13 @@ class BackendRuntime:
                     time.monotonic() - compute_t0,
                 )
                 if gnss_vector.size > 0:
+                    health_vector = (
+                        gnss_vector[0]
+                        if gnss_vector.ndim == 2
+                        else gnss_vector
+                    )
                     fifo_diag = signal_power_metrics(
-                        gnss_vector,
+                        health_vector,
                         prefix="fifo_output",
                         component_threshold=float(self._config.rx_clipping_component_threshold),
                     )
@@ -4736,7 +5343,7 @@ class BackendRuntime:
                             **dict(self._latest_output_power_metrics),
                             **fifo_diag,
                         }
-                    self._update_gnss_fifo_signal_health(gnss_vector)
+                    self._update_gnss_fifo_signal_health(health_vector)
                     if self._gnss_fifo_health_chunk_counter >= max(
                         1, int(self._config.rx_health_log_interval_chunks)
                     ):
@@ -5577,12 +6184,16 @@ class BackendRuntime:
             return {}
         ready: dict[str, object] = {}
         for key, value in values.items():
-            if isinstance(value, dict):
+            if isinstance(value, bool):
+                ready[str(key)] = value
+            elif isinstance(value, dict):
                 ready[str(key)] = cls._json_ready_mapping(value)
             elif isinstance(value, (list, tuple)):
                 ready[str(key)] = [
                     cls._json_ready_mapping(item)
                     if isinstance(item, dict)
+                    else item
+                    if isinstance(item, bool)
                     else cls._json_float(item)
                     if isinstance(item, (int, float, np.floating, np.integer))
                     else item
@@ -5593,8 +6204,6 @@ class BackendRuntime:
                     ready[str(key)] = complex_vector_payload(value)
                 else:
                     ready[str(key)] = cls._json_float_list(value)
-            elif isinstance(value, bool):
-                ready[str(key)] = value
             elif isinstance(value, (int, float, np.floating, np.integer)):
                 ready[str(key)] = cls._json_float(value)
             else:
@@ -5630,6 +6239,7 @@ class BackendRuntime:
         gnss_snapshot = self._gnss_bridge.snapshot() if self._gnss_bridge is not None else {}
         self._record_runtime_timing("ui_gnss_snapshot", time.monotonic() - snapshot_t0)
         self._maybe_log_gnss_snapshot(gnss_snapshot)
+        self._maybe_log_runtime_evidence(gnss_snapshot)
         with self._results_lock:
             # Copy arrays while holding the lock, then build the dict outside the
             # backend update path. This prevents GUI consumers from seeing arrays
@@ -5842,10 +6452,6 @@ class BackendRuntime:
             classification = "ambiguous_expected_ranges"
         else:
             classification = "unclassified"
-        desired_loss_guard_enabled = bool(
-            getattr(self._config, "lcmv_desired_loss_guard_enabled", False)
-        )
-        desired_loss_guard_enforced = desired_loss_guard_enabled and not confirmed_jammer
         healthy_angle_change = None
         if self._healthy_reference_display_bearing_deg is not None:
             healthy_angle_change = self._angle_distance_deg(
@@ -5859,17 +6465,6 @@ class BackendRuntime:
             "lcmv_target_protected_bladeRF_bearing": bool(protected_bladerf),
             "lcmv_target_angle_change_from_healthy_deg": self._json_float(
                 healthy_angle_change
-            ),
-            "lcmv_desired_loss_guard_enabled": desired_loss_guard_enabled,
-            "lcmv_desired_loss_guard_enforced": desired_loss_guard_enforced,
-            "lcmv_desired_loss_guard_bypass_reason": (
-                "disabled by runtime configuration"
-                if not desired_loss_guard_enabled
-                else (
-                    "target is inside expected jammer range and outside protected bladeRF range"
-                    if confirmed_jammer
-                    else ""
-                )
             ),
         }
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import io
+import json
 import logging
 from pathlib import Path
 import queue
@@ -59,6 +60,7 @@ def _tracking_monitor_message(
     carrier_lock_test: float = 1.0,
     channel: int = 0,
     valid_pseudorange: bool = False,
+    cycle_slip: bool = False,
 ) -> gnss_synchro_pb2.Observables:
     message = gnss_synchro_pb2.Observables()
     observable = message.observable.add()
@@ -70,12 +72,18 @@ def _tracking_monitor_message(
     observable.carrier_doppler_hz = -1350.25
     observable.carrier_phase_rads = 123_456.75
     observable.code_phase_samples = 12.0
+    observable.prompt_i = 0.75
+    observable.prompt_q = -0.25
+    observable.fs = 4_000_000
+    observable.tracking_sample_counter = 123_456
+    observable.correlation_length_ms = 1
     observable.flag_valid_symbol_output = True
     observable.flag_valid_word = False
     observable.flag_valid_pseudorange = bool(valid_pseudorange)
     observable.pseudorange_m = 21_234_567.0
     observable.rx_time = 345_600.5
     observable.flag_PLL_180_deg_phase_locked = carrier_lock_test >= PRN_CARRIER_LOCK_THRESHOLD
+    observable.flag_cycle_slip = bool(cycle_slip)
     return message
 
 
@@ -678,6 +686,43 @@ def test_bridge_fifo_config_derives_gps_l1_filter_at_4mhz(tmp_path: Path) -> Non
     assert "PVT.output_path=./outputs/pvt" in rendered
     assert "PVT.dump_filename=pvt" in rendered
     assert bridge.input_filter_bandwidth_hz == 2_600_000.0
+
+
+def test_bridge_archives_exact_pid_scoped_gnss_runtime_artifacts(tmp_path: Path) -> None:
+    runtime_dir = _fifo_runtime_dir(tmp_path)
+    session_dir = tmp_path / "runs" / "session"
+    cfg = StreamConfig(
+        gnss_sdr_runtime_dir=runtime_dir,
+        gnss_sdr_log_dir=runtime_dir / "glog",
+    )
+    bridge = GnssSdrBridge(
+        cfg,
+        _loggers(),
+        session_id="session",
+        session_dir=session_dir,
+    )
+    bridge._config_path.parent.mkdir(parents=True, exist_ok=True)
+    bridge._config_path.write_text("exact-current-config", encoding="utf-8")
+    bridge._console_log_path.write_text("exact-current-console", encoding="utf-8")
+    bridge._receiver_log_path.parent.mkdir(parents=True, exist_ok=True)
+    bridge._receiver_log_path.write_text("exact-current-receiver", encoding="utf-8")
+    bridge._pvt_outputs_dir.mkdir(parents=True, exist_ok=True)
+    (bridge._pvt_outputs_dir / "current.gpx").write_text("exact-current-pvt", encoding="utf-8")
+
+    bridge._archive_runtime_artifacts(config_only=False)
+
+    assert (
+        session_dir / "gnss-sdr/runtime/fifo_gps_l1.conf"
+    ).read_text(encoding="utf-8") == "exact-current-config"
+    assert (
+        session_dir / "gnss-sdr/runtime/console.log"
+    ).read_text(encoding="utf-8") == "exact-current-console"
+    assert (
+        session_dir / "gnss-sdr/glog/receiver.log"
+    ).read_text(encoding="utf-8") == "exact-current-receiver"
+    assert (
+        session_dir / "gnss-sdr/runtime/outputs/pvt/current.gpx"
+    ).read_text(encoding="utf-8") == "exact-current-pvt"
 
 
 def test_bridge_gps_l1_filter_keeps_physical_bandwidth_when_rate_changes(tmp_path: Path) -> None:
@@ -1291,6 +1336,47 @@ def test_bridge_snapshot_reads_tracking_monitor_udp_cn0(tmp_path: Path) -> None:
     assert prn["used_in_fix"] is False
 
 
+def test_bridge_archives_tracking_carrier_code_iq_and_cycle_slip(tmp_path: Path) -> None:
+    cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
+    bridge = GnssSdrBridge(cfg, _loggers())
+    archive = io.StringIO()
+    bridge._tracking_state_handle = archive
+
+    bridge._handle_observables_message(
+        _tracking_monitor_message(
+            cno_db_hz=41.75,
+            prn=9,
+            channel=2,
+            cycle_slip=True,
+        ),
+        source="tracking",
+    )
+
+    record = json.loads(archive.getvalue())
+    assert record["schema_version"] == 1
+    assert record["sequence"] == 1
+    assert record["timestamp_utc"]
+    assert record["timestamp_local"]
+    assert record["wall_time_unix_ns"] > 0
+    assert record["monotonic_ns"] > 0
+    assert record["satellite_id"] == "G09"
+    assert record["signal"] == "1C"
+    assert record["channel"] == 2
+    assert record["prompt_i"] == pytest.approx(0.75)
+    assert record["prompt_q"] == pytest.approx(-0.25)
+    assert record["prompt_magnitude"] == pytest.approx(np.hypot(0.75, -0.25))
+    assert record["prompt_phase_rads"] == pytest.approx(np.arctan2(-0.25, 0.75))
+    assert record["cn0_db_hz"] == pytest.approx(41.75)
+    assert record["carrier_doppler_hz"] == pytest.approx(-1350.25)
+    assert record["carrier_phase_rads"] == pytest.approx(123456.75)
+    assert record["carrier_phase_cycles"] == pytest.approx(123456.75 / (2.0 * np.pi))
+    assert record["code_phase_samples"] == pytest.approx(12.0)
+    assert record["code_phase_seconds"] == pytest.approx(12.0 / record["fs"])
+    assert record["tracking_sample_counter"] == 123456
+    assert record["cycle_slip"] is True
+    assert bridge.snapshot()["tracking_state_archive_rows"] == 1
+
+
 def test_bridge_does_not_attach_stale_tracking_monitor_cn0_to_acquired_prn(tmp_path: Path) -> None:
     cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
     bridge = GnssSdrBridge(cfg, _loggers())
@@ -1765,9 +1851,86 @@ def test_bridge_builds_pvt_accuracy_summary_from_truth_and_dops(tmp_path: Path) 
     assert "position=lat 33.6844050, lon 73.0478990, alt 538.00 m" in summary
     assert "utm=43N east 319050.188, north 3728874.354" in summary
     assert "epoch_error=H" in summary
-    assert "window_error(1 fixes)=H" in summary
+    assert "cumulative_error(1 fixes)=H" in summary
     assert "DOP_uncertainty" not in summary
     assert "DOP=HDOP 2.50, VDOP 4.00, PDOP 4.70, GDOP 5.10" in summary
+
+
+def test_bridge_reports_empirical_cep_only_after_accuracy_window_is_full(
+    tmp_path: Path,
+) -> None:
+    cfg = StreamConfig(
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+        gnss_truth_static_lat_deg=0.0,
+        gnss_truth_static_lon_deg=0.0,
+        gnss_truth_static_alt_m=0.0,
+        gnss_accuracy_window_points=4,
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+    meters_per_lon_at_equator = 111_132.954 - 93.5 + 0.118
+
+    def point(east_error_m: float) -> dict[str, float]:
+        return {
+            "latitude": 0.0,
+            "longitude": east_error_m / meters_per_lon_at_equator,
+            "altitude": 0.0,
+        }
+
+    warming = bridge._build_accuracy_snapshot([point(3.0), point(1.0), point(2.0)])
+    assert warming["cep_ready"] is False
+    assert warming["cep_sample_count"] == 3
+    assert warming["cep_window_points"] == 4
+    assert warming["cep_min_points"] == 4
+    assert warming["cep_scope"] == "run_cumulative"
+    assert "cep50_m" not in warming
+    assert "cep95_m" not in warming
+    assert "CEP=warming 3/4 fixes" in bridge._format_accuracy_summary(warming)
+
+    ready = bridge._build_accuracy_snapshot(
+        [point(3.0), point(1.0), point(100.0), point(2.0)]
+    )
+    assert ready["cep_ready"] is True
+    assert ready["cep_sample_count"] == 4
+    assert ready["cep50_m"] == pytest.approx(2.0)
+    assert ready["cep95_m"] == pytest.approx(100.0)
+    assert "CEP(4 fixes)=50% 2.00 m, 95% 100.00 m" in bridge._format_accuracy_summary(
+        ready
+    )
+
+    # A fifth fix must be included instead of retaining only the configured
+    # four-point warm-up count. With all five radii the median is 3 m; a
+    # four-point rolling window would incorrectly report 2 m.
+    cumulative = bridge._build_accuracy_snapshot(
+        [point(3.0), point(1.0), point(100.0), point(2.0), point(4.0)]
+    )
+    assert cumulative["accuracy_window_points"] == 5
+    assert cumulative["cep_sample_count"] == 5
+    assert cumulative["cep50_m"] == pytest.approx(3.0)
+    assert cumulative["cep95_m"] == pytest.approx(100.0)
+
+
+def test_bridge_cep_stays_unavailable_without_configured_truth(tmp_path: Path) -> None:
+    cfg = StreamConfig(
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+        gnss_truth_static_lat_deg=None,
+        gnss_truth_static_lon_deg=None,
+        gnss_truth_static_alt_m=None,
+        gnss_accuracy_window_points=2,
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    accuracy = bridge._build_accuracy_snapshot(
+        [
+            {"latitude": 33.0, "longitude": 73.0, "altitude": 500.0},
+            {"latitude": 33.1, "longitude": 73.1, "altitude": 501.0},
+        ]
+    )
+
+    assert accuracy["truth_available"] is False
+    assert accuracy["cep_ready"] is False
+    assert accuracy["cep_sample_count"] == 0
+    assert "cep50_m" not in accuracy
+    assert "cep95_m" not in accuracy
 
 
 def test_bridge_reset_runtime_dir_clears_runtime_and_separate_glog_dir(tmp_path: Path) -> None:

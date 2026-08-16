@@ -82,9 +82,9 @@ def _solid_pen(color: str, width: float) -> QPen:
 # Snapshot Parsing Helpers
 # =============================================================================
 
-# PRN Monitor admission follows GNSS-SDR's tracking state only. Stability,
-# telemetry decoding, and PVT use are separate qualifications displayed
-# elsewhere; none of them is allowed to hide a currently tracked satellite.
+# The PRN chart admits current tracking C/N0 as soon as it exists. Stability,
+# acquisition, pending, and lost state remain available in diagnostics, but a
+# channel without current tracking C/N0 must not create a "--" placeholder bar.
 
 def _entry_prn(entry: dict[str, object]) -> int | None:
     try:
@@ -119,7 +119,7 @@ def _entry_bar_height(entry: dict[str, object]) -> float:
 
 
 def _entry_stable(entry: dict[str, object]) -> bool:
-    return bool(entry.get("cno_stable", False))
+    return bool(entry.get("cno_stable", False)) and _entry_has_tracking_cno(entry)
 
 
 # =============================================================================
@@ -127,7 +127,7 @@ def _entry_stable(entry: dict[str, object]) -> bool:
 # =============================================================================
 
 class PocketPrnMonitor(QWidget):
-    """Render tracking PRNs with raw C/N0 bar heights and fix-state colors."""
+    """Render tracking PRNs that have current, positive C/N0 measurements."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -218,10 +218,8 @@ class PocketPrnMonitor(QWidget):
                 else:
                     self._unstable_tracking_prns.append(prn)
                     self._unstable_tracking_reasons[prn] = reason
-            # Once GNSS-SDR says this PRN is tracking, always render it. A real
-            # tracking C/N0 supplies the bar height when present; otherwise the
-            # state-height placeholder and "--" label keep the tracked PRN
-            # visible without inventing a signal-strength measurement.
+            if not _entry_has_tracking_cno(entry):
+                continue
             satellite_label = satellite_id(entry)
             entries_by_satellite[satellite_label] = (prn, entry)
         self._pending_tracking_prns.sort()

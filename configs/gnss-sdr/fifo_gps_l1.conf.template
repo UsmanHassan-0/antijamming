@@ -68,7 +68,7 @@ GNSS-SDR.AGNSS_ref_utc_time={agnss_ref_utc_time}
 ; FIFO Signal Source
 ; =============================================================================
 
-; GNSS-SDR reads the runtime-produced uniform-combined complex IQ from this FIFO.
+; GNSS-SDR reads the runtime-produced beamformed complex IQ from this FIFO.
 SignalSource.implementation=Fifo_Signal_Source
 SignalSource.filename={fifo_path}
 SignalSource.sample_type={sample_type}
@@ -164,6 +164,7 @@ Observables.dump_filename={observables_dump_path}
 ; positioning_mode remains app-configured; current live config uses PPP_Static.
 PVT.implementation=RTKLIB_PVT
 PVT.positioning_mode={pvt_positioning_mode}
+PVT.elevation_mask={pvt_elevation_mask_deg}
 PVT.output_rate_ms=100
 PVT.display_rate_ms=500
 PVT.iono_model=Broadcast

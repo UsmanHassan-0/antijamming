@@ -32,9 +32,14 @@ The current product config uses `lcmv_test_null_method: "covariance_lcmv_ideal"`
 
 Enabling LCMV first arms the runtime while the FIFO remains on uniform weights. Angular movement alone cannot activate covariance weights. Activation requires both an input-power rise and a generalized covariance-mode rise against the exact frozen arm-time baseline. Detection then latches until LCMV is disabled, so a long jammer interval cannot silently return the system to unprotected uniform weights.
 
-The product applies target weights with a one-second complex linear chunk ramp. The uniform and LCMV endpoints have the same complex response to the frozen measured bladeRF U1, so every interpolated weight has that same response. New covariance targets restart the ramp from the currently applied weights rather than introducing a one-chunk discontinuity.
+The product applies target weights with a one-second complex linear chunk ramp. The uniform and LCMV endpoints have the same complex response to the frozen measured bladeRF U1, so every interpolated weight has that same response. Repeated covariance updates do not restart an active ramp; the current ramp finishes before a later target can be scheduled. This avoids holding the applied weights indefinitely near the uniform starting point.
 
-The product profile sets `lcmv_desired_loss_guard_enabled: false` because the frozen measured bladeRF U1 is now an explicit equality constraint. Desired/SOI loss versus the healthy reference and the 6 dB diagnostic threshold remain in the logs. Invalid/non-finite weights, excessive weight norm, unavailable covariance solutions, protected bladeRF bearings, missing/stale measured references, and absent jammer activation evidence retain uniform fallbacks.
+There is no desired-loss guard or desired-loss configuration threshold in the
+product path. The frozen measured bladeRF U1 is an explicit equality
+constraint, while desired/SOI loss versus the healthy reference remains a
+diagnostic only. Invalid/non-finite weights, excessive weight norm, unavailable
+covariance solutions, protected bladeRF bearings, missing/stale measured
+references, and absent jammer activation evidence retain uniform fallbacks.
 
 Covariance-free constraint projection, the old ideal-steering shortcut, and the old ideal-angle fan have been removed from the product module and tests. The runtime schema rejects their old method names.
 

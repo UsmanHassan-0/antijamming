@@ -8,11 +8,11 @@ import math
 class AccuracyMixin:
     def _build_accuracy_snapshot(self, points: list[dict[str, float]]) -> dict[str, object]:
         latest = points[-1]
-        window_count = max(1, int(self._cfg.gnss_accuracy_window_points))
-        recent_points = points[-window_count:]
-        mean_lat = sum(point["latitude"] for point in recent_points) / len(recent_points)
-        mean_lon = sum(point["longitude"] for point in recent_points) / len(recent_points)
-        mean_alt = sum(point["altitude"] for point in recent_points) / len(recent_points)
+        minimum_count = max(1, int(self._cfg.gnss_accuracy_window_points))
+        run_points = points
+        mean_lat = sum(point["latitude"] for point in run_points) / len(run_points)
+        mean_lon = sum(point["longitude"] for point in run_points) / len(run_points)
+        mean_alt = sum(point["altitude"] for point in run_points) / len(run_points)
         truth = self._latest_truth_position
         hdop = latest.get("hdop")
         vdop = latest.get("vdop")
@@ -21,7 +21,15 @@ class AccuracyMixin:
         fix_type = self._fix_type_from_latest_point(latest)
         snapshot: dict[str, object] = {
             "fix_count": len(points),
-            "accuracy_window_points": len(recent_points),
+            "accuracy_window_points": len(run_points),
+            "accuracy_scope": "run_cumulative",
+            "cep_sample_count": 0,
+            # Keep the old key as a compatibility alias for consumers written
+            # before cumulative CEP was introduced.
+            "cep_window_points": minimum_count,
+            "cep_min_points": minimum_count,
+            "cep_scope": "run_cumulative",
+            "cep_ready": False,
             "fix_type": fix_type,
             "lat_deg": latest["latitude"],
             "lon_deg": latest["longitude"],
@@ -36,6 +44,15 @@ class AccuracyMixin:
         if utm_position is not None:
             snapshot.update(utm_position)
         if truth is not None:
+            horizontal_errors_m: list[float] = []
+            for point in run_points:
+                point_east_m, point_north_m, _ = self._enu_error_m(
+                    lat_deg=point["latitude"],
+                    lon_deg=point["longitude"],
+                    alt_m=point["altitude"],
+                    ref=truth,
+                )
+                horizontal_errors_m.append(math.hypot(point_east_m, point_north_m))
             east_m, north_m, up_m = self._enu_error_m(
                 lat_deg=latest["latitude"],
                 lon_deg=latest["longitude"],
@@ -65,12 +82,36 @@ class AccuracyMixin:
                     "three_d_error_m": three_d_m,
                     "window_horizontal_error_m": window_horizontal_m,
                     "window_three_d_error_m": window_three_d_m,
+                    "cep_sample_count": len(horizontal_errors_m),
                 }
             )
+            if len(horizontal_errors_m) >= minimum_count:
+                snapshot.update(
+                    {
+                        "cep50_m": self._empirical_nearest_rank(
+                            horizontal_errors_m,
+                            0.50,
+                        ),
+                        "cep95_m": self._empirical_nearest_rank(
+                            horizontal_errors_m,
+                            0.95,
+                        ),
+                        "cep_ready": True,
+                    }
+                )
         else:
             self._maybe_log_truth_warning()
 
         return snapshot
+
+    @staticmethod
+    def _empirical_nearest_rank(values: list[float], probability: float) -> float:
+        """Return the empirical radius containing the requested fraction of samples."""
+        if not values:
+            raise ValueError("empirical CEP requires at least one sample")
+        ordered = sorted(float(value) for value in values)
+        rank = max(1, math.ceil(float(probability) * len(ordered)))
+        return ordered[min(rank, len(ordered)) - 1]
 
     def _format_accuracy_summary(self, accuracy: dict[str, object]) -> str:
         parts = [
@@ -108,9 +149,24 @@ class AccuracyMixin:
         window_three_d_error = self._to_float(accuracy.get("window_three_d_error_m"))
         if window_horizontal_error is not None and window_three_d_error is not None:
             parts.append(
-                f"window_error({accuracy.get('accuracy_window_points', '--')} fixes)="
+                f"cumulative_error({accuracy.get('accuracy_window_points', '--')} fixes)="
                 f"H {window_horizontal_error:.2f} m, 3D {window_three_d_error:.2f} m"
             )
+        cep50 = self._to_float(accuracy.get("cep50_m"))
+        cep95 = self._to_float(accuracy.get("cep95_m"))
+        cep_samples = int(self._to_float(accuracy.get("cep_sample_count")) or 0)
+        cep_minimum = int(
+            self._to_float(
+                accuracy.get("cep_min_points", accuracy.get("cep_window_points"))
+            )
+            or 0
+        )
+        if cep50 is not None and cep95 is not None:
+            parts.append(
+                f"CEP({cep_samples} fixes)=50% {cep50:.2f} m, 95% {cep95:.2f} m"
+            )
+        elif bool(accuracy.get("truth_available")) and cep_minimum > 0:
+            parts.append(f"CEP=warming {cep_samples}/{cep_minimum} fixes")
         dop_parts: list[str] = []
         hdop = self._to_float(accuracy.get("hdop"))
         vdop = self._to_float(accuracy.get("vdop"))

@@ -6,6 +6,7 @@ import atexit
 import logging
 import os
 import pty
+import shutil
 import subprocess
 import threading
 import time
@@ -44,7 +45,14 @@ class GnssSdrBridge(
 ):
     """Manage the GNSS-SDR subprocess, FIFO writes, logs, and receiver snapshot."""
 
-    def __init__(self, config: StreamConfig, loggers: dict[str, logging.Logger]) -> None:
+    def __init__(
+        self,
+        config: StreamConfig,
+        loggers: dict[str, logging.Logger],
+        *,
+        session_id: str | None = None,
+        session_dir: Path | None = None,
+    ) -> None:
         # Config and loggers.
         self._cfg = config
         self._log = loggers["gnss"]
@@ -57,6 +65,18 @@ class GnssSdrBridge(
             config.gnss_sdr_runtime_dir,
             config.gnss_sdr_log_dir,
         )
+        self._tracking_state_archive_dir = (
+            Path(config.log_dir).expanduser().resolve() / "tracking-state"
+        )
+        self._runtime_session_id = str(session_id) if session_id else None
+        self._runtime_session_dir = (
+            Path(session_dir).expanduser().resolve() if session_dir is not None else None
+        )
+        self._tracking_state_log_path: Path | None = None
+        self._tracking_state_compat_path: Path | None = None
+        self._tracking_state_handle = None
+        self._tracking_state_sequence = 0
+        self._tracking_state_started_monotonic_ns = 0
         self._proc: subprocess.Popen[bytes] | None = None
         self._fifo_fd: int | None = None
         self._stdout_thread: threading.Thread | None = None
@@ -194,9 +214,13 @@ class GnssSdrBridge(
         self._prepare_nmea_tty()
         rendered_config = self._render_config()
         self._config_path.write_text(rendered_config, encoding="utf-8")
+        self._archive_runtime_artifacts(config_only=True)
         self._log_rendered_config_summary(rendered_config)
         self._monitor_stop.clear()
         self._session_epoch_s = time.time()
+        self._tracking_state_started_monotonic_ns = time.monotonic_ns()
+        self._tracking_state_sequence = 0
+        self._open_tracking_state_log()
         with self._state_lock:
             self._prn_states.clear()
             self._channel_prn.clear()
@@ -328,7 +352,6 @@ class GnssSdrBridge(
         arr = complex64_contiguous_vector(samples)
         if arr.size == 0:
             return True
-
         payload = memoryview(arr).cast("B")
         started_at = time.monotonic()
         try:
@@ -374,6 +397,7 @@ class GnssSdrBridge(
     def stop(self, reason: str = "normal stop") -> None:
         self._monitor_stop.set()
         self._stop_udp_monitors()
+        self._close_tracking_state_log()
         with self._fifo_lock:
             fifo_fd = self._fifo_fd
             self._fifo_fd = None
@@ -429,6 +453,8 @@ class GnssSdrBridge(
             self._glog_thread.join(timeout=1.0)
             self._glog_thread = None
 
+        self._archive_runtime_artifacts(config_only=False)
+
         if self._write_count > 0 or self._drop_count > 0:
             avg_ms = 1000.0 * (self._write_time_total_s / max(1, self._write_count))
             self._log.info(
@@ -442,6 +468,110 @@ class GnssSdrBridge(
             )
 
         self._cleanup_fifo()
+
+    def _archive_runtime_artifacts(self, *, config_only: bool) -> None:
+        """Copy the exact per-process GNSS-SDR evidence into this run."""
+
+        if self._runtime_session_dir is None:
+            return
+        mappings = [(self._config_path, Path("gnss-sdr/runtime/fifo_gps_l1.conf"))]
+        if not config_only:
+            mappings.extend(
+                [
+                    (self._console_log_path, Path("gnss-sdr/runtime/console.log")),
+                    (self._receiver_log_path, Path("gnss-sdr/glog/receiver.log")),
+                ]
+            )
+            if self._pvt_outputs_dir.is_dir():
+                for source in self._pvt_outputs_dir.iterdir():
+                    if source.is_file():
+                        mappings.append(
+                            (
+                                source,
+                                Path("gnss-sdr/runtime/outputs/pvt") / source.name,
+                            )
+                        )
+            if self._observables_outputs_dir.is_dir():
+                for source in self._observables_outputs_dir.iterdir():
+                    if source.is_file():
+                        mappings.append(
+                            (
+                                source,
+                                Path("gnss-sdr/runtime/outputs/observables") / source.name,
+                            )
+                        )
+        for source, relative_destination in mappings:
+            if not source.is_file():
+                continue
+            destination = self._runtime_session_dir / relative_destination
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            except OSError as exc:
+                self._err_log.error(
+                    "Failed archiving GNSS-SDR runtime artifact %s: %s",
+                    source,
+                    exc,
+                )
+
+    def _open_tracking_state_log(self) -> None:
+        """Open a durable, per-run archive of GNSS tracking observables."""
+
+        self._close_tracking_state_log()
+        timestamp = time.strftime(
+            "%Y%m%dT%H%M%SZ",
+            time.gmtime(self._session_epoch_s),
+        )
+        compatibility_path = (
+            self._tracking_state_archive_dir / f"tracking_{timestamp}_{os.getpid()}.jsonl"
+        )
+        path = (
+            self._runtime_session_dir / "tracking_observables.jsonl"
+            if self._runtime_session_dir is not None
+            else compatibility_path
+        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._tracking_state_handle = path.open("w", encoding="utf-8", buffering=1)
+        except OSError as exc:
+            self._tracking_state_log_path = None
+            self._tracking_state_compat_path = None
+            self._tracking_state_handle = None
+            self._err_log.error("Failed opening GNSS tracking-state archive %s: %s", path, exc)
+            return
+        if path != compatibility_path:
+            try:
+                compatibility_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    compatibility_path.unlink()
+                except FileNotFoundError:
+                    pass
+                os.link(path, compatibility_path)
+            except OSError as exc:
+                self._err_log.warning(
+                    "Could not create tracking-state compatibility hardlink %s: %s",
+                    compatibility_path,
+                    exc,
+                )
+        self._tracking_state_log_path = path
+        self._tracking_state_compat_path = compatibility_path
+        self._handoff_log.info(
+            "GNSS tracking-state archive: %s compatibility_path=%s session_id=%s",
+            path,
+            compatibility_path,
+            self._runtime_session_id or "--",
+        )
+
+    def _close_tracking_state_log(self) -> None:
+        handle = self._tracking_state_handle
+        self._tracking_state_handle = None
+        if handle is None:
+            return
+        try:
+            handle.flush()
+            handle.close()
+        except OSError as exc:
+            self._err_log.warning("Failed closing GNSS tracking-state archive: %s", exc)
 
 
 __all__ = ["GnssSdrBridge"]

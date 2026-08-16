@@ -64,13 +64,12 @@ _OPTIONAL_JSON_DEFAULTS: dict[str, Any] = {
     "lcmv_covariance_diagonal_loading_abs": 0.0,
     "lcmv_max_weight_norm": 8.0,
     "lcmv_max_white_noise_gain_db": 15.0,
-    "lcmv_desired_loss_guard_enabled": False,
-    "lcmv_max_desired_loss_db": 6.0,
     "lcmv_min_predicted_jammer_suppression_db": 3.0,
     "lcmv_heavy_diagnostics_interval_s": 1.0,
     "one_run_segmentation_enabled": True,
     "healthy_reference_capture_enabled": True,
     "gnss_sdr_startup_timeout_s": 0.0,
+    "gnss_pvt_elevation_mask_deg": 15.0,
     "experiment": {},
 }
 

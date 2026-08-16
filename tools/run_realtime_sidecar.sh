@@ -12,10 +12,18 @@ GNSS_MATCH="${GNSS_MATCH:-${ROOT}/gnss-sdr/*/gnss-sdr --config_file=*fifo_gps_l1
 runtime_usrp_ip() {
   python3 - <<'PY'
 import json
+import os
 import re
 from pathlib import Path
 
-cfg = json.loads(Path("configs/antijamming/x300_realtime.json").read_text())
+base = json.loads(Path("configs/antijamming/x300_realtime.json").read_text())
+overlay_path = os.environ.get("ANTIJAM_RUNTIME_OVERLAY", "").strip()
+if overlay_path:
+    overlay = Path(overlay_path).expanduser()
+    if not overlay.is_absolute():
+        overlay = Path.cwd() / overlay
+    base.update(json.loads(overlay.read_text()))
+cfg = base
 match = re.search(r"addr=([\d.]+)", str(cfg.get("usrp_addr", "")))
 if match:
     print(match.group(1))
@@ -59,7 +67,13 @@ fi
 
 SIDE="logs/sidecar/current"
 mkdir -p logs/sidecar
-rm -rf "${SIDE}"
+if [[ -d "${SIDE}" ]]; then
+  archive_id="$(date -u +%Y%m%dT%H%M%S.%NZ)"
+  archive_dir="logs/sidecar/runs/${archive_id}"
+  mkdir -p logs/sidecar/runs
+  mv -- "${SIDE}" "${archive_dir}"
+  printf '%s\n' "${archive_dir}" > logs/sidecar/LATEST_ARCHIVED
+fi
 mkdir -p "${SIDE}"
 printf '%s\n' "${SIDE}" > logs/sidecar/LATEST
 

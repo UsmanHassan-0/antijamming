@@ -272,10 +272,6 @@ class StreamConfig:
     lcmv_covariance_diagonal_loading_abs: float
     lcmv_max_weight_norm: float
     lcmv_max_white_noise_gain_db: float
-    # When disabled, desired/SOI loss remains diagnostic and cannot force the
-    # active LCMV method back to the uniform combiner.
-    lcmv_desired_loss_guard_enabled: bool
-    lcmv_max_desired_loss_db: float
     lcmv_min_predicted_jammer_suppression_db: float
     lcmv_heavy_diagnostics_interval_s: float
     one_run_segmentation_enabled: bool
@@ -318,7 +314,9 @@ class StreamConfig:
     gnss_truth_static_lon_deg: float | None
     gnss_truth_static_alt_m: float | None
 
-    # PVT truth-error display parameters.
+    # PVT truth-error display parameters. The point count is only the minimum
+    # before cumulative CEP is first published; the product profile uses one so
+    # CEP begins with the first valid PVT fix.
     gnss_accuracy_window_points: int
     gnss_accuracy_log_interval_s: float
 
@@ -327,6 +325,10 @@ class StreamConfig:
 
     # GNSS-SDR PVT solver mode rendered into the RTKLIB_PVT block.
     gnss_pvt_positioning_mode: str
+    # Minimum satellite elevation accepted by the PVT solver.  This is kept
+    # explicit so short rising/setting-satellite tests do not have to edit the
+    # production GNSS-SDR template.
+    gnss_pvt_elevation_mask_deg: float
 
     # Local GNSS-SDR assistance XML loaded before receiver startup. These files
     # are kept outside the runtime output tree because that tree is cleared at
