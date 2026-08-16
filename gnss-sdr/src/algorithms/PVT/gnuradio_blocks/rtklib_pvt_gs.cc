@@ -1204,6 +1204,25 @@ void rtklib_pvt_gs::msg_handler_telemetry(const pmt::pmt_t& msg)
                 {
                     // ### GPS EPHEMERIS ###
                     const auto gps_eph = wht::any_cast<std::shared_ptr<Gps_Ephemeris>>(pmt::any_ref(msg));
+                    const auto previous_gps_eph =
+                        d_internal_pvt_solver->gps_ephemeris_map.find(gps_eph->PRN);
+                    const bool had_previous_gps_eph =
+                        previous_gps_eph != d_internal_pvt_solver->gps_ephemeris_map.cend();
+                    std::cout << "GPS_EPHEMERIS_UPDATE prn=" << gps_eph->PRN
+                              << " previous_present=" << had_previous_gps_eph
+                              << " previous_toe="
+                              << (had_previous_gps_eph ? previous_gps_eph->second.toe : -1)
+                              << " week=" << gps_eph->WN
+                              << " toe=" << gps_eph->toe
+                              << " toc=" << gps_eph->toc
+                              << " tow=" << gps_eph->tow
+                              << " iode_sf2=" << gps_eph->IODE_SF2
+                              << " iode_sf3=" << gps_eph->IODE_SF3
+                              << " iodc=" << gps_eph->IODC
+                              << " iod_consistent="
+                              << (gps_eph->IODE_SF2 == gps_eph->IODE_SF3 &&
+                                      gps_eph->IODE_SF2 == (gps_eph->IODC & 0xFF))
+                              << " health=" << gps_eph->SV_health << '\n';
                     DLOG(INFO) << "Ephemeris record has arrived from SAT ID "
                                << gps_eph->PRN << " (Block "
                                << gps_eph->satelliteBlock[gps_eph->PRN] << ")"
@@ -1921,6 +1940,13 @@ void rtklib_pvt_gs::initialize_and_apply_carrier_phase_offset()
                     const double wrap_carrier_phase_rad = fmod(observables_iter->second.Carrier_phase_rads, TWO_PI);
                     d_initial_carrier_phase_offset_estimation_rads.at(observables_iter->second.Channel_ID) = TWO_PI * round(observables_iter->second.Pseudorange_m / wavelength_m) - observables_iter->second.Carrier_phase_rads + wrap_carrier_phase_rad;
                     d_channel_initialized.at(observables_iter->second.Channel_ID) = true;
+                    std::cout << "CARRIER_PHASE_AMBIGUITY_INIT channel=" << observables_iter->second.Channel_ID
+                              << " prn=" << observables_iter->second.PRN
+                              << " pseudorange_m=" << observables_iter->second.Pseudorange_m
+                              << " wavelength_m=" << wavelength_m
+                              << " raw_carrier_phase_rads=" << observables_iter->second.Carrier_phase_rads
+                              << " applied_offset_rads=" << d_initial_carrier_phase_offset_estimation_rads.at(observables_iter->second.Channel_ID)
+                              << '\n';
                     DLOG(INFO) << "initialized carrier phase at channel " << observables_iter->second.Channel_ID;
                 }
             // apply the carrier phase offset to this satellite
@@ -2144,7 +2170,11 @@ int rtklib_pvt_gs::work(int noutput_items, gr_vector_const_void_star& input_item
                     // old_time_debug = d_gnss_observables_map.cbegin()->second.RX_time * 1000.0;
                     uint32_t current_RX_time_ms = 0;
                     // #### solve PVT and store the corrected observable set
-                    if (d_internal_pvt_solver->get_PVT(d_gnss_observables_map, d_observable_interval_ms / 1000.0, *d_sensor_data_aggregator))
+                    const bool internal_pvt_valid = d_internal_pvt_solver->get_PVT(
+                        d_gnss_observables_map,
+                        d_observable_interval_ms / 1000.0,
+                        *d_sensor_data_aggregator);
+                    if (internal_pvt_valid)
                         {
                             d_pvt_errors_counter = 0;  // Reset consecutive PVT error counter
                             const double Rx_clock_offset_s = d_internal_pvt_solver->get_time_offset_s();
@@ -2244,6 +2274,22 @@ int rtklib_pvt_gs::work(int noutput_items, gr_vector_const_void_star& input_item
                         }
                     else
                         {
+                            if (d_local_counter_ms % 1000 == 0)
+                                {
+                                    std::cout << "PVT_INTERNAL_INVALID local_counter_ms="
+                                              << d_local_counter_ms
+                                              << " observable_count="
+                                              << d_gnss_observables_map.size();
+                                    for (const auto& observable : d_gnss_observables_map)
+                                        {
+                                            std::cout << " ch" << observable.first
+                                                      << "=" << observable.second.System
+                                                      << observable.second.PRN
+                                                      << ":tow_ms="
+                                                      << observable.second.TOW_at_current_symbol_ms;
+                                        }
+                                    std::cout << '\n';
+                                }
                             // sanity check: If the PVT solver is getting 100 consecutive errors, send a reset command to observables block
                             d_pvt_errors_counter++;
                             if (d_pvt_errors_counter >= 100)
@@ -2256,8 +2302,31 @@ int rtklib_pvt_gs::work(int noutput_items, gr_vector_const_void_star& input_item
                         }
 
                     // compute on the fly PVT solution
+                    if (d_local_counter_ms % 1000 == 0)
+                        {
+                            std::cout << "PVT_PIPELINE local_counter_ms="
+                                      << d_local_counter_ms
+                                      << " internal_valid=" << internal_pvt_valid
+                                      << " observable_count="
+                                      << d_gnss_observables_map.size()
+                                      << " rx_time_ms=" << current_RX_time_ms
+                                      << " output_mod_ms="
+                                      << (d_output_rate_ms == 0 ? 0 :
+                                                                  current_RX_time_ms % d_output_rate_ms)
+                                      << " compute_output="
+                                      << flag_compute_pvt_output << '\n';
+                        }
+
                     if (flag_compute_pvt_output == true)
                         {
+                            // A channel that has just become observable has an
+                            // arbitrary accumulated carrier-phase origin. PPP
+                            // must see that phase aligned to its pseudorange on
+                            // the very first epoch; waiting until after a valid
+                            // PPP solution creates a circular dependency and
+                            // can interrupt an existing fix while the new
+                            // ambiguity is rejected.
+                            initialize_and_apply_carrier_phase_offset();
                             flag_pvt_valid = d_user_pvt_solver->get_PVT(d_gnss_observables_map, d_output_rate_ms / 1000.0, *d_sensor_data_aggregator);
                         }
 
@@ -2269,10 +2338,6 @@ int rtklib_pvt_gs::work(int noutput_items, gr_vector_const_void_star& input_item
                             //                            trk_cmd_test->carrier_freq_hz = 12345.4;
                             //                            trk_cmd_test->sample_counter = d_gnss_observables_map.begin()->second.Tracking_sample_counter;
                             //                            this->message_port_pub(pmt::mp("pvt_to_trk"), pmt::make_any(trk_cmd_test));
-
-                            // initialize (if needed) the accumulated phase offset and apply it to the active channels
-                            // required to report accumulated phase cycles comparable to pseudoranges
-                            initialize_and_apply_carrier_phase_offset();
 
                             const double Rx_clock_offset_s = d_user_pvt_solver->get_time_offset_s();
                             if (d_enable_rx_clock_correction == true and fabs(Rx_clock_offset_s) > 0.000001)  // 1us !!
