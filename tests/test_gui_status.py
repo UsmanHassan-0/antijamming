@@ -60,6 +60,7 @@ class DummyWorker(QObject):
         self.stop_reasons: list[str] = []
         self.expected_sources = 1
         self.lcmv_test_enabled = False
+        self.rf_events: list[tuple[str, dict[str, object]]] = []
 
     def start(self) -> None:
         self.started = True
@@ -77,6 +78,9 @@ class DummyWorker(QObject):
     def set_lcmv_test_enabled(self, enabled: bool) -> None:
         self.lcmv_test_enabled = bool(enabled)
         self.status.emit(f"LCMV Test Nulling: {'ON' if enabled else 'OFF'}")
+
+    def mark_rf_event(self, event: str, **kwargs: object) -> None:
+        self.rf_events.append((str(event), dict(kwargs)))
 
 
 class SlowFinishWorker(DummyWorker):
@@ -383,7 +387,7 @@ def test_prn_chart_labels_bars_with_cno_and_axis_with_satellites(qtbot) -> None:
     ]
 
 
-def test_prn_chart_renders_tracked_prn_without_treating_it_as_stable(qtbot) -> None:
+def test_prn_chart_does_not_render_unstable_tracking_placeholder(qtbot) -> None:
     monitor = PocketPrnMonitor()
     qtbot.addWidget(monitor)
 
@@ -398,10 +402,10 @@ def test_prn_chart_renders_tracked_prn_without_treating_it_as_stable(qtbot) -> N
         ]
     )
 
-    assert monitor._displayed_prns == [9]
+    assert monitor._displayed_prns == []
     assert monitor._unstable_tracking_prns == [9]
-    assert monitor._bar_heights == [43.25]
-    assert [label.toPlainText() for label in monitor._label_items] == ["43.2"]
+    assert monitor._bar_heights == []
+    assert [label.toPlainText() for label in monitor._label_items] == []
 
 
 def test_gui_single_run_button_toggles_start_stop(qtbot) -> None:
@@ -524,6 +528,51 @@ def test_gui_coalesces_live_metrics_to_latest_refresh(qtbot) -> None:
     assert window._metrics_received_count == 2
     assert window._metrics_applied_count == 1
     assert window._metrics_coalesced_drop_count == 1
+
+
+def test_gui_rf_markers_include_current_attenuation_and_bladerf_gain(qtbot) -> None:
+    worker = DummyWorker()
+    window = MainWindow(StreamConfig(), worker)  # type: ignore[arg-type]
+    qtbot.addWidget(window)
+
+    assert window._jammer_on_button.isEnabled() is False
+    assert window._jammer_attenuation_spin.isEnabled() is True
+    window._on_status("USRP stream started")
+    assert worker.rf_events[:2] == [
+        (
+            "attenuation_db",
+            {
+                "attenuation_db": 50.0,
+                "notes": (
+                    "Automatically recorded GUI configured attenuation; "
+                    "this is not a measured RF power"
+                ),
+            },
+        ),
+        (
+            "bladeRF_gain_db",
+            {
+                "bladeRF_gain_db": 50.0,
+                "notes": (
+                    "Automatically recorded GUI selected bladeRF software gain; "
+                    "the GUI does not query or command an external bladeRF process"
+                ),
+            },
+        ),
+    ]
+    window._jammer_attenuation_spin.setValue(50.0)
+    window._bladerf_gain_spin.setValue(50.0)
+    window._jammer_on_button.click()
+
+    assert worker.rf_events[-1] == (
+        "jammer_on",
+        {"attenuation_db": 50.0, "bladeRF_gain_db": 50.0},
+    )
+    assert "jammer ON" in _plain_text(window._rf_event_status_label)
+
+    window._jammer_attenuation_spin.setValue(40.0)
+    window._record_rf_setting("attenuation_db")
+    assert worker.rf_events[-1] == ("attenuation_db", {"attenuation_db": 40.0})
 
 
 def test_gui_metrics_timer_clamps_aggressive_ui_interval(qtbot) -> None:
@@ -782,6 +831,37 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
     )
 
 
+def test_gui_labels_jammer_excess_suppression_separately_from_total_output(qtbot) -> None:
+    window = MainWindow(StreamConfig(), DummyWorker())  # type: ignore[arg-type]
+    qtbot.addWidget(window)
+    window.show()
+
+    window._refresh_lcmv_test_status(
+        {
+            "lcmv_test": {
+                "enabled": True,
+                "mode": "on",
+                "null_bearing_deg": 145.0,
+                "weight_transition_active": True,
+                "spatial_vector_diagnostics": {
+                    "lcmv_jammer_detected_latched": True,
+                    "jammer_only_suppression_estimate_available": True,
+                    "jammer_only_suppression_db": 12.25,
+                    "jammer_only_target_suppression_db": 31.75,
+                },
+                "output_metrics": {
+                    "measured_output_reduction_vs_uniform_db": 7.5,
+                    "measured_output_reduction_vs_raw_avg_channel_db": 4.0,
+                },
+            }
+        }
+    )
+
+    text = _plain_text(window._lcmv_null_bearing_label)
+    assert "jammer-excess suppression 12.2 dB applied / 31.8 dB target" in text
+    assert "total out reduction 7.5 dB (wanted included)" in text
+
+
 def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     worker = DummyWorker()
     window = MainWindow(StreamConfig(), worker)  # type: ignore[arg-type]
@@ -815,7 +895,7 @@ def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     assert not hasattr(window, "_skyplot_card")
     assert not _is_descendant(window._stream_summary_label, window._main_view)
     assert _plain_text(window._fix_chip) == "NO FIX"
-    assert _plain_text(window._accuracy_chip) == "--"
+    assert not hasattr(window, "_accuracy_chip")
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
     assert _plain_text(window._latitude_label) == "lat/long: -- / --"
     assert _plain_text(window._altitude_label) == "altitude: --"
@@ -823,8 +903,10 @@ def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     assert _plain_text(window._dop_label) == "HDOP/VDOP/PDOP/GDOP: -- / -- / -- / --"
     assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 0"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 0"
-    assert _plain_text(window._position_error_label) == "PVT accuracy: --"
-    assert _plain_text(window._enu_label) == "UTM east/north: -- / --"
+    assert not hasattr(window, "_position_error_label")
+    assert not hasattr(window, "_enu_label")
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
     assert "Fix:" not in _plain_text(window._receiver_summary_label)
     operator_text = "\n".join(_plain_text(label) for label in window._main_view.findChildren(QLabel))
     all_visible_text = "\n".join(_plain_text(label) for label in window.findChildren(QLabel))
@@ -846,11 +928,13 @@ def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     assert "Time:" in operator_text
     assert "HDOP/VDOP/PDOP/GDOP:" in operator_text
     assert "DOP HDOP/VDOP/PDOP/GDOP:" not in operator_text
-    assert "Satellites tracked:" in operator_text
-    assert "Satellites used for PVT:" in operator_text
-    assert "PVT accuracy:" in operator_text
+    assert "Satellites tracked:" not in operator_text
+    assert "Satellites used for PVT:" not in operator_text
+    assert "PVT accuracy:" not in operator_text
+    assert "CEP50:" in operator_text
+    assert "CEP95:" in operator_text
     assert "position 3D:" not in operator_text
-    assert "UTM east/north:" in operator_text
+    assert "UTM east/north:" not in operator_text
     assert "UTM east/north/up:" not in operator_text
     assert "East: -- / North: -- / Up: --" not in operator_text
     assert "Local East:" not in operator_text
@@ -936,7 +1020,7 @@ def test_operator_tabs_style_centers_tabs_and_removes_separator_line() -> None:
     assert f"color:{INFO}" in style
 
 
-def test_gui_clears_fix_and_hides_accuracy_without_pvt(qtbot) -> None:
+def test_gui_clears_fix_and_cep_without_pvt(qtbot) -> None:
     cfg = StreamConfig()
     worker = DummyWorker()
     window = MainWindow(cfg, worker)  # type: ignore[arg-type]
@@ -958,9 +1042,9 @@ def test_gui_clears_fix_and_hides_accuracy_without_pvt(qtbot) -> None:
         }
     )
     assert _plain_text(window._fix_chip) == "FIX"
-    assert _plain_text(window._accuracy_chip) == "1.20 m"
     assert _plain_text(window._position_status_label) == "PVT fix: 3D Fix"
-    assert _plain_text(window._position_error_label) == "PVT accuracy: 1.20 m"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
 
     window._on_data_ready(
         {
@@ -975,9 +1059,9 @@ def test_gui_clears_fix_and_hides_accuracy_without_pvt(qtbot) -> None:
     )
 
     assert _plain_text(window._fix_chip) == "NO FIX"
-    assert _plain_text(window._accuracy_chip) == "--"
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
-    assert _plain_text(window._position_error_label) == "PVT accuracy: --"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
 
 
 def test_gui_keeps_gnss_sdr_runtime_status_in_main_view(qtbot) -> None:
@@ -1239,7 +1323,8 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     assert _plain_text(window._position_status_label) == "PVT fix: DEGRADED"
     assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 5"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 1 (G09)"
-    assert _plain_text(window._position_error_label) == "PVT accuracy: --"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
     assert window._prn_monitor._bar_width == pytest.approx(PRN_SINGLE_BAR_WIDTH)
     assert PRN_BAR_OUTER_MARGIN == pytest.approx(PRN_BAR_GAP)
     assert (
@@ -1391,12 +1476,12 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
         }
     )
 
-    assert window._prn_monitor._displayed_prns == [8]
-    assert window._prn_monitor._pending_tracking_prns == [8]
-    assert window._prn_monitor._pending_tracking_reasons == {8: "missing_cno"}
-    assert window._prn_monitor._bar_positions == [_bar_position_for_index(0)]
-    assert window._prn_monitor._bar_heights == [PRN_STATE_BAR_HEIGHT]
-    assert [label.toPlainText() for label in window._prn_monitor._label_items] == ["--"]
+    assert window._prn_monitor._displayed_prns == []
+    assert window._prn_monitor._pending_tracking_prns == []
+    assert window._prn_monitor._pending_tracking_reasons == {}
+    assert window._prn_monitor._bar_positions == []
+    assert window._prn_monitor._bar_heights == []
+    assert [label.toPlainText() for label in window._prn_monitor._label_items] == []
     assert window._skyplot_monitor._plotted_prns == []
 
     window._on_data_ready(
@@ -1534,8 +1619,8 @@ def test_receiver_projection_prevents_skyplot_tracking_contradictions(qtbot) -> 
         }
     )
 
-    # The chart shows the actual tracking state; the skyplot still excludes the
-    # satellite because it lacks stable, fresh navigation/PVT geometry.
+    # The C/N0 chart shows the current measured value immediately; the skyplot
+    # still withholds an unstable channel without fresh PVT geometry.
     assert window._prn_monitor._displayed_prns == [12]
     assert window._skyplot_monitor._plotted_prns == []
     assert window._stable_prns == []
@@ -1543,8 +1628,8 @@ def test_receiver_projection_prevents_skyplot_tracking_contradictions(qtbot) -> 
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
     assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 1"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 0"
-    assert _plain_text(window._position_error_label) == "PVT accuracy: --"
-    assert _plain_text(window._accuracy_chip) == "--"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
 
 
 def test_prn_chart_keeps_gps_and_beidou_with_same_prn_number(qtbot) -> None:
@@ -1642,7 +1727,8 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
     assert _plain_text(window._position_status_label) == "PVT fix: 3D Fix"
     assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 2"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 1 (G09)"
-    assert _plain_text(window._position_error_label) == "PVT accuracy: 1.40 m"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
     tracking_marker = window._skyplot_monitor._marker_items[0]
     assert tracking_marker.opts["brush"].color().name().upper() == BG_PANEL.upper()
     assert tracking_marker.opts["pen"].color().name().upper() == GPS_TRACKING.upper()
@@ -1689,7 +1775,8 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
     assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 2"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 0"
-    assert _plain_text(window._position_error_label) == "PVT accuracy: --"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
     assert window._skyplot_monitor._marker_items[0].opts["brush"].color().name().upper() == (
         BG_PANEL.upper()
     )
@@ -1738,7 +1825,7 @@ def test_receiver_projection_clears_operator_state_on_error(qtbot) -> None:
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 0"
 
 
-def test_receiver_projection_holds_stable_prn_during_transient_tracking_monitor_gap(qtbot) -> None:
+def test_receiver_projection_clears_stable_prn_during_tracking_monitor_gap(qtbot) -> None:
     worker = DummyWorker()
     window = MainWindow(StreamConfig(), worker)  # type: ignore[arg-type]
     qtbot.addWidget(window)
@@ -1801,21 +1888,20 @@ def test_receiver_projection_holds_stable_prn_during_transient_tracking_monitor_
 
     window._on_data_ready(transient_gap_snapshot)
 
-    assert window._prn_monitor._displayed_prns == [9]
-    assert window._stable_prns == [9]
-    assert window._current_used_in_pvt_prns == [9]
-    assert window._skyplot_monitor._plotted_prns == [9]
+    assert window._prn_monitor._displayed_prns == []
+    assert window._stable_prns == []
+    assert window._current_used_in_pvt_prns == []
+    assert window._skyplot_monitor._plotted_prns == []
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 1 (G09)"
-    held_entry, _ = window._prn_display_hold["G09"]
-    window._prn_display_hold["G09"] = (held_entry, 0.0)
+    assert window._prn_display_hold == {}
     window._on_data_ready(transient_gap_snapshot)
 
-    assert window._prn_monitor._displayed_prns == [9]
-    assert window._stable_prns == [9]
-    assert window._current_used_in_pvt_prns == [9]
+    assert window._prn_monitor._displayed_prns == []
+    assert window._stable_prns == []
+    assert window._current_used_in_pvt_prns == []
 
 
-def test_receiver_projection_expires_hold_but_keeps_tracked_placeholder(qtbot) -> None:
+def test_receiver_projection_does_not_hold_tracked_placeholder(qtbot) -> None:
     worker = DummyWorker()
     window = MainWindow(StreamConfig(), worker)  # type: ignore[arg-type]
     qtbot.addWidget(window)
@@ -1859,15 +1945,14 @@ def test_receiver_projection_expires_hold_but_keeps_tracked_placeholder(qtbot) -
 
     window._on_data_ready(locked_snapshot)
     assert window._prn_monitor._displayed_prns == [9]
-    held_entry, _ = window._prn_display_hold["G09"]
-    window._prn_display_hold["G09"] = (held_entry, 0.0)
+    assert window._prn_display_hold == {}
 
     window._on_data_ready(transient_gap_snapshot)
 
-    assert window._prn_monitor._displayed_prns == [9]
-    assert window._prn_monitor._pending_tracking_prns == [9]
-    assert window._prn_monitor._bar_heights == [PRN_STATE_BAR_HEIGHT]
-    assert [label.toPlainText() for label in window._prn_monitor._label_items] == ["--"]
+    assert window._prn_monitor._displayed_prns == []
+    assert window._prn_monitor._pending_tracking_prns == []
+    assert window._prn_monitor._bar_heights == []
+    assert [label.toPlainText() for label in window._prn_monitor._label_items] == []
     assert window._stable_prns == []
     assert window._current_used_in_pvt_prns == []
 
@@ -1943,6 +2028,12 @@ def test_gui_shows_gnss_fix_accuracy_from_snapshot(qtbot) -> None:
                     "pdop": 1.47,
                     "gdop": 1.51,
                     "valid_sats": 12,
+                    "cep50_m": 0.48,
+                    "cep95_m": 1.27,
+                    "cep_sample_count": 30,
+                    "cep_window_points": 30,
+                    "cep_ready": True,
+                    "truth_available": True,
                 }
             }
         }
@@ -1950,15 +2041,12 @@ def test_gui_shows_gnss_fix_accuracy_from_snapshot(qtbot) -> None:
 
     assert _plain_text(window._fix_chip) == "FIX"
     assert _plain_text(window._position_status_label) == "PVT fix: 3D Fix"
-    assert _plain_text(window._accuracy_chip) == "1.92 m"
     assert _plain_text(window._latitude_label) == "lat/long: 33.6412345° / 73.0712345°"
     assert _plain_text(window._altitude_label) == "altitude: 542.4 m"
     assert _plain_text(window._receiver_time_label) == "Time: 01:01:01"
     assert _plain_text(window._dop_label) == "HDOP/VDOP/PDOP/GDOP: 0.82 / 1.22 / 1.47 / 1.51"
-    assert _plain_text(window._enu_label) == (
-        "UTM east/north: 321124.222 / 3724046.252 (43N)"
-    )
-    assert _plain_text(window._position_error_label) == "PVT accuracy: 1.92 m"
+    assert _plain_text(window._cep50_label) == "CEP50: 0.48 m"
+    assert _plain_text(window._cep95_label) == "CEP95: 1.27 m"
 
     window._on_data_ready(
         {
@@ -1985,7 +2073,8 @@ def test_gui_shows_gnss_fix_accuracy_from_snapshot(qtbot) -> None:
     assert _plain_text(window._altitude_label) == "altitude: --"
     assert _plain_text(window._receiver_time_label) == "Time: 01:01:02"
     assert _plain_text(window._dop_label) == "HDOP/VDOP/PDOP/GDOP: -- / -- / -- / --"
-    assert _plain_text(window._enu_label) == "UTM east/north: -- / --"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
 
     window._on_data_ready(
         {
@@ -2026,7 +2115,8 @@ def test_gui_shows_gnss_fix_accuracy_from_snapshot(qtbot) -> None:
 
     assert _plain_text(window._fix_chip) == "FIX"
     assert _plain_text(window._position_status_label) == "PVT fix: 2D Fix"
-    assert _plain_text(window._accuracy_chip) == "--"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
     assert not hasattr(window, "_accuracy_summary_label")
 
 
@@ -2050,7 +2140,8 @@ def test_gui_marks_current_high_dop_pvt_as_degraded(qtbot) -> None:
     )
     assert _plain_text(window._fix_chip) == "DEGRADED"
     assert _plain_text(window._position_status_label) == "PVT fix: 3D Fix"
-    assert _plain_text(window._accuracy_chip) == "12.13 m"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
 
     window._on_data_ready(
         {
@@ -2068,7 +2159,8 @@ def test_gui_marks_current_high_dop_pvt_as_degraded(qtbot) -> None:
         }
     )
     assert _plain_text(window._position_status_label) == "PVT fix: 3D Fix"
-    assert _plain_text(window._accuracy_chip) == "1030.29 m"
+    assert _plain_text(window._cep50_label) == "CEP50: --"
+    assert _plain_text(window._cep95_label) == "CEP95: --"
 
 
 def test_gui_uses_gnss_sdr_pvt_observation_count_for_used_count(qtbot) -> None:

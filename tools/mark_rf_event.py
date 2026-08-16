@@ -4,26 +4,23 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from antijamming.logging import RF_EVENTS, record_event  # noqa: E402
 
 
-EVENTS = (
-    "jammer_on",
-    "jammer_off",
-    "bladeRF_on",
-    "bladeRF_off",
-    "lcmv_on",
-    "lcmv_off",
-    "attenuation_db",
-    "bladeRF_gain_db",
-    "notes",
+EVENTS = tuple(sorted(RF_EVENTS | {
     "bladerf_on",
     "bladerf_off",
     "bladerf_gain_db",
-)
+}))
 
 EVENT_ALIASES = {
     "bladerf_on": "bladeRF_on",
@@ -41,23 +38,14 @@ def main() -> int:
     parser.add_argument("--logs", type=Path, default=Path("logs"))
     args = parser.parse_args()
 
-    payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "event": EVENT_ALIASES.get(args.event, args.event),
-        "attenuation_db": args.attenuation_db,
-        "bladeRF_gain_db": args.bladerf_gain_db,
-        "notes": str(args.notes),
-    }
-    path = args.logs / "operator_events.log"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
-        "utf-8"
+    payload = record_event(
+        args.logs,
+        EVENT_ALIASES.get(args.event, args.event),
+        source="cli",
+        attenuation_db=args.attenuation_db,
+        bladeRF_gain_db=args.bladerf_gain_db,
+        notes=str(args.notes),
     )
-    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o664)
-    try:
-        os.write(fd, line)
-    finally:
-        os.close(fd)
     print(json.dumps(payload, sort_keys=True))
     return 0
 

@@ -115,12 +115,13 @@ class ReceiverProjection:
             }
         )
 
-        prn_entries = self._apply_prn_display_hold(
-            prn_entries,
-            pvt_current,
-            raw_used_in_fix_satellites,
-            now=now,
-        )
+        # The C/N0 chart is a measurement chart, not a channel-state chart.
+        # Admit a currently tracking satellite as soon as GNSS-SDR supplies a
+        # real tracking C/N0.  Stability and PVT use affect qualification and
+        # colour, but must not delay the first honest C/N0 bar.  Never carry a
+        # prior value through a missing sample: that produced labelled PRNs
+        # with a "--" bar and made a lost or pending channel look current.
+        self.display_hold.clear()
         stable_prns = sorted(
             {
                 prn
@@ -137,6 +138,9 @@ class ReceiverProjection:
             for sat_id in [satellite_id(entry)]
             if sat_id != "--"
         }
+        tracking_cno_entries = [
+            entry for entry in prn_entries if is_current_tracking_cno_entry(entry)
+        ]
 
         current_used_in_pvt_prns = set(stable_prns) & raw_used_in_fix_prns
         current_used_in_pvt_satellites = stable_satellite_ids & raw_used_in_fix_satellites
@@ -181,7 +185,7 @@ class ReceiverProjection:
         tracking_without_geometry = sorted(set(current_tracking_prns) - set(fresh_geometry_prns))
 
         return ReceiverViewState(
-            prn_entries=prn_entries,
+            prn_entries=tracking_cno_entries,
             sky_entries=projected_sky_entries,
             current_tracking_prns=current_tracking_prns,
             current_tracking_satellite_ids=sorted(
@@ -301,6 +305,15 @@ def is_stable_tracking_entry(entry: dict[str, object]) -> bool:
     return bool(entry.get("cno_stable", False)) and cno is not None and cno > 0.0
 
 
+def is_current_tracking_cno_entry(entry: dict[str, object]) -> bool:
+    """Return true when a live tracking C/N0 can be plotted honestly."""
+
+    if str(entry.get("state", "")).lower() != "tracking":
+        return False
+    cno = valid_float(entry.get("cno_db_hz"))
+    return cno is not None and cno > 0.0
+
+
 def valid_float(value: object) -> float | None:
     try:
         number = float(value)
@@ -349,6 +362,7 @@ __all__ = [
     "ReceiverProjection",
     "ReceiverViewState",
     "is_stable_tracking_entry",
+    "is_current_tracking_cno_entry",
     "prn_monitor_entries",
     "satellite_id",
     "satellite_sort_key",

@@ -13,6 +13,7 @@ from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QBoxLayout,
     QCheckBox,
+    QDoubleSpinBox,
     QLabel,
     QMainWindow,
     QPushButton,
@@ -120,18 +121,19 @@ class MainWindow(QMainWindow):
         # Summary labels are operator-facing state. Detailed detector rows and
         # system labels derive from the same state.
         self._operator_title_label = QLabel("Anti-Jam GNSS Receiver")
-        self._receiver_summary_label = QLabel(
-            "Position not available | Satellites tracked 0 | Used for PVT 0 | Position --"
-        )
+        self._receiver_summary_label = QLabel("Position not available")
         self._position_status_label = QLabel("PVT fix: NO FIX")
         self._latitude_label = QLabel("lat/long: -- / --")
         self._altitude_label = QLabel("altitude: --")
         self._receiver_time_label = QLabel("Time: --")
         self._dop_label = QLabel("HDOP/VDOP/PDOP/GDOP: -- / -- / -- / --")
+        self._cep50_label = QLabel("CEP50: --")
+        self._cep95_label = QLabel("CEP95: --")
+        # Retained as internal status sinks for diagnostics/tests. Satellite
+        # counts are already represented by the PRN chart and skyplot, so the
+        # labels are deliberately not added to the operator-facing layout.
         self._satellites_tracked_label = QLabel("Satellites tracked: 0")
         self._satellites_used_label = QLabel("Satellites used for PVT: 0")
-        self._position_error_label = QLabel("PVT accuracy: --")
-        self._enu_label = QLabel("UTM east/north: -- / --")
         self._system_health_label = QLabel("System health: Idle")
         self._antijam_summary_label = QLabel("DoA -- | MUSIC sources --")
         self._stream_summary_label = QLabel("Idle\nOutput: Uniform array IQ -> GNSS-SDR")
@@ -139,11 +141,22 @@ class MainWindow(QMainWindow):
         self._expected_sources_control = self._build_expected_sources_control()
         self._lcmv_test_checkbox = QCheckBox("LCMV Test Nulling")
         self._lcmv_test_control = self._build_lcmv_test_control()
+        self._rf_event_status_label = QLabel(
+            "Optional ground truth: jammer UNKNOWN | bladeRF UNKNOWN"
+        )
+        self._jammer_on_button = QPushButton("Record jammer ON")
+        self._jammer_off_button = QPushButton("Record jammer OFF")
+        self._bladerf_on_button = QPushButton("Record bladeRF ON")
+        self._bladerf_off_button = QPushButton("Record bladeRF OFF")
+        self._jammer_attenuation_spin = QDoubleSpinBox()
+        self._bladerf_gain_spin = QDoubleSpinBox()
+        self._operator_jammer_state = "UNKNOWN"
+        self._operator_bladerf_state = "UNKNOWN"
+        self._rf_event_control = self._build_rf_event_control()
         self._lcmv_test_status_label = QLabel("LCMV Test Nulling: OFF")
         self._lcmv_null_bearing_label = QLabel("Null bearing / MUSIC peak: --")
         self._stream_status_text = "Idle"
         self._receiver_fix_text = "Not available"
-        self._receiver_accuracy_text = "--"
         self._tracking_prn_count = 0
         self._stable_prn_count = 0
         self._used_in_pvt_count = 0
@@ -188,7 +201,6 @@ class MainWindow(QMainWindow):
         self._mode_chip = QLabel("")
         self._fix_chip = QLabel("Not available")
         self._doa_chip = QLabel("--")
-        self._accuracy_chip = QLabel("--")
         self._stable_prns_chip = QLabel("0")
         self._used_in_pvt_chip = QLabel("0")
         self._gnss_chip = QLabel("")
@@ -224,7 +236,7 @@ class MainWindow(QMainWindow):
         self._set_fix_chip("Not available", ALERT)
         self._clear_antijam_operator_state()
         self._set_direction_chip("--", INFO)
-        self._set_accuracy_chip("--", INFO)
+        self._set_cep_metrics({}, False)
         self._gnss_chip.hide()
         self._set_status_state("idle", "Idle")
 
@@ -499,6 +511,8 @@ class MainWindow(QMainWindow):
         antijam_labels = (
             self._expected_sources_control,
             self._lcmv_test_control,
+            self._rf_event_control,
+            self._rf_event_status_label,
             self._lcmv_test_status_label,
             self._lcmv_null_bearing_label,
             self._music_sources_label,
@@ -625,10 +639,8 @@ class MainWindow(QMainWindow):
             self._altitude_label,
             self._receiver_time_label,
             self._dop_label,
-            self._satellites_tracked_label,
-            self._satellites_used_label,
-            self._position_error_label,
-            self._enu_label,
+            self._cep50_label,
+            self._cep95_label,
         )
         self._receiver_overview_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
         self._receiver_overview_row.setContentsMargins(*ZERO_MARGINS)
@@ -855,17 +867,6 @@ class MainWindow(QMainWindow):
         )
         self._refresh_operator_summaries()
 
-    def _set_accuracy_chip(
-        self,
-        value: str,
-        color: str,
-        title: str = "PVT accuracy",
-    ) -> None:
-        self._set_summary_chip(
-            "_receiver_accuracy_text", self._accuracy_chip, self._position_error_label,
-            title, value, color
-        )
-
     def _set_direction_chip(self, value: str, color: str = INFO) -> None:
         self._doa_summary_text = value
         self._doa_chip.setText(value)
@@ -938,12 +939,7 @@ class MainWindow(QMainWindow):
         self._set_status_row(self._system_health_label, "System health", value, color)
 
     def _refresh_operator_summaries(self) -> None:
-        receiver_text = (
-            f"Position {self._receiver_fix_text.lower()} | "
-            f"Satellites tracked {self._tracking_prn_count} | "
-            f"Used for PVT {self._used_in_pvt_count} | "
-            f"Error {self._receiver_accuracy_text}"
-        )
+        receiver_text = f"Position {self._receiver_fix_text.lower()}"
         antijam_text = (
             f"DoA {self._doa_summary_text} | "
             f"Sources {self._source_count_summary_text}"
@@ -1017,6 +1013,20 @@ class MainWindow(QMainWindow):
             self._run_btn.setEnabled(True)
             self._run_btn.setStyleSheet(start_button_style())
             self._set_status_chip(message, INFO)
+        rf_markers_enabled = state in {"running", "degraded"}
+        for button in (
+            self._jammer_on_button,
+            self._jammer_off_button,
+            self._bladerf_on_button,
+            self._bladerf_off_button,
+        ):
+            button.setEnabled(rf_markers_enabled)
+        # Settings can be selected before Start. They are logged automatically
+        # when the new stream reports started; editing while running records a
+        # new setting event. These widgets record settings, not measured power.
+        rf_settings_enabled = state != "stopping"
+        self._jammer_attenuation_spin.setEnabled(rf_settings_enabled)
+        self._bladerf_gain_spin.setEnabled(rf_settings_enabled)
         if state in {"idle", "error"}:
             self._clear_gnss_operator_state()
             self._clear_antijam_operator_state()
@@ -1073,6 +1083,71 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return container
 
+    def _build_rf_event_control(self) -> QWidget:
+        """Build operator-declared physical-state markers and RF settings."""
+
+        container = QWidget()
+        container.setObjectName("rfEventMarkerControl")
+        container.setAccessibleName("Optional operator RF ground-truth markers")
+        container.setStyleSheet(transparent_style())
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(*ZERO_MARGINS)
+        layout.setSpacing(COMPACT_SPACING)
+
+        settings_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        jammer_label = QLabel("Configured jammer attenuation (dB)")
+        self._jammer_attenuation_spin.setRange(0.0, 90.0)
+        self._jammer_attenuation_spin.setDecimals(1)
+        self._jammer_attenuation_spin.setSingleStep(1.0)
+        self._jammer_attenuation_spin.setValue(50.0)
+        self._jammer_attenuation_spin.setAccessibleName("Jammer attenuation dB")
+        self._jammer_attenuation_spin.setEnabled(False)
+        self._jammer_attenuation_spin.editingFinished.connect(
+            lambda: self._record_rf_setting("attenuation_db")
+        )
+        bladerf_label = QLabel("Declared bladeRF SW gain (dB)")
+        self._bladerf_gain_spin.setRange(-23.75, 66.0)
+        self._bladerf_gain_spin.setDecimals(2)
+        self._bladerf_gain_spin.setSingleStep(1.0)
+        configured_bladerf_gain = valid_float(
+            getattr(self._cfg, "experiment", {}).get("bladeRF_tx_gain_db")
+        )
+        self._bladerf_gain_spin.setValue(
+            50.0 if configured_bladerf_gain is None else configured_bladerf_gain
+        )
+        self._bladerf_gain_spin.setAccessibleName("bladeRF software gain dB")
+        self._bladerf_gain_spin.setEnabled(False)
+        self._bladerf_gain_spin.editingFinished.connect(
+            lambda: self._record_rf_setting("bladeRF_gain_db")
+        )
+        for widget in (
+            jammer_label,
+            self._jammer_attenuation_spin,
+            bladerf_label,
+            self._bladerf_gain_spin,
+        ):
+            settings_row.addWidget(widget)
+        settings_row.addStretch(1)
+        layout.addLayout(settings_row)
+
+        button_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        button_row.setSpacing(COMPACT_SPACING)
+        for button, event in (
+            (self._jammer_on_button, "jammer_on"),
+            (self._jammer_off_button, "jammer_off"),
+            (self._bladerf_on_button, "bladeRF_on"),
+            (self._bladerf_off_button, "bladeRF_off"),
+        ):
+            button.setMinimumHeight(CONTROL_H)
+            button.setAccessibleName(button.text())
+            button.clicked.connect(
+                lambda _checked=False, selected=event: self._mark_rf_event(selected)
+            )
+            button.setEnabled(False)
+            button_row.addWidget(button, stretch=1)
+        layout.addLayout(button_row)
+        return container
+
     def _configure_expected_sources_control(self) -> None:
         max_sources = max(len(self._cfg.channels) - 1, 1)
         initial = min(max(1, int(self._cfg.expected_sources)), max_sources)
@@ -1117,6 +1192,81 @@ class MainWindow(QMainWindow):
         )
         self._refresh_operator_summaries()
         self._refresh_system_info()
+
+    def _mark_rf_event(self, event: str) -> None:
+        marker = str(event)
+        setter = getattr(self._worker, "mark_rf_event", None)
+        if not callable(setter):
+            self._log.error("RF event marker is unavailable: %s", marker)
+            return
+        setter(
+            marker,
+            attenuation_db=float(self._jammer_attenuation_spin.value()),
+            bladeRF_gain_db=float(self._bladerf_gain_spin.value()),
+        )
+        if marker == "jammer_on":
+            self._operator_jammer_state = "ON"
+        elif marker == "jammer_off":
+            self._operator_jammer_state = "OFF"
+        elif marker == "bladeRF_on":
+            self._operator_bladerf_state = "ON"
+        elif marker == "bladeRF_off":
+            self._operator_bladerf_state = "OFF"
+        self._rf_event_status_label.setText(
+            "Optional ground truth: "
+            f"jammer {self._operator_jammer_state} | "
+            f"bladeRF {self._operator_bladerf_state}"
+        )
+        self._log.info("UI action: physical_rf_event=%s", marker)
+
+    def _record_rf_setting(self, event: str) -> None:
+        if self._stream_status_state not in {"running", "degraded"}:
+            return
+        setter = getattr(self._worker, "mark_rf_event", None)
+        if not callable(setter):
+            return
+        kwargs: dict[str, float] = {}
+        if event == "attenuation_db":
+            kwargs["attenuation_db"] = float(self._jammer_attenuation_spin.value())
+        elif event == "bladeRF_gain_db":
+            kwargs["bladeRF_gain_db"] = float(self._bladerf_gain_spin.value())
+        setter(event, **kwargs)
+        self._log.info("UI action: physical_rf_setting=%s values=%s", event, kwargs)
+
+    def _replay_known_rf_state_for_new_run(self) -> None:
+        """Record selected RF settings and seed the last declared state."""
+
+        setter = getattr(self._worker, "mark_rf_event", None)
+        if not callable(setter):
+            return
+        setter(
+            "attenuation_db",
+            attenuation_db=float(self._jammer_attenuation_spin.value()),
+            notes=(
+                "Automatically recorded GUI configured attenuation; "
+                "this is not a measured RF power"
+            ),
+        )
+        setter(
+            "bladeRF_gain_db",
+            bladeRF_gain_db=float(self._bladerf_gain_spin.value()),
+            notes=(
+                "Automatically recorded GUI selected bladeRF software gain; "
+                "the GUI does not query or command an external bladeRF process"
+            ),
+        )
+        for device, state in (
+            ("jammer", self._operator_jammer_state),
+            ("bladeRF", self._operator_bladerf_state),
+        ):
+            if state not in {"ON", "OFF"}:
+                continue
+            setter(
+                f"{device}_{state.lower()}",
+                attenuation_db=float(self._jammer_attenuation_spin.value()),
+                bladeRF_gain_db=float(self._bladerf_gain_spin.value()),
+                notes="GUI reasserted last explicit physical state after stream restart",
+            )
 
     def _configured_feed_label(self) -> str:
         if not bool(self._cfg.gnss_sdr_enable):
@@ -1276,6 +1426,8 @@ class MainWindow(QMainWindow):
             self._set_status_state("degraded", message)
         elif "started" in lower:
             self._set_status_state("running", "Streaming")
+            if lower.strip() == "usrp stream started":
+                self._replay_known_rf_state_for_new_run()
         elif (
             "preparing" in lower
             or "initializing" in lower
@@ -1603,7 +1755,6 @@ class MainWindow(QMainWindow):
         self._tracking_without_geometry = []
         self._set_prn_counts(0, 0)
         self._set_fix_chip("NO FIX", ALERT)
-        self._set_accuracy_chip("--", INFO)
         self._set_receiver_pvt_details({}, False)
         self._last_prn_chart_signature = None
         self._last_skyplot_signature = None
@@ -1631,7 +1782,6 @@ class MainWindow(QMainWindow):
             self._last_skyplot_signature = None
             self._set_prn_counts(0, 0)
             self._set_fix_chip("NO FIX", ALERT)
-            self._set_accuracy_chip("--", INFO)
             self._set_receiver_pvt_details({}, False)
             self._refresh_system_info()
             return
@@ -1689,7 +1839,7 @@ class MainWindow(QMainWindow):
                 receiver_state.raw_used_in_fix_satellites,
                 tracking_count=len(receiver_state.current_tracking_satellite_ids),
             )
-            self._refresh_receiver_fix_and_accuracy(
+            self._refresh_receiver_fix(
                 gnss_snapshot,
                 receiver_state.pvt_current,
                 receiver_state.used_for_pvt_count,
@@ -1700,7 +1850,7 @@ class MainWindow(QMainWindow):
             )
             self._refresh_system_info()
 
-    def _refresh_receiver_fix_and_accuracy(
+    def _refresh_receiver_fix(
         self,
         gnss_snapshot: dict[str, object],
         pvt_current: bool,
@@ -1708,36 +1858,19 @@ class MainWindow(QMainWindow):
     ) -> None:
         if gnss_snapshot.get("pvt_output_seen") is False or not pvt_current:
             self._set_fix_chip("NO FIX", ALERT)
-            self._set_accuracy_chip("--", INFO)
             return
         accuracy = gnss_snapshot.get("accuracy", {})
         if not isinstance(accuracy, dict) or not accuracy:
             self._set_fix_chip("DEGRADED", WARNING)
-            self._set_accuracy_chip("--", INFO)
             return
 
-        horizontal_error = valid_float(accuracy.get("horizontal_error_m"))
-        three_d_error = valid_float(accuracy.get("three_d_error_m"))
         fix_type = str(accuracy.get("fix_type", ""))
-        fix_type_lower = fix_type.strip().lower()
-        is_three_d = "3d" in fix_type_lower
-        title = "PVT accuracy"
-        if is_three_d and three_d_error is not None:
-            text = f"{three_d_error:.2f} m"
-        elif horizontal_error is not None:
-            text = f"{horizontal_error:.2f} m"
-        elif three_d_error is not None:
-            text = f"{three_d_error:.2f} m"
-        else:
-            text = "--"
         pvt_status, pvt_color = self._format_pvt_status(
             str(accuracy.get("fix_type", "")),
             used_for_pvt_count,
             accuracy,
         )
         self._set_fix_chip(pvt_status, pvt_color, self._format_fix_value(fix_type))
-        accuracy_color = pvt_color if pvt_status == "DEGRADED" else SUCCESS
-        self._set_accuracy_chip(text, accuracy_color if text != "--" else INFO, title)
 
     def _set_receiver_pvt_details(
         self,
@@ -1747,12 +1880,10 @@ class MainWindow(QMainWindow):
         accuracy = gnss_snapshot.get("accuracy", {}) if pvt_current else {}
         if not isinstance(accuracy, dict):
             accuracy = {}
+        self._set_cep_metrics(accuracy, pvt_current)
         lat = valid_float(accuracy.get("lat_deg"))
         lon = valid_float(accuracy.get("lon_deg"))
         alt = valid_float(accuracy.get("alt_m"))
-        utm_easting = valid_float(accuracy.get("utm_easting_m"))
-        utm_northing = valid_float(accuracy.get("utm_northing_m"))
-        utm_zone = str(accuracy.get("utm_zone") or "").strip()
         hdop = valid_float(accuracy.get("hdop"))
         vdop = valid_float(accuracy.get("vdop"))
         pdop = valid_float(accuracy.get("pdop"))
@@ -1766,17 +1897,6 @@ class MainWindow(QMainWindow):
         lat_lon_text = f"{lat:.7f}° / {lon:.7f}°" if lat_lon_available else "-- / --"
         altitude_available = pvt_current and alt is not None
         altitude_text = f"{alt:.1f} m" if altitude_available else "--"
-        utm_available = (
-            pvt_current
-            and utm_easting is not None
-            and utm_northing is not None
-            and bool(utm_zone)
-        )
-        utm_text = (
-            f"{utm_easting:.3f} / {utm_northing:.3f} ({utm_zone})"
-            if utm_available
-            else "-- / --"
-        )
         rows = (
             (
                 self._latitude_label,
@@ -1802,12 +1922,6 @@ class MainWindow(QMainWindow):
                 dop_text if pvt_current else "-- / -- / -- / --",
                 True if dop_has_value else None,
             ),
-            (
-                self._enu_label,
-                "UTM east/north",
-                utm_text,
-                True if utm_available else None,
-            ),
         )
         for label, title, value, valid in rows:
             self._set_status_row(
@@ -1816,6 +1930,56 @@ class MainWindow(QMainWindow):
                 value,
                 SUCCESS if pvt_current and valid is not None else INFO,
             )
+
+    def _set_cep_metrics(
+        self,
+        accuracy: dict[str, object],
+        pvt_current: bool,
+    ) -> None:
+        """Show CEP over every valid fix collected in the current run."""
+        cep50 = valid_float(accuracy.get("cep50_m")) if pvt_current else None
+        cep95 = valid_float(accuracy.get("cep95_m")) if pvt_current else None
+        minimum_points = max(
+            0,
+            int(
+                valid_float(
+                    accuracy.get(
+                        "cep_min_points",
+                        accuracy.get("cep_window_points"),
+                    )
+                )
+                or 0
+            ),
+        )
+        truth_available = bool(accuracy.get("truth_available", False))
+        ready = (
+            pvt_current
+            and truth_available
+            and bool(accuracy.get("cep_ready", False))
+            and minimum_points > 0
+            and cep50 is not None
+            and cep95 is not None
+        )
+        if ready:
+            self._set_status_row(
+                self._cep50_label,
+                "CEP50",
+                f"{cep50:.2f} m",
+                SUCCESS,
+            )
+            self._set_status_row(
+                self._cep95_label,
+                "CEP95",
+                f"{cep95:.2f} m",
+                SUCCESS,
+            )
+            return
+        if pvt_current and truth_available and minimum_points > 0:
+            self._set_status_row(self._cep50_label, "CEP50", "warming", INFO)
+            self._set_status_row(self._cep95_label, "CEP95", "warming", INFO)
+            return
+        self._set_status_row(self._cep50_label, "CEP50", "--", INFO)
+        self._set_status_row(self._cep95_label, "CEP95", "--", INFO)
 
     @staticmethod
     def _format_meter_value(value: float | None) -> str:
@@ -2052,6 +2216,31 @@ class MainWindow(QMainWindow):
         reduction_raw_avg_db = valid_float(
             output_metrics.get("measured_output_reduction_vs_raw_avg_channel_db")
         )
+        jammer_suppression_available = bool(
+            spatial.get("jammer_only_suppression_estimate_available", False)
+        )
+        jammer_suppression_db = valid_float(
+            spatial.get("jammer_only_suppression_db")
+        )
+        jammer_target_suppression_db = valid_float(
+            spatial.get("jammer_only_target_suppression_db")
+        )
+        if (
+            mode == "on"
+            and jammer_suppression_available
+            and jammer_suppression_db is not None
+        ):
+            bearing_text = (
+                f"{bearing_text} | jammer-excess suppression "
+                f"{jammer_suppression_db:.1f} dB applied"
+            )
+            if (
+                transition_active
+                and jammer_target_suppression_db is not None
+            ):
+                bearing_text = (
+                    f"{bearing_text} / {jammer_target_suppression_db:.1f} dB target"
+                )
         if reduction_uniform_db is not None and mode == "on":
             bearing_text = (
                 f"{bearing_text} | total out reduction {reduction_uniform_db:.1f} dB"

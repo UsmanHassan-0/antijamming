@@ -89,6 +89,26 @@ class RemoteStreamWorker(QObject):
         except Exception as exc:
             self.failed.emit(f"Could not set LCMV test state: {exc}")
 
+    def mark_rf_event(
+        self,
+        event: str,
+        *,
+        attenuation_db: float | None = None,
+        bladeRF_gain_db: float | None = None,
+        notes: str = "",
+    ) -> None:
+        try:
+            self._client.command(
+                "mark_rf_event",
+                event=str(event),
+                attenuation_db=attenuation_db,
+                bladeRF_gain_db=bladeRF_gain_db,
+                notes=str(notes),
+                source="gui",
+            )
+        except Exception as exc:
+            self.failed.emit(f"Could not record RF event {event}: {exc}")
+
     def _on_message(self, message: dict[str, Any]) -> None:
         message_type = str(message.get("type", ""))
         if message_type == "metrics":

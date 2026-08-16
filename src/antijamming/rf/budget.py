@@ -19,6 +19,11 @@ EXPECTED_EXPERIMENT_FIELDS = (
     "calibration_file_expected_gain_db",
     "bladeRF_tx_gain_db",
     "bladeRF_tx_power_dbm_est",
+    "bladeRF_tx_power_basis_description",
+    "bladeRF_tx_power_basis_bandwidth_hz",
+    "bladeRF_distance_m",
+    "bladeRF_tx_antenna_gain_dbi",
+    "bladeRF_tx_cable_loss_db",
     "bladeRF_expected_bearing_deg_min",
     "bladeRF_expected_bearing_deg_max",
     "jammer_attenuation_db",
@@ -27,6 +32,10 @@ EXPECTED_EXPERIMENT_FIELDS = (
     "jammer_fullband_avg_dbm",
     "jammer_fullband_low_hz",
     "jammer_fullband_high_hz",
+    "jammer_distance_m",
+    "jammer_tx_antenna_gain_dbi",
+    "jammer_tx_cable_loss_db",
+    "rx_antenna_gain_dbi",
     "jammer_expected_bearing_deg_min",
     "jammer_expected_bearing_deg_max",
     "horizontal_distance_m",
@@ -117,6 +126,11 @@ def compute_rf_budget(values: Mapping[str, object]) -> dict[str, object]:
     center_freq_hz = _number(values.get("center_freq_hz"))
     distance_m, distance_source = _distance(values)
     fspl_db = _fspl_db(center_freq_hz, distance_m)
+    jammer_distance_m, jammer_distance_source = _source_distance(values, "jammer")
+    jammer_fspl_db = _fspl_db(center_freq_hz, jammer_distance_m)
+    bladerf_distance_m, bladerf_distance_source = _source_distance(values, "bladeRF")
+    bladerf_fspl_db = _fspl_db(center_freq_hz, bladerf_distance_m)
+    rx_antenna_gain_dbi = _number(values.get("rx_antenna_gain_dbi"))
 
     pre_bpf_cable_loss_db = _number(values.get("pre_bpf_cable_loss_db"))
     bpf_l1_loss_db = _number(values.get("bpf_l1_loss_db"))
@@ -138,6 +152,12 @@ def compute_rf_budget(values: Mapping[str, object]) -> dict[str, object]:
         "fspl_db": fspl_db,
         "distance_used_m": distance_m,
         "distance_source": distance_source,
+        "jammer_fspl_db": jammer_fspl_db,
+        "jammer_distance_used_m": jammer_distance_m,
+        "jammer_distance_source": jammer_distance_source,
+        "bladeRF_fspl_db": bladerf_fspl_db,
+        "bladeRF_distance_used_m": bladerf_distance_m,
+        "bladeRF_distance_source": bladerf_distance_source,
         "pre_lna_loss_db": pre_lna_loss_db,
         "post_lna_loss_db": post_lna_loss_db,
         "chain_gain_to_usrp_rf_db": chain_gain_to_usrp_rf_db,
@@ -147,7 +167,10 @@ def compute_rf_budget(values: Mapping[str, object]) -> dict[str, object]:
             prefix="jammer_avg",
             tx_dbm=_number(values.get("jammer_l1_4mhz_avg_dbm")),
             attenuation_db=_number(values.get("jammer_attenuation_db")),
-            fspl_db=fspl_db,
+            fspl_db=jammer_fspl_db,
+            tx_antenna_gain_dbi=_number(values.get("jammer_tx_antenna_gain_dbi")),
+            rx_antenna_gain_dbi=rx_antenna_gain_dbi,
+            tx_cable_loss_db=_number(values.get("jammer_tx_cable_loss_db")),
             pre_bpf_cable_loss_db=pre_bpf_cable_loss_db,
             pre_lna_loss_db=pre_lna_loss_db,
             post_lna_loss_db=post_lna_loss_db,
@@ -161,7 +184,10 @@ def compute_rf_budget(values: Mapping[str, object]) -> dict[str, object]:
             prefix="jammer_peak",
             tx_dbm=_number(values.get("jammer_peak_dbm")),
             attenuation_db=_number(values.get("jammer_attenuation_db")),
-            fspl_db=fspl_db,
+            fspl_db=jammer_fspl_db,
+            tx_antenna_gain_dbi=_number(values.get("jammer_tx_antenna_gain_dbi")),
+            rx_antenna_gain_dbi=rx_antenna_gain_dbi,
+            tx_cable_loss_db=_number(values.get("jammer_tx_cable_loss_db")),
             pre_bpf_cable_loss_db=pre_bpf_cable_loss_db,
             pre_lna_loss_db=pre_lna_loss_db,
             post_lna_loss_db=post_lna_loss_db,
@@ -175,7 +201,10 @@ def compute_rf_budget(values: Mapping[str, object]) -> dict[str, object]:
             prefix="bladeRF",
             tx_dbm=_number(values.get("bladeRF_tx_power_dbm_est")),
             attenuation_db=0.0,
-            fspl_db=fspl_db,
+            fspl_db=bladerf_fspl_db,
+            tx_antenna_gain_dbi=_number(values.get("bladeRF_tx_antenna_gain_dbi")),
+            rx_antenna_gain_dbi=rx_antenna_gain_dbi,
+            tx_cable_loss_db=_number(values.get("bladeRF_tx_cable_loss_db")),
             pre_bpf_cable_loss_db=pre_bpf_cable_loss_db,
             pre_lna_loss_db=pre_lna_loss_db,
             post_lna_loss_db=post_lna_loss_db,
@@ -193,6 +222,9 @@ def _source_budget(
     tx_dbm: float | None,
     attenuation_db: float | None,
     fspl_db: float | None,
+    tx_antenna_gain_dbi: float | None,
+    rx_antenna_gain_dbi: float | None,
+    tx_cable_loss_db: float | None,
     pre_bpf_cable_loss_db: float | None,
     pre_lna_loss_db: float | None,
     post_lna_loss_db: float | None,
@@ -200,25 +232,39 @@ def _source_budget(
     lna_input_p1db_dbm: float | None,
     twinrx_max_rf_input_dbm: float | None,
 ) -> dict[str, object]:
-    at_antenna = _subtract_if_known(tx_dbm, attenuation_db, fspl_db)
+    tx_after_attenuation = _subtract_if_known(tx_dbm, attenuation_db)
+    tx_antenna_input = _subtract_if_known(tx_after_attenuation, tx_cable_loss_db)
+    eirp = _add_if_known(tx_antenna_input, tx_antenna_gain_dbi)
+    at_antenna = _add_subtract_if_known(
+        eirp,
+        add=rx_antenna_gain_dbi,
+        subtract=fspl_db,
+    )
     bpf_input = _subtract_if_known(at_antenna, pre_bpf_cable_loss_db)
     lna_input = _subtract_if_known(at_antenna, pre_lna_loss_db)
     lna_output = _add_if_known(lna_input, lna_gain_db)
     usrp_rf_input = _subtract_if_known(lna_output, post_lna_loss_db)
     return {
         f"{prefix}_tx_dbm": tx_dbm,
+        f"{prefix}_tx_after_attenuation_dbm": tx_after_attenuation,
+        f"{prefix}_tx_antenna_input_dbm": tx_antenna_input,
+        f"{prefix}_eirp_dbm": eirp,
         f"{prefix}_at_antenna_dbm": at_antenna,
         f"{prefix}_bpf_input_dbm": bpf_input,
         f"{prefix}_lna_input_dbm": lna_input,
         f"{prefix}_lna_output_ideal_dbm": lna_output,
         f"{prefix}_usrp_rf_input_ideal_dbm": usrp_rf_input,
-        f"{prefix}_lna_p1db_margin_db": _subtract_if_known(
-            lna_input,
-            lna_input_p1db_dbm,
+        f"{prefix}_lna_p1db_headroom_db": _subtract_if_known(
+            lna_input_p1db_dbm, lna_input
         ),
-        f"{prefix}_twinrx_margin_db": _subtract_if_known(
-            usrp_rf_input,
-            twinrx_max_rf_input_dbm,
+        f"{prefix}_lna_input_above_p1db": _greater_than_if_known(
+            lna_input, lna_input_p1db_dbm
+        ),
+        f"{prefix}_twinrx_headroom_db": _subtract_if_known(
+            twinrx_max_rf_input_dbm, usrp_rf_input
+        ),
+        f"{prefix}_usrp_above_twinrx_max": _greater_than_if_known(
+            usrp_rf_input, twinrx_max_rf_input_dbm
         ),
     }
 
@@ -231,6 +277,16 @@ def _distance(values: Mapping[str, object]) -> tuple[float | None, str]:
     if horizontal is not None and horizontal > 0.0:
         return horizontal, "horizontal_distance_m_fallback"
     return None, "unknown"
+
+
+def _source_distance(
+    values: Mapping[str, object], source: str
+) -> tuple[float | None, str]:
+    source_distance = _number(values.get(f"{source}_distance_m"))
+    if source_distance is not None and source_distance > 0.0:
+        return source_distance, f"{source}_distance_m"
+    distance, distance_source = _distance(values)
+    return distance, f"shared_{distance_source}"
 
 
 def _fspl_db(center_freq_hz: float | None, distance_m: float | None) -> float | None:
@@ -271,6 +327,25 @@ def _subtract_if_known(left: float | None, *rights: float | None) -> float | Non
         if value is not None:
             result -= float(value)
     return result
+
+
+def _add_subtract_if_known(
+    value: float | None,
+    *,
+    add: float | None,
+    subtract: float | None,
+) -> float | None:
+    if value is None or add is None or subtract is None:
+        return None
+    return float(value + add - subtract)
+
+
+def _greater_than_if_known(
+    value: float | None, limit: float | None
+) -> bool | None:
+    if value is None or limit is None:
+        return None
+    return bool(value > limit)
 
 
 def _chain_gain(

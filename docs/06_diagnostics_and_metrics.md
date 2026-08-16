@@ -9,7 +9,8 @@ Important metrics:
 - Ideal steering suppression: predicted reduction of the ideal steering component.
 - U1 measured component suppression: predicted reduction of the dominant measured covariance eigenvector.
 - Total output reduction: measured or covariance-predicted drop in total output power. This is not jammer-only suppression.
-- Jammer-only suppression: unavailable unless the run has explicit jammer-off/LCMV-off, jammer-on/LCMV-off, and jammer-on/LCMV-on windows with positive baseline-subtracted powers. The summary uses the stored healthy covariance to adjust the LCMV-on baseline; the runtime logs `jammer_only_suppression_estimate_available=false` when a single chunk cannot prove those windows.
+- Added-scene suppression: the runtime PSD-projects `R_current - R_arm`, then applies the uniform and actually applied weights to that same covariance. This avoids mixing desired-signal loss into the numerator merely because the weights changed. The automatic activation latch is only a safety gate, not proof that the added scene is the physical jammer.
+- Jammer-only suppression: the summary accepts the runtime same-covariance result as jammer-only only inside an explicit operator `jammer_on` marker window with the bladeRF scene otherwise unchanged. If those runtime fields are unavailable, the legacy fallback requires explicit jammer-off/LCMV-off, jammer-on/LCMV-off, and jammer-on/LCMV-on windows with positive baseline-subtracted powers.
 - Desired loss: response loss versus the healthy reference vector, when available.
 - Noise gain: weight power, usually `10log10(||w||^2)` or relative to a reference.
 - Effective J/S improvement: target suppression minus desired loss.

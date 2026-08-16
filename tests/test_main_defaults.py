@@ -17,6 +17,7 @@ from antijamming.config import (
 from antijamming.logging import LOGGER_DEFS, reset_session_logs, setup_logging
 from antijamming.logging.setup import ImmediateFileHandler
 from antijamming.app.main import _runtime_config, parse_args
+from antijamming.app.runtime_config import build_runtime_config
 from antijamming.config.schemas.runtime import VALID_LCMV_METHODS
 from antijamming.rf.budget import manifest_from_config
 from antijamming.radio.usrp.uhd_events import (
@@ -67,9 +68,9 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.gnss_agnss_ref_location == ""
     assert cfg.gnss_agnss_ref_utc_time == ""
     assert cfg.gnss_tow_to_trk is True
-    assert cfg.gnss_truth_static_lat_deg == 33.6844
-    assert cfg.gnss_truth_static_lon_deg == 73.0479
-    assert cfg.gnss_truth_static_alt_m == 540.0
+    assert cfg.gnss_truth_static_lat_deg == 37.352721
+    assert cfg.gnss_truth_static_lon_deg == -121.915773
+    assert cfg.gnss_truth_static_alt_m == 100.0
     assert cfg.gnss_sdr_echo_stdout is False
     assert cfg.ui_update_interval_s == 0.1
     assert cfg.dsp_update_interval_s == 0.1
@@ -99,9 +100,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_covariance_diagonal_loading_abs == 0.0
     assert cfg.lcmv_max_weight_norm == 8.0
     assert cfg.lcmv_max_white_noise_gain_db == 15.0
-    assert cfg.lcmv_desired_loss_guard_enabled is False
-    assert cfg.lcmv_max_desired_loss_db == 6.0
-    assert cfg.lcmv_min_predicted_jammer_suppression_db == 3.0
+    assert cfg.lcmv_min_predicted_jammer_suppression_db == 18.0
     assert cfg.lcmv_heavy_diagnostics_interval_s == 1.0
     assert cfg.one_run_segmentation_enabled is True
     assert cfg.healthy_reference_capture_enabled is True
@@ -116,6 +115,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert "/tmp" not in cfg.gnss_sdr_runtime_dir.as_posix()
     assert "/tmp" not in cfg.gnss_sdr_log_dir.as_posix()
     assert cfg.gnss_1c_channel_count == 9
+    assert cfg.gnss_pvt_elevation_mask_deg == 15.0
     assert cfg.gnss_channels_in_acquisition == 1
     assert cfg.gnss_pvt_monitor_enable is True
     assert cfg.gnss_pvt_monitor_client_addresses == "127.0.0.1"
@@ -163,9 +163,14 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
         "reimport",
     )
     assert cfg.experiment["rx_chain"] == "antenna->cable->BPF->LNA->DC_block->cable->TwinRX"
-    assert "jammer_attenuation_db" not in cfg.experiment
+    assert cfg.expected_sources == 1
+    assert cfg.gnss_accuracy_window_points == 1
+    assert cfg.experiment["jammer_attenuation_db"] == 50.0
     assert cfg.experiment["jammer_attenuation_db_min"] == 0.0
     assert cfg.experiment["jammer_attenuation_db_max"] == 90.0
+    assert cfg.experiment["bladeRF_tx_gain_db"] == 50.0
+    assert cfg.experiment["bladeRF_distance_m"] == pytest.approx(3.4798)
+    assert cfg.experiment["jammer_distance_m"] == pytest.approx(2.7432)
 
 
 def test_runtime_config_experiment_section_is_optional(tmp_path) -> None:
@@ -359,6 +364,7 @@ def test_runtime_has_core_signal_processing_logs() -> None:
     assert LOGGER_DEFS["analysis"][1] == "analysis.log"
     assert LOGGER_DEFS["lcmv_pattern"][1] == "lcmv_pattern_absolute.jsonl"
     assert LOGGER_DEFS["spatial_vector"][1] == "spatial_vector_diagnostics.jsonl"
+    assert LOGGER_DEFS["runtime_evidence"][1] == "runtime_evidence.jsonl"
     assert "jammer" not in LOGGER_DEFS
     assert LOGGER_DEFS["ui"][1] == "ui_health.log"
 
@@ -491,6 +497,29 @@ def test_runtime_config_builds_product_profile_without_cli_overrides() -> None:
     cfg = _runtime_config()
 
     assert cfg.sample_rate == float(profile["sample_rate"])
+
+
+def test_runtime_config_applies_opt_in_partial_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    overlay = tmp_path / "runtime_test.json"
+    overlay.write_text(
+        json.dumps(
+            {
+                "gnss_pvt_elevation_mask_deg": 5.0,
+                "expected_sources": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ANTIJAM_RUNTIME_OVERLAY", str(overlay))
+
+    cfg = build_runtime_config()
+
+    assert cfg.gnss_pvt_elevation_mask_deg == 5.0
+    assert cfg.expected_sources == 2
+    assert cfg.sample_rate == 4_000_000.0
     assert cfg.center_freq_hz == 1_575_420_000.0
     assert cfg.auto_rate_backoff is False
     assert cfg.stop_on_overflow is True

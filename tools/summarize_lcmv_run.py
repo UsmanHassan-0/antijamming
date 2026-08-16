@@ -11,7 +11,16 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 from typing import Iterable
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from antijamming.rf import compute_rf_budget
 
 
 LOG_PREFIX_RE = re.compile(
@@ -40,6 +49,7 @@ class IntervalStats:
     model_null_db: list[float] = field(default_factory=list)
     reduction_uniform_db: list[float] = field(default_factory=list)
     reduction_raw_avg_db: list[float] = field(default_factory=list)
+    reduction_raw_sum_db: list[float] = field(default_factory=list)
     raw_spread_db: list[float] = field(default_factory=list)
     cal_spread_db: list[float] = field(default_factory=list)
     cno: list[float] = field(default_factory=list)
@@ -94,6 +104,9 @@ def main() -> int:
         if event in {"lcmv_on", "lcmv_off"}:
             app.setdefault("toggles", []).append((ts, event == "lcmv_on"))
     manifest, rf_budget = parse_manifest_budget(logs)
+    marked_rf_budget, marked_rf_basis = operator_marked_rf_budget(
+        manifest, operator_events
+    )
     usrp = parse_usrp_config(logs / "usrp_hardware.log")
     timeline = parse_timeline(logs)
     spatial_events = parse_spatial_events(logs)
@@ -121,6 +134,12 @@ def main() -> int:
     print_json_summary(rf_budget)
     print_js_summary(rf_budget)
     print_metadata_warnings(manifest)
+    if marked_rf_budget:
+        print()
+        print("Operator-marked RF budget")
+        print(f"  basis: {marked_rf_basis}")
+        print_json_summary(marked_rf_budget)
+        print_js_summary(marked_rf_budget)
     print()
     print("Operator events")
     print_operator_events(operator_events)
@@ -208,8 +227,15 @@ def parse_operator_events(path: Path) -> list[tuple[datetime, dict[str, object]]
             continue
         timestamp = payload.get("timestamp")
         try:
-            ts = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).replace(
-                tzinfo=None
+            parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            # Python log ``asctime`` values are local wall time. Convert an
+            # aware marker (normally UTC) to this host's local zone before
+            # removing tzinfo so event/spatial comparisons remain aligned on
+            # non-UTC systems such as the Pakistan-time DGX.
+            ts = (
+                parsed.astimezone().replace(tzinfo=None)
+                if parsed.tzinfo is not None
+                else parsed
             )
         except (TypeError, ValueError):
             continue
@@ -362,6 +388,10 @@ def assign_metrics_to_intervals(
                     interval.used_prns[prn] += 1
             append_float(interval.reduction_uniform_db, data.get("measured_output_reduction_vs_uniform_db"))
             append_float(interval.reduction_raw_avg_db, data.get("measured_output_reduction_vs_raw_avg_channel_db"))
+            append_float(
+                interval.reduction_raw_sum_db,
+                data.get("measured_output_reduction_vs_raw_sum_channels_db"),
+            )
             append_float(interval.raw_spread_db, data.get("raw_power_spread_db"))
             append_float(interval.cal_spread_db, data.get("cal_power_spread_db"))
         elif kind == "lcmv_pattern":
@@ -370,6 +400,10 @@ def assign_metrics_to_intervals(
             if isinstance(out, dict):
                 append_float(interval.reduction_uniform_db, out.get("measured_output_reduction_vs_uniform_db"))
                 append_float(interval.reduction_raw_avg_db, out.get("measured_output_reduction_vs_raw_avg_channel_db"))
+                append_float(
+                    interval.reduction_raw_sum_db,
+                    out.get("measured_output_reduction_vs_raw_sum_channels_db"),
+                )
         elif kind == "analysis":
             hints = data.get("classification_hints", {})
             if isinstance(hints, dict):
@@ -622,7 +656,8 @@ def print_metadata_warnings(manifest: dict[str, object]) -> None:
         "bladeRF_tx_power_dbm_est",
         "jammer_attenuation_db",
         "jammer_l1_4mhz_avg_dbm",
-        "horizontal_distance_m",
+        "bladeRF_distance_m",
+        "jammer_distance_m",
         "usrp_rx_gain_db",
         "center_freq_hz",
         "sample_rate_sps",
@@ -633,6 +668,36 @@ def print_metadata_warnings(manifest: dict[str, object]) -> None:
         print(f"  metadata warning: missing/unknown {', '.join(missing)}")
     else:
         print("  metadata warning: none")
+
+
+def operator_marked_rf_budget(
+    manifest: dict[str, object],
+    operator_events: list[tuple[datetime, dict[str, object]]],
+) -> tuple[dict[str, object], str]:
+    """Recompute RF levels from the latest explicit attenuation marker."""
+
+    attenuation_db: float | None = None
+    marker_event = ""
+    marker_time: datetime | None = None
+    for ts, payload in operator_events:
+        event = str(payload.get("event", ""))
+        if event not in {"attenuation_db", "jammer_on"}:
+            continue
+        candidate = numeric_or_none(payload.get("attenuation_db"))
+        if candidate is None:
+            continue
+        attenuation_db = candidate
+        marker_event = event
+        marker_time = ts
+    if attenuation_db is None:
+        return {}, ""
+    marked_manifest = dict(manifest)
+    marked_manifest["jammer_attenuation_db"] = attenuation_db
+    basis = (
+        f"explicit {marker_event} marker at {format_ts(marker_time)} with "
+        f"attenuation_db={attenuation_db:.2f}"
+    )
+    return compute_rf_budget(marked_manifest), basis
 
 
 def print_js_summary(rf_budget: dict[str, object]) -> None:
@@ -705,6 +770,71 @@ def estimate_jammer_only_suppression(
             "reason": "no explicit jammer_on/jammer_off operator markers",
         }
 
+    # Prefer the runtime's same-covariance estimate.  It evaluates the uniform
+    # and actually applied weights against the same PSD-projected covariance
+    # difference R_current - R_arm.  The automatic activation latch alone is
+    # not physical truth, so accept these samples only while an explicit
+    # operator marker says that the physical jammer is on.
+    runtime_suppression_db: list[float] = []
+    runtime_before: list[float] = []
+    runtime_after: list[float] = []
+    marker_index = 0
+    jammer_on: bool | None = None
+    for ts, payload in spatial_events:
+        while marker_index < len(jammer_markers) and jammer_markers[marker_index][0] <= ts:
+            jammer_on = jammer_markers[marker_index][1]
+            marker_index += 1
+        if jammer_on is not True or not bool(
+            payload.get("jammer_only_suppression_estimate_available", False)
+        ):
+            continue
+        suppression = numeric_or_none(payload.get("jammer_only_suppression_db"))
+        before = numeric_or_none(
+            payload.get("jammer_only_power_before_uniform_linear")
+        )
+        after = numeric_or_none(
+            payload.get("jammer_only_power_after_applied_linear")
+        )
+        if (
+            suppression is not None
+            and before is not None
+            and after is not None
+            and before > 0.0
+            and after >= 0.0
+        ):
+            runtime_suppression_db.append(suppression)
+            runtime_before.append(before)
+            runtime_after.append(after)
+    if runtime_suppression_db:
+        mean_before = mean_or_none(runtime_before)
+        mean_after = mean_or_none(runtime_after)
+        aggregate_suppression_db = (
+            10.0 * math.log10(mean_before / mean_after)
+            if mean_before is not None
+            and mean_after is not None
+            and mean_before > 0.0
+            and mean_after > 0.0
+            else None
+        )
+        return {
+            "available": True,
+            "method": (
+                "same-covariance PSD-projected R_current-R_arm inside explicit "
+                "jammer_on marker window"
+            ),
+            "sample_count": len(runtime_suppression_db),
+            # Aggregate powers first, then form the ratio. Averaging values
+            # that are already in dB gives a different number whenever the
+            # per-window input powers differ, so keep that only as a clearly
+            # labelled distribution diagnostic.
+            "suppression_db": aggregate_suppression_db,
+            "mean_per_snapshot_suppression_db": mean_or_none(
+                runtime_suppression_db
+            ),
+            "jammer_before_power_linear": mean_before,
+            "jammer_after_power_linear": mean_after,
+        }
+
     baseline_off: list[float] = []
     jammer_on_lcmv_off: list[float] = []
     jammer_on_lcmv_on_excess: list[float] = []
@@ -757,6 +887,8 @@ def estimate_jammer_only_suppression(
         }
     return {
         "available": True,
+        "method": "matched marked windows with healthy-baseline subtraction",
+        "sample_count": len(jammer_on_lcmv_on_excess),
         "suppression_db": 10.0 * math.log10(jammer_before / jammer_after),
         "jammer_before_power_linear": jammer_before,
         "jammer_after_power_linear": jammer_after,
@@ -773,10 +905,20 @@ def print_jammer_only_estimate(estimate: dict[str, object]) -> None:
         )
         return
     print("  jammer_only_suppression_estimate_available: true")
+    print(f"  jammer_only_suppression_method: {estimate.get('method', '--')}")
+    print(f"  jammer_only_suppression_sample_count: {estimate.get('sample_count', '--')}")
     print(
         "  jammer_only_suppression_estimate_db: "
         f"{numeric_or_none(estimate.get('suppression_db')):.2f}"
     )
+    snapshot_mean = numeric_or_none(
+        estimate.get("mean_per_snapshot_suppression_db")
+    )
+    if snapshot_mean is not None:
+        print(
+            "  jammer_only_mean_per_snapshot_suppression_db: "
+            f"{snapshot_mean:.2f}"
+        )
     print(
         "  jammer_only_power_before/after_linear: "
         f"{estimate.get('jammer_before_power_linear')} / "
@@ -1168,6 +1310,10 @@ def print_interval(interval: IntervalStats) -> None:
     print(f"    model_response_at_selected_null_db: {stat(interval.model_null_db)}")
     print(f"    measured_output_reduction_vs_uniform_db: {stat(interval.reduction_uniform_db)}")
     print(f"    measured_output_reduction_vs_raw_avg_channel_db: {stat(interval.reduction_raw_avg_db)}")
+    print(
+        "    measured_output_reduction_vs_raw_sum_channels_db: "
+        f"{stat(interval.reduction_raw_sum_db)}"
+    )
     print(f"    raw_power_spread_db: {stat(interval.raw_spread_db)}")
     print(f"    cal_power_spread_db: {stat(interval.cal_spread_db)}")
     print(f"    spatial ideal_measured_coherence_abs: {stat(interval.spatial_coherence_abs)}")

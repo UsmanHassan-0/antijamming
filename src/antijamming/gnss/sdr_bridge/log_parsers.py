@@ -81,7 +81,8 @@ _GLOG_PREFIX_RE = re.compile(r"^[IWEF]\d{8}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+[^]
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _GNSS_DIAGNOSTIC_RE = re.compile(
     r"(?:"
-    r"chi[- ]?square|i[- ]?square|rtkpos|rtklib_pvt_residual|point\s+pos|pos\s+error|"
+    r"chi[- ]?square|i[- ]?square|rtkpos|rtklib_pvt_residual|carrier_phase_ambiguity_init|point\s+pos|pos\s+error|"
+    r"pvt_pipeline|pvt_internal_invalid|gps_ephemeris_update|"
     r"loss\s+of\s+lock|cycle\s+slip|reset\s+observables|error\s+nv="
     r")",
     re.IGNORECASE,

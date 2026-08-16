@@ -78,6 +78,9 @@ def test_headless_service_stays_idle_until_explicit_start_command(tmp_path) -> N
         def set_lcmv_test_enabled(self, _enabled: bool) -> None:
             pass
 
+        def mark_rf_event(self, event: str, **kwargs) -> dict:
+            return {"event": event, **kwargs}
+
     service = HeadlessRuntimeService(
         object(),  # type: ignore[arg-type]
         {"app": __import__("logging").getLogger("headless-test")},
@@ -94,6 +97,19 @@ def test_headless_service_stays_idle_until_explicit_start_command(tmp_path) -> N
     assert backend.starts == 1
     service._handle_command("stop", {"reason": "unit test"})
     assert backend.stops == 1
+
+    marker = service._handle_command(
+        "mark_rf_event",
+        {
+            "event": "jammer_on",
+            "attenuation_db": "50",
+            "bladeRF_gain_db": 50,
+            "notes": "unit test",
+            "source": "gui",
+        },
+    )
+    assert marker["event"]["event"] == "jammer_on"
+    assert marker["event"]["attenuation_db"] == 50.0
 
 
 def test_json_ipc_round_trip_does_not_require_backend_or_hardware(tmp_path) -> None:
