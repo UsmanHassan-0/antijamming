@@ -521,11 +521,11 @@ void Rtklib_Solver::log_rtklib_residuals()
             << " pdop=" << d_dop[1]
             << " hdop=" << d_dop[2]
             << " vdop=" << d_dop[3];
-    LOG(INFO) << summary.str();
+    std::cout << summary.str() << '\n';
 
     for (const auto& line : residual_lines)
         {
-            LOG(INFO) << line;
+            std::cout << line << '\n';
         }
 }
 
@@ -1492,7 +1492,7 @@ bool Rtklib_Solver::get_PVT(const std::map<int, Gnss_Synchro> &gnss_observables_
 
             if (result == 0)
                 {
-                    LOG(INFO) << "RTKLIB rtkpos error: " << d_rtk.errbuf;
+                    std::cout << "RTKLIB rtkpos error: " << d_rtk.errbuf << '\n';
                     d_rtk.neb = 0;                 // clear error buffer to avoid repeating the error message
                     this->set_time_offset_s(0.0);  // reset rx time estimation
                     this->set_num_valid_observations(0);

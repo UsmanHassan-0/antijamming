@@ -447,8 +447,17 @@ bool gps_l1_ca_telemetry_decoder_gs::decode_subframe(double cn0, bool flag_inver
                                       << Gnss_Satellite(std::string((d_system == L1LnavSystem::GPS) ? "GPS" : "QZSS"), d_nav->get_satellite_PRN())
                                       << " with CN0=" << std::setprecision(2) << cn0 << std::setprecision(default_precision)
                                       << " dB-Hz" << std::endl;
-                            return true;
                         }
+
+                    // A complete parity-valid subframe with a continuous HOW
+                    // is valid navigation transport even when it does not yet
+                    // complete a publishable ephemeris, almanac, ionosphere,
+                    // or UTC model.  Treating "nothing new to publish" as a
+                    // decode failure makes valid SF4/SF5 pages and a partial
+                    // SF1-SF3 ephemeris transition accumulate as CRC errors;
+                    // after three such frames the decoder clears TOW and the
+                    // observables/PVT stream develops a deterministic gap.
+                    return true;
                 }
         }
     return false;
