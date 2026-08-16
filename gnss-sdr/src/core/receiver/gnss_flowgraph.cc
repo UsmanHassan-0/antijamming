@@ -937,8 +937,26 @@ int GNSSFlowgraph::connect_sample_counter()
                 }
 
             const int observable_interval_ms = configuration_->property("GNSS-SDR.observable_interval_ms", 20);
-            ch_out_sample_counter_ = gnss_sdr_make_sample_counter(fs, observable_interval_ms, sig_conditioner_.at(0)->get_right_block()->output_signature()->sizeof_stream_item(0));
-            top_block_->connect(sig_conditioner_.at(0)->get_right_block(), 0, ch_out_sample_counter_, 0);
+            const bool synchronize_signal_sources = configuration_->property("GNSS-SDR.synchronize_signal_sources", false);
+            const size_t counter_inputs = synchronize_signal_sources ? sig_conditioner_.size() : 1U;
+            const size_t counter_item_size = sig_conditioner_.at(0)->get_right_block()->output_signature()->sizeof_stream_item(0);
+            if (counter_inputs == 0U)
+                {
+                    throw(std::invalid_argument("Sample counter needs at least one Signal Conditioner"));
+                }
+            for (size_t input = 0; input < counter_inputs; input++)
+                {
+                    const size_t item_size = sig_conditioner_.at(input)->get_right_block()->output_signature()->sizeof_stream_item(0);
+                    if (item_size != counter_item_size)
+                        {
+                            throw(std::invalid_argument("Synchronized Signal Conditioners must have equal item sizes"));
+                        }
+                }
+            ch_out_sample_counter_ = gnss_sdr_make_sample_counter(fs, observable_interval_ms, counter_item_size, counter_inputs);
+            for (size_t input = 0; input < counter_inputs; input++)
+                {
+                    top_block_->connect(sig_conditioner_.at(input)->get_right_block(), 0, ch_out_sample_counter_, input);
+                }
             top_block_->connect(ch_out_sample_counter_, 0, observables_->get_left_block(), channels_count_);  // extra port for the sample counter pulse
         }
     catch (const std::exception& e)
@@ -947,7 +965,7 @@ int GNSSFlowgraph::connect_sample_counter()
             top_block_->disconnect_all();
             return 1;
         }
-    DLOG(INFO) << "sample counter successfully connected to Signal Conditioner and Observables blocks";
+    DLOG(INFO) << "sample counter successfully connected to synchronized Signal Conditioner input(s) and Observables block";
     return 0;
 }
 

@@ -15,7 +15,11 @@ import numpy as np
 
 from antijamming.config import StreamConfig
 from antijamming.config.schemas.runtime import VALID_LCMV_METHODS
-from antijamming.gnss import GnssSdrBridge
+from antijamming.gnss import (
+    GnssSdrBridge,
+    SharedU1DesiredVectorMonitor,
+    SharedU1PhaseCompensationBank,
+)
 from antijamming.gnss.sdr_bridge.constants import (
     PVT_DEGRADED_PDOP_THRESHOLD,
     PVT_LOW_OBSERVATION_COUNT,
@@ -153,6 +157,10 @@ class BackendRuntime:
         self._doa_thread: threading.Thread | None = None
         self._gnss_handoff_thread: threading.Thread | None = None
         self._gnss_raw_queue: queue.Queue | None = None
+        self._shared_u1_phase_monitor: SharedU1DesiredVectorMonitor | None = None
+        self._shared_u1_phase_bank: SharedU1PhaseCompensationBank | None = None
+        self._last_shared_u1_phase_status_log_ts = 0.0
+        self._gnss_fifo_samples_written = 0
         self._gnss_raw_drops: int = 0
         self._gnss_raw_q_highwater: int = 0
         self._gnss_raw_q_interval_highwater: int = 0
@@ -256,6 +264,13 @@ class BackendRuntime:
         self._latest_beamformer_weights = initial_weights
         self._latest_gnss_effective_weights = self._effective_gnss_weights(initial_weights)
         self._target_beamformer_weights = np.array(initial_weights, copy=True)
+        self._shared_measured_u1_protection_weights = np.array(
+            initial_weights, copy=True
+        )
+        self._shared_measured_u1_protection_available = False
+        self._latest_shared_u1_phase_logical_weights = np.empty(
+            (0, len(config.channels)), dtype=np.complex128
+        )
         self._beamformer_transition_start_weights = np.array(initial_weights, copy=True)
         self._beamformer_transition_total_chunks = 0
         self._beamformer_transition_completed_chunks = 0
@@ -481,6 +496,57 @@ class BackendRuntime:
                 self._gnss_raw_q_highwater = 0
                 self._gnss_raw_q_interval_highwater = 0
                 self._gnss_raw_q_marks_logged.clear()
+                self._gnss_fifo_samples_written = 0
+                shared_phase_enabled = bool(
+                    getattr(
+                        self._config,
+                        "gnss_shared_u1_phase_compensation_enabled",
+                        False,
+                    )
+                )
+                if shared_phase_enabled:
+                    if self._log_session is None:
+                        raise RuntimeError(
+                            "shared-U1 phase compensation requires an active log session"
+                        )
+                    satellites = tuple(
+                        int(value)
+                        for value in self._config.gnss_shared_u1_phase_satellites
+                    )
+                    self._shared_u1_phase_bank = SharedU1PhaseCompensationBank(
+                        satellites=satellites,
+                        channel_count=len(self._config.channels),
+                        sample_rate_hz=float(self._config.sample_rate),
+                        samples_per_chunk=int(self._config.samples_per_chunk),
+                        transition_s=float(
+                            self._config.gnss_shared_u1_phase_transition_s
+                        ),
+                        max_weight_norm=self._lcmv_weight_norm_limit(),
+                    )
+                    self._shared_u1_phase_monitor = SharedU1DesiredVectorMonitor(
+                        sample_rate_hz=float(self._config.sample_rate),
+                        channel_count=len(self._config.channels),
+                        phase_correction_vector=self._config.phase_correction_vector,
+                        tracking_snapshot=self._gnss_bridge.snapshot,
+                        session_dir=self._log_session.session_dir,
+                        session_id=self._log_session.session_id,
+                        logger=self._handoff_log,
+                        satellites=satellites,
+                        min_quality_measurements=int(
+                            self._config.gnss_shared_u1_phase_min_quality_measurements
+                        ),
+                    )
+                    self._shared_u1_phase_monitor.start()
+                    self._handoff_log.info(
+                        "Shared measured-U1 phase compensation enabled: "
+                        "satellites=%s sources=%d independent_per_prn_lcmv=false",
+                        ",".join(f"G{value:02d}" for value in satellites),
+                        len(satellites),
+                    )
+                else:
+                    self._shared_u1_phase_bank = None
+                    self._shared_u1_phase_monitor = None
+                self._last_shared_u1_phase_status_log_ts = 0.0
                 self._gnss_handoff_thread = threading.Thread(
                     target=self._gnss_beamform_loop,
                     name="gnss_ordered_handoff",
@@ -579,6 +645,10 @@ class BackendRuntime:
                         pass
                     self._gnss_handoff_thread = None
             self._gnss_raw_queue = None
+            if self._shared_u1_phase_monitor is not None:
+                self._shared_u1_phase_monitor.stop()
+                self._shared_u1_phase_monitor = None
+            self._shared_u1_phase_bank = None
             if self._config.gnss_sdr_enable:
                 self._loggers["transport"].info(
                     "GNSS queue summary: raw_highwater=%d/%d raw_rejections=%d",
@@ -1621,6 +1691,9 @@ class BackendRuntime:
 
     def set_lcmv_test_enabled(self, enabled: bool) -> None:
         active = bool(enabled)
+        self._set_shared_measured_u1_protection_weights(
+            uniform_weights(len(self._config.channels)), available=False
+        )
         preserve_mode = str(
             getattr(self._config, "lcmv_preserve_constraint_mode", "uniform")
         ).strip().lower()
@@ -2765,6 +2838,39 @@ class BackendRuntime:
         with self._beamformer_lock:
             return np.array(self._target_beamformer_weights, copy=True)
 
+    def _set_shared_measured_u1_protection_weights(
+        self, weights: np.ndarray, *, available: bool = True
+    ) -> None:
+        """Publish the one shared covariance-LCMV measured-U1 onset target."""
+
+        selected = np.asarray(weights, dtype=np.complex128).reshape(-1)
+        if (
+            selected.size != len(self._config.channels)
+            or not np.all(np.isfinite(selected))
+        ):
+            return
+        with self._beamformer_lock:
+            self._shared_measured_u1_protection_weights = np.array(
+                selected, copy=True
+            )
+            self._shared_measured_u1_protection_available = bool(available)
+
+    def _get_shared_measured_u1_protection_weights_copy(self) -> np.ndarray:
+        with self._beamformer_lock:
+            return np.array(self._shared_measured_u1_protection_weights, copy=True)
+
+    def _shared_measured_u1_protection_is_available(self) -> bool:
+        with self._beamformer_lock:
+            return bool(self._shared_measured_u1_protection_available)
+
+    def _get_gnss_monitor_logical_weights_copy(self) -> np.ndarray:
+        with self._beamformer_lock:
+            if self._latest_shared_u1_phase_logical_weights.size:
+                return np.array(
+                    self._latest_shared_u1_phase_logical_weights, copy=True
+                )
+            return np.array(self._latest_beamformer_weights, copy=True)
+
     def _get_gnss_effective_weights(self) -> np.ndarray:
         with self._beamformer_lock:
             return self._latest_gnss_effective_weights
@@ -2791,7 +2897,91 @@ class BackendRuntime:
         return out
 
     def _gnss_output_vector(self, chunk: np.ndarray) -> np.ndarray:
+        if bool(
+            getattr(
+                self._config,
+                "gnss_shared_u1_phase_compensation_enabled",
+                False,
+            )
+        ):
+            return self._gnss_shared_u1_phase_output_matrix(chunk)
         return self._gnss_beamformed_output_vector(chunk)
+
+    def _gnss_shared_u1_phase_output_matrix(self, chunk: np.ndarray) -> np.ndarray:
+        """Return pinned PRN streams sharing one phase-compensated LCMV null."""
+
+        self._advance_beamformer_transition()
+        source = np.asarray(chunk, dtype=np.complex64)
+        if source.ndim != 2 or source.shape[1] == 0:
+            return np.zeros((0, 0), dtype=np.complex64)
+        bank = self._shared_u1_phase_bank
+        if bank is None:
+            raise RuntimeError("shared-U1 phase compensation bank is unavailable")
+        monitor = self._shared_u1_phase_monitor
+        desired_vectors = (
+            monitor.desired_vectors_snapshot() if monitor is not None else {}
+        )
+        with self._results_lock:
+            jammer_latched = bool(self._lcmv_jammer_detected_latched)
+        enabled_now = bool(self._lcmv_test_enabled and jammer_latched)
+        # Use the common target, not an intermediate common-ramp sample. This
+        # makes jammer-OFF return each phase-compensated source all the way to
+        # a scalar multiple of uniform combining while preserving continuity.
+        common = self._get_beamformer_target_weights_copy()
+        protection = self._get_shared_measured_u1_protection_weights_copy()
+        logical, status = bank.advance(
+            shared_common_weights=common,
+            shared_measured_u1_weights=protection,
+            shared_measured_u1_available=(
+                self._shared_measured_u1_protection_is_available()
+            ),
+            desired_vectors=desired_vectors,
+            enabled_now=enabled_now,
+        )
+        with self._beamformer_lock:
+            self._latest_shared_u1_phase_logical_weights = np.array(
+                logical, copy=True
+            )
+        correction_vector = self._config.phase_correction_vector
+        correction = (
+            np.asarray(correction_vector, dtype=np.complex64).reshape(-1)
+            if correction_vector is not None
+            else np.ones((source.shape[0],), dtype=np.complex64)
+        )
+        if correction.size != source.shape[0]:
+            raise ValueError("shared-U1 phase correction length mismatch")
+        effective = np.asarray(
+            np.conj(logical) * correction[None, :], dtype=np.complex64
+        )
+        outputs = np.ascontiguousarray(effective @ source, dtype=np.complex64)
+        now = time.monotonic()
+        if now - self._last_shared_u1_phase_status_log_ts >= 1.0:
+            self._last_shared_u1_phase_status_log_ts = now
+            compensated_count = sum(
+                1
+                for payload in status.values()
+                if bool(payload.get("phase_compensation_applied", False))
+            )
+            self._handoff_log.info(
+                "shared_u1_phase_compensation_status %s",
+                json.dumps(
+                    {
+                        "event": "shared_u1_phase_compensation_status",
+                        "applied_to_gnss_sdr": True,
+                        "jammer_latched": jammer_latched,
+                        "enabled_now": enabled_now,
+                        "shared_spatial_solution": (
+                            "covariance_lcmv_measured_u1"
+                        ),
+                        "independent_per_prn_lcmv": False,
+                        "phase_compensated_source_count": compensated_count,
+                        "sources": status,
+                    },
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ),
+            )
+        return outputs
 
     def _gnss_beamformed_output_vector(self, chunk: np.ndarray) -> np.ndarray:
         self._advance_beamformer_transition()
@@ -2856,6 +3046,14 @@ class BackendRuntime:
             return apply_beamformer(source, uniform_weights(source.shape[0]))
 
     def _gnss_handoff_mode_label(self) -> str:
+        if bool(
+            getattr(
+                self._config,
+                "gnss_shared_u1_phase_compensation_enabled",
+                False,
+            )
+        ):
+            return "shared_measured_u1_lcmv_per_prn_phase_compensated"
         if self._lcmv_test_enabled:
             status = self._lcmv_status_copy()
             if str(status.get("mode", "")).lower() == "on":
@@ -2869,6 +3067,13 @@ class BackendRuntime:
 
     def _reset_lcmv_test_for_run(self) -> None:
         self._spatial_diag_seq = 0
+        self._set_shared_measured_u1_protection_weights(
+            uniform_weights(len(self._config.channels)), available=False
+        )
+        with self._beamformer_lock:
+            self._latest_shared_u1_phase_logical_weights = np.empty(
+                (0, len(self._config.channels)), dtype=np.complex128
+            )
         self._last_lcmv_heavy_diag_ts = None
         self._latest_lcmv_heavy_diag_payload = {
             "heavy_diagnostics_interval_s": self._json_float(
@@ -4706,6 +4911,24 @@ class BackendRuntime:
                     enforce_white_noise_gain=enforce_white_noise_gain,
                 )
 
+            # The phase-continuity fan-out always uses this one shared spatial
+            # solution. Publish it as soon as the full-covariance measured-U1
+            # candidate passes the same runtime safety checks. No PRN-specific
+            # covariance or LCMV solve occurs here.
+            if covariance_u1_result is not None:
+                protection_rejection = _preflight_rejection(
+                    "covariance_lcmv_measured_u1",
+                    covariance_u1_result,
+                    enforce_white_noise_gain=False,
+                )
+                if not protection_rejection:
+                    self._set_shared_measured_u1_protection_weights(
+                        np.asarray(
+                            getattr(covariance_u1_result, "weights", []),
+                            dtype=np.complex128,
+                        )
+                    )
+
             active_lcmv_null_method = self._lcmv_test_null_method
             active_lcmv_method = self._lcmv_test_null_method
             active_lcmv_weights_source = active_lcmv_method
@@ -5352,16 +5575,42 @@ class BackendRuntime:
                         )
                         self._reset_gnss_fifo_signal_health()
                     write_t0 = time.monotonic()
+                    sample_start = int(self._gnss_fifo_samples_written)
                     if not bridge.write(gnss_vector):
                         raise RuntimeError(
                             "GNSS-SDR FIFO did not accept the contiguous IQ chunk"
                         )
+                    monitor = self._shared_u1_phase_monitor
+                    if monitor is not None:
+                        monitor.submit(
+                            sample_start,
+                            chunk,
+                            self._get_gnss_monitor_logical_weights_copy(),
+                        )
+                    stream_sample_count = int(
+                        gnss_vector.shape[-1]
+                        if gnss_vector.ndim == 2
+                        else gnss_vector.size
+                    )
+                    self._gnss_fifo_samples_written = (
+                        sample_start + stream_sample_count
+                    )
                     self._record_runtime_timing("gnss_fifo_write", time.monotonic() - write_t0)
             except Exception as exc:
                 self._handle_gnss_pipeline_error(exc)
                 break
 
     def _fifo_output_source_label(self) -> str:
+        if bool(
+            getattr(
+                self._config,
+                "gnss_shared_u1_phase_compensation_enabled",
+                False,
+            )
+        ):
+            if self._lcmv_test_enabled and self._lcmv_jammer_detected_latched:
+                return "shared_measured_u1_phase_compensated_fanout"
+            return "pinned_prn_shared_common_weights"
         if bool(self._beamformer_transition_payload().get("weight_transition_active")):
             return "weight_transition"
         mode = self._gnss_handoff_mode_label()

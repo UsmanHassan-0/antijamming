@@ -346,6 +346,14 @@ class StreamConfig:
     # Sample representation expected by the GNSS-SDR SignalSource.
     gnss_sdr_sample_type: str
 
+    # Every pinned GPS source uses one shared covariance-LCMV measured-U1
+    # spatial solution. Only its response-preserving scalar differs by PRN;
+    # no independent per-PRN covariance/LCMV solve is part of this path.
+    gnss_shared_u1_phase_compensation_enabled: bool
+    gnss_shared_u1_phase_satellites: tuple[int, ...]
+    gnss_shared_u1_phase_transition_s: float
+    gnss_shared_u1_phase_min_quality_measurements: int
+
     # Channel allocation and acquisition.
     #
     # GPS L1 C/A channel allocation and acquisition concurrency.

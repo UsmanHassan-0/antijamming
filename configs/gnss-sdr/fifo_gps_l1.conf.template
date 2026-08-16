@@ -68,12 +68,9 @@ GNSS-SDR.AGNSS_ref_utc_time={agnss_ref_utc_time}
 ; FIFO Signal Source
 ; =============================================================================
 
-; GNSS-SDR reads the runtime-produced beamformed complex IQ from this FIFO.
-SignalSource.implementation=Fifo_Signal_Source
-SignalSource.filename={fifo_path}
-SignalSource.sample_type={sample_type}
-SignalSource.dump=false
-SignalSource.dump_filename={signal_source_dump_path}
+; Normal runs render one FIFO. Shared-U1 phase-continuity tests render one
+; synchronized FIFO per pinned PRN, all using the same spatial LCMV solution.
+{signal_source_config}
 
 ; Signal conditioner is rendered by the backend so the GNSS-SDR block graph stays explicit
 ; at the configured sample rate.

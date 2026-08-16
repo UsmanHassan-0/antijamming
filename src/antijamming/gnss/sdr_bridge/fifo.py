@@ -13,6 +13,7 @@ import numpy as np
 
 _FIFO_STARTUP_PROGRESS_INTERVAL_S = 10.0
 _GNSS_STARTUP_CONSOLE_ENV = "ANTIJAM_GNSS_STARTUP_CONSOLE"
+PER_SOURCE_FIFO_STRIPE_SAMPLES = 4096
 
 
 def complex64_contiguous_vector(samples: np.ndarray) -> np.ndarray:
@@ -36,7 +37,12 @@ class FifoMixin:
                 # must never break GNSS-SDR startup.
                 pass
 
-    def _open_fifo_writer(self, timeout_s: float | None) -> int:
+    def _open_fifo_writer(
+        self,
+        timeout_s: float | None,
+        fifo_path: Path | None = None,
+    ) -> int:
+        selected_path = Path(fifo_path) if fifo_path is not None else self._fifo_path
         started_at = time.monotonic()
         timeout_value = None
         if timeout_s is not None and float(timeout_s) > 0.0:
@@ -52,7 +58,7 @@ class FifoMixin:
                     f"GNSS-SDR exited early with code {self._proc.returncode}. See gnss_sdr.log."
                 )
             try:
-                fd = os.open(self._fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+                fd = os.open(selected_path, os.O_WRONLY | os.O_NONBLOCK)
                 self._configure_pipe(fd)
                 os.set_blocking(fd, True)
                 elapsed_s = time.monotonic() - started_at
@@ -75,7 +81,9 @@ class FifoMixin:
                 return fd
             except OSError as exc:
                 if exc.errno != errno.ENXIO:
-                    raise RuntimeError(f"Could not open GNSS-SDR FIFO writer: {exc}") from exc
+                    raise RuntimeError(
+                        f"Could not open GNSS-SDR FIFO writer {selected_path}: {exc}"
+                    ) from exc
 
                 now = time.monotonic()
                 elapsed_s = now - started_at
@@ -139,8 +147,10 @@ class FifoMixin:
             return None
 
     def _cleanup_fifo(self) -> None:
-        try:
-            if self._fifo_path.exists() or self._fifo_path.is_symlink():
-                self._fifo_path.unlink()
-        except OSError:
-            pass
+        paths = tuple(getattr(self, "_fifo_paths", (self._fifo_path,)))
+        for path in paths:
+            try:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+            except OSError:
+                pass

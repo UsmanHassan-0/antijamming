@@ -19,7 +19,11 @@ from antijamming.config import StreamConfig
 from .accuracy import AccuracyMixin
 from .cno import CnoMixin
 from .config_renderer import ConfigRendererMixin
-from .fifo import FifoMixin, complex64_contiguous_vector
+from .fifo import (
+    PER_SOURCE_FIFO_STRIPE_SAMPLES,
+    FifoMixin,
+    complex64_contiguous_vector,
+)
 from .models import _SatKey
 from .nmea import NmeaMixin
 from .observable_state import ObservableStateMixin
@@ -79,6 +83,7 @@ class GnssSdrBridge(
         self._tracking_state_started_monotonic_ns = 0
         self._proc: subprocess.Popen[bytes] | None = None
         self._fifo_fd: int | None = None
+        self._fifo_fds: list[int] = []
         self._stdout_thread: threading.Thread | None = None
         self._stdout_handle = None
         self._nmea_thread: threading.Thread | None = None
@@ -95,6 +100,8 @@ class GnssSdrBridge(
         self._write_max_latency_s = 0.0
         self._write_warn_threshold_s = 0.05
         self._pipe_size_bytes: int | None = None
+        self._fifo_source_bytes: list[int] = []
+        self._fifo_max_source_lead_bytes = 0
         self._glog_thread: threading.Thread | None = None
         self._monitor_stop = threading.Event()
         self._fifo_lock = threading.Lock()
@@ -151,7 +158,22 @@ class GnssSdrBridge(
 
         self._runtime_dir = Path(runtime_dir).expanduser().resolve()
         self._log_dir = Path(log_dir).expanduser().resolve()
-        self._fifo_path = self._runtime_dir / "gnss_iq.fifo"
+        shared_phase = bool(
+            getattr(self._cfg, "gnss_shared_u1_phase_compensation_enabled", False)
+        )
+        satellites = tuple(
+            int(value)
+            for value in getattr(self._cfg, "gnss_shared_u1_phase_satellites", ())
+        )
+        self._fifo_paths = (
+            [
+                self._runtime_dir / f"gnss_iq_G{prn:02d}.fifo"
+                for prn in satellites
+            ]
+            if shared_phase
+            else [self._runtime_dir / "gnss_iq.fifo"]
+        )
+        self._fifo_path = self._fifo_paths[0]
         self._config_path = self._runtime_dir / "fifo_gps_l1.conf"
         self._console_log_path = self._runtime_dir / "console.log"
         self._receiver_log_path = self._log_dir / "receiver.log"
@@ -166,7 +188,12 @@ class GnssSdrBridge(
 
     @property
     def active(self) -> bool:
-        return self._fifo_fd is not None and self._proc is not None and self._proc.poll() is None
+        return (
+            bool(self._fifo_fds)
+            and len(self._fifo_fds) == len(self._fifo_paths)
+            and self._proc is not None
+            and self._proc.poll() is None
+        )
 
     def start(self) -> bool:
         if not self._cfg.gnss_sdr_enable:
@@ -207,7 +234,8 @@ class GnssSdrBridge(
         self._cleanup_fifo()
         # A FIFO gives GNSS-SDR a live complex64 source while keeping SDR capture
         # in this Python process.
-        os.mkfifo(self._fifo_path)
+        for fifo_path in self._fifo_paths:
+            os.mkfifo(fifo_path)
         self._console_log_path.write_text("", encoding="utf-8")
         self._receiver_log_path.parent.mkdir(parents=True, exist_ok=True)
         self._receiver_log_path.write_text("", encoding="utf-8")
@@ -308,7 +336,15 @@ class GnssSdrBridge(
             timeout_label,
         )
         try:
-            self._fifo_fd = self._open_fifo_writer(timeout_s=startup_timeout_s)
+            self._fifo_fds = []
+            for fifo_path in self._fifo_paths:
+                self._fifo_fds.append(
+                    self._open_fifo_writer(
+                        timeout_s=startup_timeout_s,
+                        fifo_path=fifo_path,
+                    )
+                )
+            self._fifo_fd = self._fifo_fds[0]
         except Exception:
             self.stop("startup failure")
             raise
@@ -317,10 +353,12 @@ class GnssSdrBridge(
         self._write_bytes = 0
         self._write_time_total_s = 0.0
         self._write_max_latency_s = 0.0
+        self._fifo_source_bytes = [0 for _ in self._fifo_paths]
+        self._fifo_max_source_lead_bytes = 0
 
         self._log.info("Launching product GNSS-SDR: %s", exe_path)
         self._log.info("GNSS-SDR config: %s", self._config_path)
-        self._log.info("GNSS IQ FIFO: %s", self._fifo_path)
+        self._log.info("GNSS IQ FIFO(s): %s", ", ".join(map(str, self._fifo_paths)))
         self._log.info("GNSS-SDR console log: %s", self._console_log_path)
         self._log.info("GNSS-SDR receiver log: %s", self._receiver_log_path)
         self._log.info("GNSS-SDR runtime dir: %s", self._runtime_dir)
@@ -332,7 +370,7 @@ class GnssSdrBridge(
             self._outputs_dir,
             self._tracking_outputs_dir,
             self._pvt_outputs_dir,
-            self._fifo_path,
+            ",".join(map(str, self._fifo_paths)),
             self._config_path,
             self._console_log_path,
             self._receiver_log_path,
@@ -349,24 +387,63 @@ class GnssSdrBridge(
         return True
 
     def write(self, samples: np.ndarray) -> bool:
-        arr = complex64_contiguous_vector(samples)
-        if arr.size == 0:
+        source_count = len(self._fifo_paths)
+        sample_array = np.asarray(samples)
+        if source_count == 1:
+            arrays = [complex64_contiguous_vector(sample_array)]
+        else:
+            if sample_array.ndim != 2 or sample_array.shape[0] != source_count:
+                raise ValueError(
+                    "shared-U1 phase FIFO write expects sources x samples: "
+                    f"got {sample_array.shape}, sources={source_count}"
+                )
+            arrays = [
+                complex64_contiguous_vector(sample_array[index])
+                for index in range(source_count)
+            ]
+        if not arrays or arrays[0].size == 0:
             return True
-        payload = memoryview(arr).cast("B")
+        if any(array.size != arrays[0].size for array in arrays):
+            raise ValueError("shared-U1 phase FIFO streams have unequal sample counts")
         started_at = time.monotonic()
         try:
             with self._fifo_lock:
-                fifo_fd = self._fifo_fd
-                if fifo_fd is None:
+                fifo_fds = tuple(self._fifo_fds)
+                if len(fifo_fds) != len(arrays):
                     return False
-                while payload:
-                    written = os.write(fifo_fd, payload)
-                    if written <= 0:
-                        raise RuntimeError("GNSS-SDR FIFO write returned no progress")
-                    payload = payload[written:]
+                if len(self._fifo_source_bytes) != len(arrays):
+                    self._fifo_source_bytes = [0 for _ in arrays]
+                    self._fifo_max_source_lead_bytes = 0
+                stripe_samples = (
+                    arrays[0].size
+                    if len(arrays) == 1
+                    else PER_SOURCE_FIFO_STRIPE_SAMPLES
+                )
+                for start in range(0, arrays[0].size, stripe_samples):
+                    stop = min(arrays[0].size, start + stripe_samples)
+                    for source_index, (fifo_fd, array) in enumerate(
+                        zip(fifo_fds, arrays)
+                    ):
+                        payload = memoryview(array[start:stop]).cast("B")
+                        while payload:
+                            written = os.write(fifo_fd, payload)
+                            if written <= 0:
+                                raise RuntimeError(
+                                    "GNSS-SDR FIFO write returned no progress"
+                                )
+                            self._fifo_source_bytes[source_index] += written
+                            if len(self._fifo_source_bytes) > 1:
+                                lead = max(self._fifo_source_bytes) - min(
+                                    self._fifo_source_bytes
+                                )
+                                self._fifo_max_source_lead_bytes = max(
+                                    self._fifo_max_source_lead_bytes, lead
+                                )
+                            payload = payload[written:]
             elapsed_s = time.monotonic() - started_at
             self._write_count += 1
-            self._write_bytes += arr.nbytes
+            payload_bytes = sum(array.nbytes for array in arrays)
+            self._write_bytes += payload_bytes
             self._write_time_total_s += elapsed_s
             self._write_max_latency_s = max(self._write_max_latency_s, elapsed_s)
             if elapsed_s >= self._write_warn_threshold_s:
@@ -374,7 +451,7 @@ class GnssSdrBridge(
                 self._log.warning(
                     "GNSS FIFO write latency %.1f ms for %d bytes (writes=%d avg=%.1f ms max=%.1f ms pipe=%s).",
                     elapsed_s * 1000.0,
-                    arr.nbytes,
+                    payload_bytes,
                     self._write_count,
                     avg_ms,
                     self._write_max_latency_s * 1000.0,
@@ -399,9 +476,10 @@ class GnssSdrBridge(
         self._stop_udp_monitors()
         self._close_tracking_state_log()
         with self._fifo_lock:
-            fifo_fd = self._fifo_fd
+            fifo_fds = tuple(self._fifo_fds)
+            self._fifo_fds = []
             self._fifo_fd = None
-            if fifo_fd is not None:
+            for fifo_fd in fifo_fds:
                 try:
                     os.close(fifo_fd)
                 except OSError:

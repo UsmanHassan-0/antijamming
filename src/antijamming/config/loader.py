@@ -70,6 +70,10 @@ _OPTIONAL_JSON_DEFAULTS: dict[str, Any] = {
     "healthy_reference_capture_enabled": True,
     "gnss_sdr_startup_timeout_s": 0.0,
     "gnss_pvt_elevation_mask_deg": 15.0,
+    "gnss_shared_u1_phase_compensation_enabled": False,
+    "gnss_shared_u1_phase_satellites": (3, 4, 7, 8, 9, 14, 16, 27, 30),
+    "gnss_shared_u1_phase_transition_s": 1.0,
+    "gnss_shared_u1_phase_min_quality_measurements": 3,
     "experiment": {},
 }
 
@@ -91,6 +95,7 @@ _TUPLE_KEYS = {
     "rx_antennas_by_channel",
     "rx_lo_sources_by_channel",
     "rx_lo_exports_by_channel",
+    "gnss_shared_u1_phase_satellites",
 }
 
 

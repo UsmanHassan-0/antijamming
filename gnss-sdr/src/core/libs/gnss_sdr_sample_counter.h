@@ -38,7 +38,8 @@ using gnss_sdr_sample_counter_sptr = gnss_shared_ptr<gnss_sdr_sample_counter>;
 gnss_sdr_sample_counter_sptr gnss_sdr_make_sample_counter(
     double _fs,
     int32_t _interval_ms,
-    size_t _size);
+    size_t _size,
+    size_t _ninputs = 1);
 
 class gnss_sdr_sample_counter : public gr::sync_decimator
 {
@@ -52,11 +53,13 @@ private:
     friend gnss_sdr_sample_counter_sptr gnss_sdr_make_sample_counter(
         double _fs,
         int32_t _interval_ms,
-        size_t _size);
+        size_t _size,
+        size_t _ninputs);
 
     gnss_sdr_sample_counter(double _fs,
         int32_t _interval_ms,
-        size_t _size);
+        size_t _size,
+        size_t _ninputs);
 
     int64_t uint64diff(uint64_t first, uint64_t second);
 

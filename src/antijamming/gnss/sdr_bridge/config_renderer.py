@@ -17,7 +17,12 @@ class ConfigRendererMixin:
     def _render_config(self) -> str:
         template_path = self._cfg.gnss_sdr_config_template.expanduser().resolve()
         template = template_path.read_text(encoding="utf-8")
-        channels_1c_count = max(1, int(self._cfg.gnss_1c_channel_count))
+        phase_satellites = self._shared_u1_phase_satellites()
+        channels_1c_count = (
+            len(phase_satellites)
+            if phase_satellites
+            else max(1, int(self._cfg.gnss_1c_channel_count))
+        )
         channels_in_acquisition = min(
             channels_1c_count,
             max(1, int(self._cfg.gnss_channels_in_acquisition)),
@@ -82,6 +87,7 @@ class ConfigRendererMixin:
                 -90.0, min(90.0, float(self._cfg.gnss_pvt_elevation_mask_deg))
             ),
             sample_type=self._cfg.gnss_sdr_sample_type,
+            signal_source_config=self._render_signal_source_config(),
             signal_source_dump_path="./outputs/signal_source/signal_source.dat",
             signal_conditioner_config=self._render_signal_conditioner_config(),
             telemetry_dump_prefix="./outputs/telemetry/telemetry_decoder_1C.dat",
@@ -148,7 +154,12 @@ class ConfigRendererMixin:
             match = re.search(rf"^{re.escape(key)}=(.+)$", rendered_config, re.MULTILINE)
             return match.group(1).strip() if match else "--"
 
-        channels_1c = max(1, int(self._cfg.gnss_1c_channel_count))
+        phase_satellites = self._shared_u1_phase_satellites()
+        channels_1c = (
+            len(phase_satellites)
+            if phase_satellites
+            else max(1, int(self._cfg.gnss_1c_channel_count))
+        )
         channels_in_acquisition = min(
             channels_1c,
             max(1, int(self._cfg.gnss_channels_in_acquisition)),
@@ -158,6 +169,9 @@ class ConfigRendererMixin:
             f"channels_1c={channels_1c} "
             f"total_channels={channels_1c} "
             f"channels_in_acquisition={channels_in_acquisition} "
+            f"rf_sources={len(phase_satellites) if phase_satellites else 1} "
+            f"shared_u1_phase_compensation={bool(phase_satellites)} "
+            f"pinned_prns={','.join(str(value) for value in phase_satellites) or '--'} "
             f"tracking_1c_dump={value_for('Tracking_1C.dump')} "
             f"pvt_dump={value_for('PVT.dump')} "
             f"observables_dump={value_for('Observables.dump')} "
@@ -185,8 +199,49 @@ class ConfigRendererMixin:
         self._handoff_log.info("%s", summary)
 
     def _render_channel_signal_config(self) -> str:
+        satellites = self._shared_u1_phase_satellites()
+        if satellites:
+            rows: list[str] = []
+            for idx, prn in enumerate(satellites):
+                rows.extend(
+                    [
+                        f"Channel{idx}.signal=1C",
+                        f"Channel{idx}.satellite={prn}",
+                        f"Channel{idx}.RF_channel_ID={idx}",
+                    ]
+                )
+            return "\n".join(rows)
         gps_count = max(1, int(self._cfg.gnss_1c_channel_count))
         return "\n".join(f"Channel{idx}.signal=1C" for idx in range(gps_count))
+
+    def _render_signal_source_config(self) -> str:
+        satellites = self._shared_u1_phase_satellites()
+        if not satellites:
+            return "\n".join(
+                [
+                    "SignalSource.implementation=Fifo_Signal_Source",
+                    f"SignalSource.filename={self._fifo_path}",
+                    f"SignalSource.sample_type={self._cfg.gnss_sdr_sample_type}",
+                    "SignalSource.dump=false",
+                    "SignalSource.dump_filename=./outputs/signal_source/signal_source.dat",
+                ]
+            )
+        rows = [
+            f"GNSS-SDR.num_sources={len(satellites)}",
+            "GNSS-SDR.synchronize_signal_sources=true",
+        ]
+        for idx, (prn, path) in enumerate(zip(satellites, self._fifo_paths)):
+            role = f"SignalSource{idx}"
+            rows.extend(
+                [
+                    f"{role}.implementation=Fifo_Signal_Source",
+                    f"{role}.filename={path}",
+                    f"{role}.sample_type={self._cfg.gnss_sdr_sample_type}",
+                    f"{role}.dump=false",
+                    f"{role}.dump_filename=./outputs/signal_source/signal_source_G{prn:02d}.dat",
+                ]
+            )
+        return "\n".join(rows)
 
     def _render_signal_conditioner_config(self) -> str:
         sample_rate_hz = max(1.0, float(self._cfg.sample_rate))
@@ -194,31 +249,62 @@ class ConfigRendererMixin:
         # Validate that the configured rate can represent the physical GPS L1
         # pass/stop edges before asking GNU Radio to derive low-pass taps.
         self.input_filter_bandwidth_hz
-        return "\n".join(
-            [
-                "SignalConditioner.implementation=Signal_Conditioner",
-                "DataTypeAdapter.implementation=Pass_Through",
-                "DataTypeAdapter.item_type=gr_complex",
-                "InputFilter.implementation=Freq_Xlating_Fir_Filter",
-                "InputFilter.input_item_type=gr_complex",
-                "InputFilter.output_item_type=gr_complex",
-                "InputFilter.taps_item_type=float",
-                "InputFilter.filter_type=lowpass",
-                f"InputFilter.bw={GNSS_INPUT_FILTER_CUTOFF_HZ:.0f}",
-                f"InputFilter.tw={GNSS_INPUT_FILTER_TRANSITION_WIDTH_HZ:.0f}",
-                f"InputFilter.sampling_frequency={sample_rate_sps}",
-                "InputFilter.IF=0",
-                "InputFilter.decimation_factor=1",
-                "InputFilter.dump=false",
-                "InputFilter.dump_filename=./outputs/signal_conditioner/input_filter.dat",
-                "Resampler.implementation=Pass_Through",
-                "Resampler.item_type=gr_complex",
-                f"Resampler.sample_freq_in={sample_rate_sps}",
-                f"Resampler.sample_freq_out={sample_rate_sps}",
-                "Resampler.dump=false",
-                "Resampler.dump_filename=./outputs/signal_conditioner/resampler.dat",
-            ]
+        satellites = self._shared_u1_phase_satellites()
+        count = len(satellites) if satellites else 1
+        rows: list[str] = []
+        for idx in range(count):
+            suffix = str(idx) if satellites else ""
+            output_suffix = f"_G{satellites[idx]:02d}" if satellites else ""
+            conditioner = f"SignalConditioner{suffix}"
+            adapter = f"DataTypeAdapter{suffix}"
+            input_filter = f"InputFilter{suffix}"
+            resampler = f"Resampler{suffix}"
+            rows.extend(
+                [
+                    f"{conditioner}.implementation=Signal_Conditioner",
+                    f"{adapter}.implementation=Pass_Through",
+                    f"{adapter}.item_type=gr_complex",
+                    f"{input_filter}.implementation=Freq_Xlating_Fir_Filter",
+                    f"{input_filter}.input_item_type=gr_complex",
+                    f"{input_filter}.output_item_type=gr_complex",
+                    f"{input_filter}.taps_item_type=float",
+                    f"{input_filter}.filter_type=lowpass",
+                    f"{input_filter}.bw={GNSS_INPUT_FILTER_CUTOFF_HZ:.0f}",
+                    f"{input_filter}.tw={GNSS_INPUT_FILTER_TRANSITION_WIDTH_HZ:.0f}",
+                    f"{input_filter}.sampling_frequency={sample_rate_sps}",
+                    f"{input_filter}.IF=0",
+                    f"{input_filter}.decimation_factor=1",
+                    f"{input_filter}.dump=false",
+                    f"{input_filter}.dump_filename=./outputs/signal_conditioner/input_filter{output_suffix}.dat",
+                    f"{resampler}.implementation=Pass_Through",
+                    f"{resampler}.item_type=gr_complex",
+                    f"{resampler}.sample_freq_in={sample_rate_sps}",
+                    f"{resampler}.sample_freq_out={sample_rate_sps}",
+                    f"{resampler}.dump=false",
+                    f"{resampler}.dump_filename=./outputs/signal_conditioner/resampler{output_suffix}.dat",
+                ]
+            )
+        return "\n".join(rows)
+
+    def _shared_u1_phase_satellites(self) -> tuple[int, ...]:
+        if not bool(
+            getattr(self._cfg, "gnss_shared_u1_phase_compensation_enabled", False)
+        ):
+            return ()
+        satellites = tuple(
+            int(value)
+            for value in getattr(self._cfg, "gnss_shared_u1_phase_satellites", ())
         )
+        if len(satellites) < 4:
+            raise ValueError(
+                "shared-U1 phase PVT test requires at least four pinned GPS satellites"
+            )
+        if len(set(satellites)) != len(satellites):
+            raise ValueError("shared-U1 phase satellite list contains duplicates")
+        invalid = [value for value in satellites if value < 1 or value > 32]
+        if invalid:
+            raise ValueError(f"invalid GPS L1 C/A PRNs: {invalid}")
+        return satellites
 
     def _active_signal_ids(self) -> tuple[str, ...]:
         signals: list[str] = []
