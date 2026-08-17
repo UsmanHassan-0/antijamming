@@ -72,6 +72,10 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.gnss_truth_static_lon_deg == -121.915773
     assert cfg.gnss_truth_static_alt_m == 100.0
     assert cfg.gnss_sdr_echo_stdout is False
+    assert cfg.gnss_shared_u1_phase_compensation_enabled is True
+    assert cfg.gnss_shared_u1_phase_satellites == ()
+    assert cfg.gnss_1c_channel_count == 10
+    assert cfg.gnss_channels_in_acquisition == 10
     assert cfg.ui_update_interval_s == 0.1
     assert cfg.dsp_update_interval_s == 0.1
     assert cfg.prn_chart_update_interval_s == 0.1
@@ -104,6 +108,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_heavy_diagnostics_interval_s == 1.0
     assert cfg.one_run_segmentation_enabled is True
     assert cfg.healthy_reference_capture_enabled is True
+    assert cfg.lcmv_auto_arm_after_pvt is True
     assert cfg.process_every_n_chunks == 15
     assert cfg.samples_per_chunk == 32768
     assert cfg.gnss_feed_queue_maxsize == 512
@@ -114,9 +119,9 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.rx_clipping_fraction_threshold == 0.001
     assert "/tmp" not in cfg.gnss_sdr_runtime_dir.as_posix()
     assert "/tmp" not in cfg.gnss_sdr_log_dir.as_posix()
-    assert cfg.gnss_1c_channel_count == 9
+    assert cfg.gnss_1c_channel_count == 10
     assert cfg.gnss_pvt_elevation_mask_deg == 15.0
-    assert cfg.gnss_channels_in_acquisition == 1
+    assert cfg.gnss_channels_in_acquisition == 10
     assert cfg.gnss_pvt_monitor_enable is True
     assert cfg.gnss_pvt_monitor_client_addresses == "127.0.0.1"
     assert cfg.gnss_pvt_monitor_udp_port == "1111"
@@ -540,42 +545,23 @@ def test_runtime_config_applies_opt_in_partial_overlay(
     assert "recv_buff_size=50000000" in cfg.usrp_addr
     assert "num_recv_frames=4096" in cfg.usrp_addr
     assert cfg.gnss_sdr_echo_stdout is False
-    assert cfg.gnss_1c_channel_count == 9
-    assert cfg.gnss_channels_in_acquisition == 1
+    assert cfg.gnss_shared_u1_phase_compensation_enabled is True
+    assert cfg.gnss_shared_u1_phase_satellites == ()
+    assert cfg.gnss_1c_channel_count == 10
+    assert cfg.gnss_channels_in_acquisition == 10
     assert cfg.phase_calibration_file is not None
     assert cfg.phase_calibration_file.is_absolute()
     assert cfg.phase_correction_vector is not None
 
 
-def test_shared_u1_g10_lab_overlay_builds_complete_runtime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    overlay = (
-        REPO_ROOT
-        / "configs/antijamming/shared_u1_phase_g10_5deg_atten50_gain29_test.json"
-    )
-    monkeypatch.setenv("ANTIJAM_RUNTIME_OVERLAY", str(overlay))
-
+def test_product_profile_uses_dynamic_shared_u1_phase_fanout() -> None:
     cfg = build_runtime_config()
 
     assert cfg.gnss_shared_u1_phase_compensation_enabled is True
-    assert cfg.gnss_shared_u1_phase_satellites == (
-        5,
-        10,
-        13,
-        15,
-        16,
-        18,
-        23,
-        25,
-        26,
-        29,
-    )
+    assert cfg.gnss_shared_u1_phase_satellites == ()
     assert cfg.gnss_1c_channel_count == 10
     assert cfg.gnss_channels_in_acquisition == 10
-    assert cfg.gnss_pvt_elevation_mask_deg == 5.0
     assert cfg.gain_db == 45.0
-    assert cfg.experiment["bladeRF_tx_gain_db"] == 29.0
     assert cfg.experiment["jammer_attenuation_db"] == 50.0
     assert cfg.sample_rate == 4_000_000.0
     assert cfg.center_freq_hz == 1_575_420_000.0

@@ -165,14 +165,23 @@ class GnssSdrBridge(
             int(value)
             for value in getattr(self._cfg, "gnss_shared_u1_phase_satellites", ())
         )
-        self._fifo_paths = (
-            [
-                self._runtime_dir / f"gnss_iq_G{prn:02d}.fifo"
-                for prn in satellites
+        if shared_phase:
+            source_count = (
+                len(satellites)
+                if satellites
+                else max(1, int(self._cfg.gnss_1c_channel_count))
+            )
+            self._fifo_paths = [
+                self._runtime_dir
+                / (
+                    f"gnss_iq_G{satellites[index]:02d}.fifo"
+                    if satellites
+                    else f"gnss_iq_channel_{index:02d}.fifo"
+                )
+                for index in range(source_count)
             ]
-            if shared_phase
-            else [self._runtime_dir / "gnss_iq.fifo"]
-        )
+        else:
+            self._fifo_paths = [self._runtime_dir / "gnss_iq.fifo"]
         self._fifo_path = self._fifo_paths[0]
         self._config_path = self._runtime_dir / "fifo_gps_l1.conf"
         self._console_log_path = self._runtime_dir / "console.log"

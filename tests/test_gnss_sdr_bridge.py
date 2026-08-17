@@ -646,6 +646,7 @@ def test_bridge_renders_fifo_config_with_runtime_paths(tmp_path: Path) -> None:
 
     cfg = StreamConfig(
         sample_rate=8e6,
+        gnss_shared_u1_phase_compensation_enabled=False,
         gnss_sdr_config_template=template_path,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
     )
@@ -661,6 +662,7 @@ def test_bridge_renders_fifo_config_with_runtime_paths(tmp_path: Path) -> None:
 def test_bridge_fifo_config_derives_gps_l1_filter_at_4mhz(tmp_path: Path) -> None:
     cfg = StreamConfig(
         sample_rate=4e6,
+        gnss_shared_u1_phase_compensation_enabled=False,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
     )
     bridge = GnssSdrBridge(cfg, _loggers())
@@ -728,6 +730,7 @@ def test_bridge_archives_exact_pid_scoped_gnss_runtime_artifacts(tmp_path: Path)
 def test_bridge_gps_l1_filter_keeps_physical_bandwidth_when_rate_changes(tmp_path: Path) -> None:
     cfg = StreamConfig(
         sample_rate=8e6,
+        gnss_shared_u1_phase_compensation_enabled=False,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
     )
     bridge = GnssSdrBridge(cfg, _loggers())
@@ -1959,6 +1962,7 @@ def test_bridge_reset_runtime_dir_falls_back_after_root_owned_path(
     fallback_runtime = tmp_path / "user-runtime"
     bridge = GnssSdrBridge(
         StreamConfig(
+            gnss_shared_u1_phase_compensation_enabled=False,
             gnss_sdr_runtime_dir=configured_runtime,
             gnss_sdr_log_dir=configured_log,
         ),

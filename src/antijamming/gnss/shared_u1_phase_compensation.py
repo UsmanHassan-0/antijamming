@@ -167,6 +167,7 @@ class _PrnAggregate:
 
 @dataclass(slots=True)
 class _PhaseState:
+    satellite: str | None
     current: np.ndarray
     start: np.ndarray
     target: np.ndarray
@@ -193,12 +194,17 @@ class SharedU1PhaseCompensationBank:
         sample_rate_hz: float,
         samples_per_chunk: int,
         transition_s: float,
+        source_count: int | None = None,
         max_weight_norm: float = 8.0,
-        max_compensation_gain_db: float = 6.0,
         min_post_onset_desired_updates: int = 3,
         max_post_onset_desired_step_deg: float = 10.0,
     ) -> None:
         self._satellites = tuple(int(value) for value in satellites)
+        self._source_count = (
+            len(self._satellites)
+            if self._satellites
+            else max(1, int(source_count or 0))
+        )
         self._channel_count = int(channel_count)
         chunk_s = max(1, int(samples_per_chunk)) / max(1.0, float(sample_rate_hz))
         self._transition_chunks = (
@@ -207,14 +213,11 @@ class SharedU1PhaseCompensationBank:
             else max(1, int(math.ceil(float(transition_s) / chunk_s)))
         )
         self._max_weight_norm = max(float(max_weight_norm), 1e-6)
-        self._max_compensation_gain = 10.0 ** (
-            max(0.0, float(max_compensation_gain_db)) / 20.0
-        )
         self._min_post_onset_updates = max(2, int(min_post_onset_desired_updates))
         self._max_post_onset_step_deg = max(
             0.1, min(float(max_post_onset_desired_step_deg), 90.0)
         )
-        self._states: dict[str, _PhaseState] = {}
+        self._states: dict[int, _PhaseState] = {}
         self._enabled_previous = False
         self._activation_monotonic: float | None = None
         self._last_shared_protection: np.ndarray | None = None
@@ -272,10 +275,6 @@ class SharedU1PhaseCompensationBank:
         # np.vdot(gamma*w, a) = conj(gamma) * np.vdot(w, a).
         scale = complex(np.conj(old_response / raw_response))
         metrics["scale"] = scale
-        minimum_gain = 1.0 / self._max_compensation_gain
-        if not minimum_gain <= abs(scale) <= self._max_compensation_gain:
-            metrics["guard_reason"] = "complex_response_scale_out_of_range"
-            return None, metrics
         target = np.asarray(scale * requested, dtype=np.complex128)
         if (
             not np.all(np.isfinite(target))
@@ -337,6 +336,7 @@ class SharedU1PhaseCompensationBank:
         shared_measured_u1_weights: np.ndarray,
         shared_measured_u1_available: bool,
         desired_vectors: dict[str, dict[str, object]],
+        source_satellites: tuple[int | None, ...] | None = None,
         enabled_now: bool,
         now_monotonic: float | None = None,
         max_vector_age_s: float = 2.5,
@@ -372,21 +372,56 @@ class SharedU1PhaseCompensationBank:
         if protection_changed:
             self._last_shared_protection = np.array(protection, copy=True)
 
+        if self._satellites:
+            active_satellites: tuple[int | None, ...] = tuple(self._satellites)
+        else:
+            supplied = tuple(source_satellites or ())
+            active_satellites = tuple(
+                (
+                    int(supplied[index])
+                    if index < len(supplied) and supplied[index] is not None
+                    else None
+                )
+                for index in range(self._source_count)
+            )
         rows = np.empty(
-            (len(self._satellites), self._channel_count),
+            (self._source_count, self._channel_count),
             dtype=np.complex128,
         )
         status: dict[str, object] = {}
-        for row_index, prn in enumerate(self._satellites):
+        for row_index, prn in enumerate(active_satellites):
+            if prn is None:
+                rows[row_index] = common
+                if emit_status:
+                    status[f"source_{row_index:02d}"] = {
+                        "source": "shared_common_waiting_for_channel_prn",
+                        "source_index": row_index,
+                        "satellite": None,
+                        "applied_to_gnss_sdr": True,
+                        "shared_spatial_solution": True,
+                        "independent_per_prn_lcmv": False,
+                        "desired_vector_available": False,
+                        "phase_compensation_applied": False,
+                        "shared_protection_bridge_applied": False,
+                        "phase_compensation_guard_reason": (
+                            "tracking channel has no current GPS PRN assignment"
+                        ),
+                        "transition_active": False,
+                        "transition_progress": 1.0,
+                        "applied_logical_weights": _complex_payload(common),
+                        "desired_spatial_vector": None,
+                    }
+                continue
             satellite = f"G{prn:02d}"
-            state = self._states.get(satellite)
-            if state is None:
+            state = self._states.get(row_index)
+            if state is None or state.satellite != satellite:
                 state = _PhaseState(
+                    satellite=satellite,
                     current=np.array(common, copy=True),
                     start=np.array(common, copy=True),
                     target=np.array(common, copy=True),
                 )
-                self._states[satellite] = state
+                self._states[row_index] = state
             payload = desired_vectors.get(satellite, {})
             vector = self._valid_vector(
                 payload.get("desired_spatial_vector"), self._channel_count
@@ -506,8 +541,15 @@ class SharedU1PhaseCompensationBank:
                 state.total_chunks > 0
                 and state.completed_chunks < state.total_chunks
             )
-            status[satellite] = {
+            status_key = (
+                satellite
+                if satellite not in status
+                else f"{satellite}@source_{row_index:02d}"
+            )
+            status[status_key] = {
                 "source": state.source,
+                "source_index": row_index,
+                "satellite": satellite,
                 "applied_to_gnss_sdr": True,
                 "shared_spatial_solution": True,
                 "independent_per_prn_lcmv": False,
@@ -572,6 +614,7 @@ class SharedU1DesiredVectorMonitor:
         session_id: str,
         logger: logging.Logger,
         satellites: tuple[int, ...],
+        source_count: int | None = None,
         retention_s: float = 0.75,
         measurement_interval_s: float = 1.0,
         min_cno_db_hz: float = 30.0,
@@ -598,6 +641,12 @@ class SharedU1DesiredVectorMonitor:
         self._satellite_rows = {
             f"G{int(prn):02d}": index for index, prn in enumerate(satellites)
         }
+        self._dynamic_sources = not bool(self._satellite_rows)
+        self._source_count = (
+            len(self._satellite_rows)
+            if self._satellite_rows
+            else max(1, int(source_count or 0))
+        )
         self._path = Path(session_dir) / "shared_u1_phase_vectors.jsonl"
         self._queue: queue.Queue[
             tuple[int, np.ndarray, np.ndarray] | None
@@ -640,6 +689,8 @@ class SharedU1DesiredVectorMonitor:
                 "event": "shared_u1_phase_vector_monitor_start",
                 "schema_version": 1,
                 "satellites": sorted(self._satellite_rows),
+                "dynamic_channel_prn_mapping": self._dynamic_sources,
+                "source_count": self._source_count,
                 "purpose": (
                     "PRN code-despread desired vectors for shared measured-U1 "
                     "LCMV complex-response compensation; no per-PRN LCMV solve"
@@ -731,14 +782,13 @@ class SharedU1DesiredVectorMonitor:
         self,
         start: int,
         end: int,
-        satellite: str,
+        row_index: int,
     ) -> tuple[np.ndarray, np.ndarray, bool] | None:
         if end <= start or not self._spans:
             return None
         output = np.empty((self._channel_count, end - start), dtype=np.complex64)
         filled = 0
         rows: list[np.ndarray] = []
-        row_index = self._satellite_rows.get(satellite)
         for span in self._spans:
             overlap_start = max(start, span.start)
             overlap_end = min(end, span.end)
@@ -754,7 +804,7 @@ class SharedU1DesiredVectorMonitor:
             logical = np.asarray(span.logical_weights, dtype=np.complex128)
             if logical.ndim == 1:
                 selected = logical
-            elif logical.ndim == 2 and row_index is not None:
+            elif logical.ndim == 2 and 0 <= row_index < logical.shape[0]:
                 selected = logical[row_index]
             else:
                 return None
@@ -780,11 +830,22 @@ class SharedU1DesiredVectorMonitor:
             signal = str(entry.get("signal", ""))
             prn = int(entry.get("prn", 0) or 0)
             satellite = str(entry.get("satellite_id") or f"G{prn:02d}")
+            try:
+                tracking_channel = int(entry.get("channel", -1))
+            except (TypeError, ValueError):
+                tracking_channel = -1
+            source_index = (
+                tracking_channel
+                if self._dynamic_sources
+                else self._satellite_rows.get(satellite, -1)
+            )
             counter = int(entry.get("tracking_sample_counter", 0) or 0)
             cno = _finite_float(entry.get("cn0_db_hz"))
             doppler = _finite_float(entry.get("carrier_doppler_hz"))
             if (
-                satellite not in self._satellite_rows
+                (not self._dynamic_sources and satellite not in self._satellite_rows)
+                or source_index < 0
+                or source_index >= self._source_count
                 or system not in {"G", "GPS"}
                 or signal != "1C"
                 or counter <= 0
@@ -795,7 +856,7 @@ class SharedU1DesiredVectorMonitor:
             ):
                 continue
             measurement = self._correlate(
-                entry, satellite, prn, counter, doppler, cno
+                entry, satellite, prn, counter, doppler, cno, source_index
             )
             if measurement is not None:
                 self._last_counter[satellite] = counter
@@ -809,6 +870,7 @@ class SharedU1DesiredVectorMonitor:
         counter: int,
         doppler_hz: float,
         cno_db_hz: float,
+        source_index: int,
     ) -> dict[str, object] | None:
         code_rate_hz = GPS_CA_RATE_HZ * (1.0 + doppler_hz / GPS_L1_HZ)
         nominal_length = self._fs * GPS_CA_LENGTH / code_rate_hz
@@ -822,7 +884,7 @@ class SharedU1DesiredVectorMonitor:
         extracted = self._extract(
             counter - max(lengths) - margin,
             counter + margin,
-            satellite,
+            source_index,
         )
         if extracted is None:
             return None
@@ -917,6 +979,7 @@ class SharedU1DesiredVectorMonitor:
             "schema_version": 1,
             "satellite_id": satellite,
             "prn": prn,
+            "source_index": source_index,
             "tracking_sample_counter": counter,
             "cn0_db_hz": cno_db_hz,
             "carrier_doppler_hz": doppler_hz,

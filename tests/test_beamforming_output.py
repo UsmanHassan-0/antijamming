@@ -102,6 +102,45 @@ def test_uniform_combiner_rejects_wrong_weight_count() -> None:
         apply_beamformer(x, uniform_weights(3))
 
 
+def test_dynamic_phase_source_mapping_ignores_stale_latest_by_prn_entry() -> None:
+    cfg = StreamConfig(
+        gnss_shared_u1_phase_compensation_enabled=True,
+        gnss_shared_u1_phase_satellites=(),
+        gnss_1c_channel_count=4,
+        gnss_channels_in_acquisition=4,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    snapshot = {
+        # This collection deliberately reproduces the live failure: stale G23
+        # and current G14 both claim channel 2, and sorted PRN order would make
+        # G23 win if this archive-like collection were used for routing.
+        "tracking_monitor": [
+            {"channel": 2, "prn": 14, "system": "G", "signal": "1C"},
+            {"channel": 2, "prn": 23, "system": "G", "signal": "1C"},
+        ],
+        "prns": [
+            {
+                "channel": 2,
+                "prn": 14,
+                "tracking_monitor_prn": 14,
+                "state": "tracking",
+                "system": "G",
+                "signal": "1C",
+            },
+            {
+                "channel": 2,
+                "prn": 23,
+                "tracking_monitor_prn": 14,
+                "state": "lost",
+                "system": "G",
+                "signal": "1C",
+            },
+        ],
+    }
+
+    assert runtime._tracking_source_satellites(snapshot) == (None, None, 14, None)
+
+
 def test_display_bearing_to_internal_angle_convention_is_invertible() -> None:
     assert operator_bearing_to_internal_angle_deg(170.0) == pytest.approx(280.0)
     assert operator_bearing_to_internal_angle_deg(290.0) == pytest.approx(160.0)
@@ -422,7 +461,10 @@ def test_worker_gnss_output_static_calibration_uses_uniform_combiner() -> None:
 
 
 def test_backend_gnss_handoff_label_is_uniform_array_sum() -> None:
-    cfg = StreamConfig(phase_correction_vector=None)
+    cfg = StreamConfig(
+        phase_correction_vector=None,
+        gnss_shared_u1_phase_compensation_enabled=False,
+    )
     runtime = BackendRuntime(cfg, _build_loggers())
     x = np.array(
         [
@@ -451,6 +493,7 @@ def test_backend_lcmv_test_missing_music_bearing_falls_back_to_uniform() -> None
         lcmv_target_selection_mode="strongest_music_peak",
         lcmv_weight_transition_s=0.0,
         phase_correction_vector=None,
+        gnss_shared_u1_phase_compensation_enabled=False,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
     runtime.set_lcmv_test_enabled(True)
@@ -517,6 +560,7 @@ def test_backend_lcmv_test_valid_music_bearing_updates_gnss_weights() -> None:
         lcmv_target_selection_mode="strongest_music_peak",
         lcmv_weight_transition_s=0.0,
         phase_correction_vector=None,
+        gnss_shared_u1_phase_compensation_enabled=False,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
     internal_angle = 88.75
@@ -1116,6 +1160,78 @@ def test_healthy_reference_updates_during_lcmv_off_healthy_baseline() -> None:
     assert payload["lcmv_safe_baseline"] is True
     assert payload["healthy_reference_available"] is True
     assert runtime._healthy_reference_vector is not None
+
+
+def test_healthy_pvt_auto_arms_lcmv_but_keeps_uniform_until_jammer() -> None:
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_auto_arm_after_pvt=True,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        lcmv_target_selection_mode="realtime_non_preserve_peak",
+        lcmv_realtime_preserve_min_samples=3,
+        lcmv_realtime_preserve_max_circular_std_deg=5.0,
+        gnss_shared_u1_phase_compensation_enabled=True,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    runtime._gnss_bridge = SimpleNamespace(
+        snapshot=lambda: {
+            "pvt_current": True,
+            "pvt_gui_status": "FIX",
+            "pvt_observation_count": 10,
+            "avg_tracking_cno_db_hz": 42.0,
+        }
+    )
+    for angle in (39.0, 40.0, 41.0):
+        runtime._update_realtime_bladerf_angle_tracker(
+            {"doa_peaks": [{"angle_deg": angle}]},
+            primary_internal_deg=angle,
+        )
+    desired = steering_vector(
+        np.asarray([40.0]), cfg.center_freq_hz, cfg.array_spacing_m
+    ).reshape(-1)
+    x = np.tile(desired[:, None], (1, 256))
+
+    payload = runtime._update_healthy_reference_tracking_from_music(
+        corrected_chunk=x,
+        music_internal_deg=40.0,
+        music_bearing_deg=internal_angle_to_operator_bearing_deg(40.0),
+    )
+
+    status = runtime._lcmv_status_copy()
+    assert payload["lcmv_auto_arm_triggered"] is True
+    assert runtime._lcmv_test_enabled is True
+    assert runtime._lcmv_jammer_detected_latched is False
+    assert status["mode"] == "fallback"
+    assert status["spatial_vector_diagnostics"][
+        "lcmv_jammer_activation_armed"
+    ] is True
+    assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
+
+
+def test_lcmv_auto_arm_waits_for_pvt_and_respects_manual_off() -> None:
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_auto_arm_after_pvt=True,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        gnss_shared_u1_phase_compensation_enabled=True,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    runtime.set_lcmv_test_enabled(False)
+
+    armed = runtime._maybe_auto_arm_lcmv_after_pvt(
+        {
+            "healthy_reference_updated": True,
+            "pvt_healthy": True,
+            "observations_healthy": True,
+            "cn0_healthy": True,
+        }
+    )
+
+    assert armed is False
+    assert runtime._lcmv_auto_arm_suppressed_by_operator is True
+    assert runtime._lcmv_test_enabled is False
 
 
 def test_healthy_reference_does_not_treat_music_local_peaks_as_emitters() -> None:

@@ -2297,6 +2297,12 @@ def test_gui_shows_doa_and_rx_health(qtbot) -> None:
     assert np.allclose(lcmv_y, lcmv_response_db[order])
     assert window._lcmv_response_marker.value() == pytest.approx(expected_bearing)
 
+    # The offscreen Qt backend can retain a paint event for pyqtgraph's axes
+    # after this test returns.  Drain it while the window and its AxisItems are
+    # still alive; otherwise pytest-qt may delete the plot first and process
+    # the queued paint at the beginning of the next test.
+    qtbot.wait(1)
+
 
 def test_gui_displays_current_source_count_estimators(qtbot) -> None:
     cfg = StreamConfig(expected_sources=1)

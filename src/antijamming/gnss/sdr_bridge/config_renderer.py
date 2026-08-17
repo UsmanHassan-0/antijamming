@@ -17,10 +17,11 @@ class ConfigRendererMixin:
     def _render_config(self) -> str:
         template_path = self._cfg.gnss_sdr_config_template.expanduser().resolve()
         template = template_path.read_text(encoding="utf-8")
+        shared_phase = self._shared_u1_phase_enabled()
         phase_satellites = self._shared_u1_phase_satellites()
         channels_1c_count = (
-            len(phase_satellites)
-            if phase_satellites
+            self._shared_u1_phase_source_count()
+            if shared_phase
             else max(1, int(self._cfg.gnss_1c_channel_count))
         )
         channels_in_acquisition = min(
@@ -154,10 +155,12 @@ class ConfigRendererMixin:
             match = re.search(rf"^{re.escape(key)}=(.+)$", rendered_config, re.MULTILINE)
             return match.group(1).strip() if match else "--"
 
+        shared_phase = self._shared_u1_phase_enabled()
         phase_satellites = self._shared_u1_phase_satellites()
+        source_count = self._shared_u1_phase_source_count() if shared_phase else 1
         channels_1c = (
-            len(phase_satellites)
-            if phase_satellites
+            source_count
+            if shared_phase
             else max(1, int(self._cfg.gnss_1c_channel_count))
         )
         channels_in_acquisition = min(
@@ -169,8 +172,8 @@ class ConfigRendererMixin:
             f"channels_1c={channels_1c} "
             f"total_channels={channels_1c} "
             f"channels_in_acquisition={channels_in_acquisition} "
-            f"rf_sources={len(phase_satellites) if phase_satellites else 1} "
-            f"shared_u1_phase_compensation={bool(phase_satellites)} "
+            f"rf_sources={source_count} "
+            f"shared_u1_phase_compensation={shared_phase} "
             f"pinned_prns={','.join(str(value) for value in phase_satellites) or '--'} "
             f"tracking_1c_dump={value_for('Tracking_1C.dump')} "
             f"pvt_dump={value_for('PVT.dump')} "
@@ -199,24 +202,23 @@ class ConfigRendererMixin:
         self._handoff_log.info("%s", summary)
 
     def _render_channel_signal_config(self) -> str:
+        shared_phase = self._shared_u1_phase_enabled()
         satellites = self._shared_u1_phase_satellites()
-        if satellites:
+        if shared_phase:
             rows: list[str] = []
-            for idx, prn in enumerate(satellites):
-                rows.extend(
-                    [
-                        f"Channel{idx}.signal=1C",
-                        f"Channel{idx}.satellite={prn}",
-                        f"Channel{idx}.RF_channel_ID={idx}",
-                    ]
-                )
+            for idx in range(self._shared_u1_phase_source_count()):
+                rows.append(f"Channel{idx}.signal=1C")
+                if satellites:
+                    rows.append(f"Channel{idx}.satellite={satellites[idx]}")
+                rows.append(f"Channel{idx}.RF_channel_ID={idx}")
             return "\n".join(rows)
         gps_count = max(1, int(self._cfg.gnss_1c_channel_count))
         return "\n".join(f"Channel{idx}.signal=1C" for idx in range(gps_count))
 
     def _render_signal_source_config(self) -> str:
+        shared_phase = self._shared_u1_phase_enabled()
         satellites = self._shared_u1_phase_satellites()
-        if not satellites:
+        if not shared_phase:
             return "\n".join(
                 [
                     "SignalSource.implementation=Fifo_Signal_Source",
@@ -226,22 +228,26 @@ class ConfigRendererMixin:
                     "SignalSource.dump_filename=./outputs/signal_source/signal_source.dat",
                 ]
             )
+        source_count = self._shared_u1_phase_source_count()
         rows = [
-            f"GNSS-SDR.num_sources={len(satellites)}",
+            f"GNSS-SDR.num_sources={source_count}",
             # GNSS-SDR normally derives its observables clock from conditioner
             # zero only. Per-PRN FIFOs are independent scheduler branches, so
             # that clock must consume every branch in lockstep.
             "GNSS-SDR.synchronize_signal_sources=true",
         ]
-        for idx, (prn, path) in enumerate(zip(satellites, self._fifo_paths)):
+        for idx, path in enumerate(self._fifo_paths):
             role = f"SignalSource{idx}"
+            source_name = (
+                f"G{satellites[idx]:02d}" if satellites else f"channel_{idx:02d}"
+            )
             rows.extend(
                 [
                     f"{role}.implementation=Fifo_Signal_Source",
                     f"{role}.filename={path}",
                     f"{role}.sample_type={self._cfg.gnss_sdr_sample_type}",
                     f"{role}.dump=false",
-                    f"{role}.dump_filename=./outputs/signal_source/signal_source_G{prn:02d}.dat",
+                    f"{role}.dump_filename=./outputs/signal_source/signal_source_{source_name}.dat",
                 ]
             )
         return "\n".join(rows)
@@ -252,12 +258,19 @@ class ConfigRendererMixin:
         # Validate that the configured rate can represent the physical GPS L1
         # pass/stop edges before asking GNU Radio to derive low-pass taps.
         self.input_filter_bandwidth_hz
+        shared_phase = self._shared_u1_phase_enabled()
         satellites = self._shared_u1_phase_satellites()
-        count = len(satellites) if satellites else 1
+        count = self._shared_u1_phase_source_count() if shared_phase else 1
         rows: list[str] = []
         for idx in range(count):
-            suffix = str(idx) if satellites else ""
-            output_suffix = f"_G{satellites[idx]:02d}" if satellites else ""
+            # Every shared-phase source is a distinct synchronized GNU Radio
+            # branch, whether its PRN is pinned or acquired dynamically.
+            suffix = str(idx) if shared_phase else ""
+            output_suffix = (
+                f"_G{satellites[idx]:02d}"
+                if satellites
+                else (f"_channel_{idx:02d}" if shared_phase else "")
+            )
             conditioner = f"SignalConditioner{suffix}"
             adapter = f"DataTypeAdapter{suffix}"
             input_filter = f"InputFilter{suffix}"
@@ -290,15 +303,16 @@ class ConfigRendererMixin:
         return "\n".join(rows)
 
     def _shared_u1_phase_satellites(self) -> tuple[int, ...]:
-        if not bool(
-            getattr(self._cfg, "gnss_shared_u1_phase_compensation_enabled", False)
-        ):
+        if not self._shared_u1_phase_enabled():
             return ()
         satellites = tuple(
             int(value)
             for value in getattr(self._cfg, "gnss_shared_u1_phase_satellites", ())
         )
-        if len(satellites) < 4:
+        # An empty tuple selects dynamic source slots. GNSS-SDR acquires any
+        # available PRNs and the runtime maps each tracking channel back to its
+        # source slot. A non-empty tuple remains supported for narrow tests.
+        if satellites and len(satellites) < 4:
             raise ValueError(
                 "shared-U1 phase PVT test requires at least four pinned GPS satellites"
             )
@@ -308,6 +322,19 @@ class ConfigRendererMixin:
         if invalid:
             raise ValueError(f"invalid GPS L1 C/A PRNs: {invalid}")
         return satellites
+
+    def _shared_u1_phase_enabled(self) -> bool:
+        return bool(
+            getattr(self._cfg, "gnss_shared_u1_phase_compensation_enabled", False)
+        )
+
+    def _shared_u1_phase_source_count(self) -> int:
+        if not self._shared_u1_phase_enabled():
+            return 1
+        satellites = self._shared_u1_phase_satellites()
+        if satellites:
+            return len(satellites)
+        return max(1, int(self._cfg.gnss_1c_channel_count))
 
     def _active_signal_ids(self) -> tuple[str, ...]:
         signals: list[str] = []

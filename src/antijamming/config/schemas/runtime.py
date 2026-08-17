@@ -276,6 +276,9 @@ class StreamConfig:
     lcmv_heavy_diagnostics_interval_s: float
     one_run_segmentation_enabled: bool
     healthy_reference_capture_enabled: bool
+    # Production lifecycle: collect a uniform healthy reference first, then
+    # arm LCMV automatically. Arming does not apply null weights by itself.
+    lcmv_auto_arm_after_pvt: bool
 
     # -------------------------------------------------------------------------
     # GNSS-SDR Process and Runtime Paths

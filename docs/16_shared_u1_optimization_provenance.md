@@ -8,18 +8,12 @@ phase-continuous GNSS fanout`). It changes the anti-jamming repository only.
 No source, build product, or configuration below `gnss-sdr/` is changed by this
 audit, and no USRP, bladeRF, SynthUSB, or jammer was powered or commanded.
 
-The reproducible lab overlay is
-`configs/antijamming/shared_u1_phase_g10_5deg_atten50_gain29_test.json`:
-ten pinned GPS L1 C/A PRNs including rising G10, 5 degree PVT mask, USRP gain
-45 dB, recorded bladeRF software gain 29, and recorded jammer attenuation
-50 dB. It is applied on top of `x300_realtime.json` with:
-
-```bash
-ANTIJAM_RUNTIME_OVERLAY=configs/antijamming/shared_u1_phase_g10_5deg_atten50_gain29_test.json ./run_realtime.sh
-```
-
-The configuration test constructs the complete runtime through that exact
-overlay path. These RF values are experiment metadata, not inferred RF truth.
+The archived G10-rising experiment used ten pinned GPS L1 C/A PRNs including
+G10, a 5 degree PVT mask, USRP gain 45 dB, recorded bladeRF software gain 29,
+and recorded jammer attenuation 50 dB. Those values remain in the archived run
+logs as experiment provenance; the executable overlay was removed after it
+proved that a BIN-specific PRN list made the production behavior inconsistent.
+The product profile now uses dynamic GNSS-SDR channel-to-PRN assignment.
 
 ## Exact active signal path
 
@@ -65,9 +59,12 @@ overlay path. These RF values are experiment metadata, not inferred RF truth.
 8. Because all `w_k` rows are scalar multiples of one shared row, realtime IQ
    applies the four-channel beam once and fans out `conjugate(gamma_k)` scalar
    copies. A general matrix multiply remains only for the non-collinear
-   jammer-off transition. GNSS-SDR receives one FIFO per pinned PRN with
-   `GNSS-SDR.synchronize_signal_sources=true`, so all source branches advance
-   together before common observables/PVT.
+   jammer-off transition. GNSS-SDR receives one FIFO per synchronized source
+   slot with `GNSS-SDR.synchronize_signal_sources=true`, so all source branches
+   advance together before common observables/PVT. Production sources are dynamic
+   channel slots: GNSS-SDR may acquire any GPS L1 C/A PRN, and a changed
+   channel assignment discards the old PRN phase state before learning the new
+   one. Pinned sources remain a unit-test facility only.
 
 The monitor records GNSS-SDR's reported carrier phase for audit, but it does
 not need that absolute common phase to recover the relative four-channel PRN
@@ -173,7 +170,8 @@ The offline gate covers:
 - every intermediate jammer-off ramp chunk;
 - scalar fast-path equality and non-collinear transition fallback;
 - GPS C/A code/Doppler correlation and phase-invariant vector recovery;
-- pinned/synchronized GNSS-SDR configuration and FIFO write ordering;
+- dynamic and pinned synchronized GNSS-SDR configuration, safe PRN
+  reassignment, and FIFO write ordering;
 - covariance/MUSIC/Bartlett numerical equivalence;
 - prompt/code/carrier/symbol/bit/word/C/N0/PVT audit fields;
 - non-duplicated logs and compact runtime evidence;

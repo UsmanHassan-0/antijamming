@@ -1,7 +1,0 @@
-{
-  "gnss_shared_u1_phase_compensation_enabled": true,
-  "gnss_shared_u1_phase_satellites": [3, 4, 7, 8, 9, 14, 16, 27, 30],
-  "gnss_shared_u1_phase_transition_s": 1.0,
-  "gnss_shared_u1_phase_min_quality_measurements": 3,
-  "lcmv_test_null_method": "covariance_lcmv_measured_u1"
-}

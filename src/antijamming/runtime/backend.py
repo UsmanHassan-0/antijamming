@@ -164,6 +164,10 @@ class BackendRuntime:
         self._scan_angles_deg = self._angle_scan.values()
         self._expected_sources = config.expected_sources
         self._lcmv_test_enabled = bool(config.lcmv_test_enabled)
+        self._lcmv_auto_arm_after_pvt = bool(
+            getattr(config, "lcmv_auto_arm_after_pvt", True)
+        )
+        self._lcmv_auto_arm_suppressed_by_operator = False
         self._lcmv_test_null_method = self._normalized_lcmv_null_method(
             getattr(config, "lcmv_test_null_method", "covariance_lcmv_ideal")
         )
@@ -203,6 +207,7 @@ class BackendRuntime:
         self._shared_u1_phase_bank: SharedU1PhaseCompensationBank | None = None
         self._last_shared_u1_phase_status_log_ts = 0.0
         self._shared_u1_desired_vectors_cache: dict[str, dict[str, object]] = {}
+        self._shared_u1_source_satellites_cache: tuple[int | None, ...] = ()
         self._shared_u1_scalar_fanout_chunks = 0
         self._shared_u1_matrix_fallback_chunks = 0
         self._gnss_fifo_samples_written: int = 0
@@ -453,6 +458,13 @@ class BackendRuntime:
             self._latest_doa_deg = float(self._config.doa_min_deg)
             self._last_phase_ts = 0.0
             self._last_doa_ts = 0.0
+        if self._lcmv_auto_arm_after_pvt:
+            # Each run must begin with a genuinely uniform, learnable
+            # baseline. The automatic transition is evaluated only after the
+            # new run has its own healthy PVT/U1/covariance evidence.
+            self._lcmv_test_enabled = False
+            self._config.lcmv_test_enabled = False
+            self._lcmv_auto_arm_suppressed_by_operator = False
         self._set_beamformer_weights(uniform_weights(len(self._config.channels)))
         self._reset_lcmv_test_for_run()
         try:
@@ -547,6 +559,11 @@ class BackendRuntime:
                     int(value)
                     for value in self._config.gnss_shared_u1_phase_satellites
                 )
+                shared_phase_source_count = (
+                    len(satellites)
+                    if satellites
+                    else max(1, int(self._config.gnss_1c_channel_count))
+                )
                 shared_phase_transition_s = float(
                     self._config.gnss_shared_u1_phase_transition_s
                 )
@@ -557,14 +574,20 @@ class BackendRuntime:
                         sample_rate_hz=float(self._config.sample_rate),
                         samples_per_chunk=int(self._config.samples_per_chunk),
                         transition_s=shared_phase_transition_s,
+                        source_count=shared_phase_source_count,
                         max_weight_norm=self._lcmv_weight_norm_limit(),
                     )
                     self._handoff_log.info(
-                        "Shared measured-U1 phase fanout enabled: satellites=%s "
+                        "Shared measured-U1 phase fanout enabled: mapping=%s satellites=%s "
                         "sources=%d transition_s=%.3f min_suppression_db=%.1f "
                         "independent_per_prn_lcmv=false",
-                        ",".join(f"G{value:02d}" for value in satellites),
-                        len(satellites),
+                        "pinned" if satellites else "dynamic_channel_to_prn",
+                        (
+                            ",".join(f"G{value:02d}" for value in satellites)
+                            if satellites
+                            else "acquired_at_runtime"
+                        ),
+                        shared_phase_source_count,
                         shared_phase_transition_s,
                         float(
                             self._config.lcmv_min_predicted_jammer_suppression_db
@@ -574,6 +597,11 @@ class BackendRuntime:
                     self._shared_u1_phase_bank = None
                 self._last_shared_u1_phase_status_log_ts = 0.0
                 self._shared_u1_desired_vectors_cache = {}
+                self._shared_u1_source_satellites_cache = tuple(
+                    satellites
+                    if satellites
+                    else (None for _ in range(shared_phase_source_count))
+                )
                 self._shared_u1_scalar_fanout_chunks = 0
                 self._shared_u1_matrix_fallback_chunks = 0
                 if shared_phase_fanout:
@@ -593,6 +621,7 @@ class BackendRuntime:
                             self._config.gnss_shared_u1_phase_min_quality_measurements
                         ),
                         satellites=satellites,
+                        source_count=shared_phase_source_count,
                     )
                     self._shared_u1_phase_monitor.start()
                 else:
@@ -700,6 +729,7 @@ class BackendRuntime:
                 self._shared_u1_phase_monitor = None
             self._shared_u1_phase_bank = None
             self._shared_u1_desired_vectors_cache = {}
+            self._shared_u1_source_satellites_cache = ()
             if self._config.gnss_sdr_enable:
                 self._loggers["transport"].info(
                     "GNSS queue summary: raw_highwater=%d/%d raw_rejections=%d",
@@ -875,6 +905,7 @@ class BackendRuntime:
         return {
             "event": "lcmv_runtime_manifest",
             "lcmv_test_enabled": bool(self._lcmv_test_enabled),
+            "lcmv_auto_arm_after_pvt": bool(self._lcmv_auto_arm_after_pvt),
             "lcmv_test_null_method": self._lcmv_test_null_method,
             "lcmv_test_null_method_allowed": sorted(VALID_LCMV_METHODS),
             "lcmv_preserve_constraint_mode": str(
@@ -1782,8 +1813,16 @@ class BackendRuntime:
             )
             return self._realtime_preserve_tracker_payload_locked()
 
-    def set_lcmv_test_enabled(self, enabled: bool) -> None:
+    def set_lcmv_test_enabled(
+        self,
+        enabled: bool,
+        *,
+        source: str = "operator",
+    ) -> None:
         active = bool(enabled)
+        normalized_source = str(source).strip().lower() or "operator"
+        if normalized_source == "operator":
+            self._lcmv_auto_arm_suppressed_by_operator = not active
         self._set_shared_measured_u1_protection_weights(
             uniform_weights(len(self._config.channels)), available=False
         )
@@ -1933,12 +1972,13 @@ class BackendRuntime:
                 reason="",
             )
             self._lcmv_log.info(
-                "lcmv_test action=operator_toggle enabled=False mode=off "
-                "weights=uniform_array_sum"
+                "lcmv_test action=%s enabled=False mode=off "
+                "weights=uniform_array_sum",
+                normalized_source,
             )
             self._record_runtime_event(
                 "lcmv_off",
-                source="backend_control",
+                source=f"backend_control:{normalized_source}",
                 notes="LCMV disabled; smooth transition to uniform weights scheduled",
             )
             self._emit_status("LCMV Test Nulling: OFF")
@@ -1962,21 +2002,25 @@ class BackendRuntime:
             spatial_vector_diagnostics=enable_diag,
         )
         self._lcmv_log.info(
-            "lcmv_test action=operator_toggle enabled=True mode=fallback "
+            "lcmv_test action=%s enabled=True mode=fallback "
             "reason=%s weights=uniform_array_sum "
-            "weight_transition=armed_uniform_waiting_for_valid_target"
-            ,
+            "weight_transition=armed_uniform_waiting_for_valid_target",
+            normalized_source,
             frozen_reason or "waiting_for_music_peak",
         )
         self._record_runtime_event(
             "lcmv_on",
-            source="backend_control",
+            source=f"backend_control:{normalized_source}",
             notes=(
                 frozen_reason
                 or "LCMV armed in uniform fallback while waiting for a valid target"
             ),
         )
-        self._emit_status("LCMV Test Nulling: ON")
+        self._emit_status(
+            "LCMV armed automatically after healthy PVT"
+            if normalized_source == "auto_after_pvt"
+            else "LCMV Test Nulling: ON"
+        )
 
     # -------------------------------------------------------------------------
     # Callback Emission
@@ -2998,7 +3042,13 @@ class BackendRuntime:
         return out
 
     def _gnss_output_vector(self, chunk: np.ndarray) -> np.ndarray:
-        if self._shared_phase_fanout_enabled():
+        # The fanout bank is created only after the GNSS bridge has started.
+        # Keep the ordinary beamformer usable during construction, teardown,
+        # and failed/partial startup instead of raising from the realtime path.
+        if (
+            self._shared_phase_fanout_enabled()
+            and self._shared_u1_phase_bank is not None
+        ):
             return self._gnss_shared_u1_phase_output_matrix(chunk)
         return self._gnss_beamformed_output_vector(chunk)
 
@@ -3011,8 +3061,65 @@ class BackendRuntime:
             )
         )
 
+    def _shared_phase_source_count(self) -> int:
+        satellites = tuple(
+            int(value)
+            for value in self._config.gnss_shared_u1_phase_satellites
+        )
+        return (
+            len(satellites)
+            if satellites
+            else max(1, int(self._config.gnss_1c_channel_count))
+        )
+
+    def _tracking_source_satellites(
+        self,
+        snapshot: dict[str, object],
+    ) -> tuple[int | None, ...]:
+        pinned = tuple(
+            int(value)
+            for value in self._config.gnss_shared_u1_phase_satellites
+        )
+        if pinned:
+            return tuple(pinned)
+        source_count = self._shared_phase_source_count()
+        mapped: list[int | None] = [None] * source_count
+        # ``tracking_monitor`` is an archive-like latest-by-PRN collection.  A
+        # PRN remains in it after its channel has moved to another PRN, so
+        # iterating that collection can let a stale, numerically-later PRN
+        # overwrite the live channel assignment.  The ``prns`` collection has
+        # already reconciled receiver state with the current UDP
+        # channel->PRN map.  Require both views to agree before routing a
+        # phase-compensated output row.
+        entries = snapshot.get("prns", [])
+        if not isinstance(entries, list):
+            return tuple(mapped)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                channel = int(entry.get("channel", -1))
+                prn = int(entry.get("prn", 0) or 0)
+                tracking_monitor_prn = int(
+                    entry.get("tracking_monitor_prn", 0) or 0
+                )
+            except (TypeError, ValueError):
+                continue
+            system = str(entry.get("system", "G")).upper()
+            signal = str(entry.get("signal", ""))
+            if (
+                0 <= channel < source_count
+                and 1 <= prn <= 32
+                and tracking_monitor_prn == prn
+                and str(entry.get("state", "")).lower() == "tracking"
+                and system in {"G", "GPS"}
+                and signal == "1C"
+            ):
+                mapped[channel] = prn
+        return tuple(mapped)
+
     def _gnss_shared_u1_phase_output_matrix(self, chunk: np.ndarray) -> np.ndarray:
-        """Return phase-aligned copies of one shared beam for pinned GPS PRNs."""
+        """Return phase-aligned copies of one shared beam for GPS source slots."""
 
         self._advance_beamformer_transition()
         source = np.asarray(chunk, dtype=np.complex64)
@@ -3030,6 +3137,11 @@ class BackendRuntime:
             self._shared_u1_desired_vectors_cache = (
                 monitor.desired_vectors_snapshot()
             )
+            bridge = self._gnss_bridge
+            if bridge is not None:
+                self._shared_u1_source_satellites_cache = (
+                    self._tracking_source_satellites(bridge.snapshot())
+                )
         with self._results_lock:
             jammer_latched = bool(self._lcmv_jammer_detected_latched)
         enabled_now = bool(self._lcmv_test_enabled and jammer_latched)
@@ -3046,6 +3158,7 @@ class BackendRuntime:
             desired_vectors=(
                 self._shared_u1_desired_vectors_cache if emit_status else {}
             ),
+            source_satellites=self._shared_u1_source_satellites_cache,
             enabled_now=enabled_now,
             now_monotonic=now,
             emit_status=emit_status,
@@ -3109,6 +3222,10 @@ class BackendRuntime:
                             if scalar_fast_path
                             else "general_transition_matrix"
                         ),
+                        "dynamic_source_satellites": [
+                            (f"G{value:02d}" if value is not None else None)
+                            for value in self._shared_u1_source_satellites_cache
+                        ],
                         "sources": status,
                     },
                     allow_nan=False,
@@ -4344,7 +4461,118 @@ class BackendRuntime:
         )
         with self._results_lock:
             self._latest_spatial_vector_diagnostics = dict(payload)
+        auto_armed = self._maybe_auto_arm_lcmv_after_pvt(run_state)
+        payload["lcmv_auto_arm_after_pvt"] = bool(
+            self._lcmv_auto_arm_after_pvt
+        )
+        payload["lcmv_auto_arm_suppressed_by_operator"] = bool(
+            self._lcmv_auto_arm_suppressed_by_operator
+        )
+        payload["lcmv_auto_arm_triggered"] = bool(auto_armed)
+        if auto_armed:
+            with self._results_lock:
+                self._latest_spatial_vector_diagnostics = dict(payload)
         return payload
+
+    def _maybe_auto_arm_lcmv_after_pvt(
+        self,
+        run_state: dict[str, object],
+    ) -> bool:
+        """Freeze the healthy reference and arm LCMV once per live run.
+
+        Arming leaves uniform weights on the GNSS stream. The existing jammer
+        evidence latch remains solely responsible for allowing null weights to
+        become active.
+        """
+
+        if (
+            not self._lcmv_auto_arm_after_pvt
+            or self._lcmv_auto_arm_suppressed_by_operator
+            or self._lcmv_test_enabled
+            or not self._shared_phase_fanout_enabled()
+            or str(
+                getattr(
+                    self._config,
+                    "lcmv_preserve_constraint_mode",
+                    "uniform",
+                )
+            ).strip().lower()
+            != "realtime_bladerf_measured_u1"
+            or not bool(run_state.get("healthy_reference_updated", False))
+            or not bool(run_state.get("pvt_healthy", False))
+            or not bool(run_state.get("observations_healthy", False))
+            or not bool(run_state.get("cn0_healthy", False))
+        ):
+            return False
+
+        now = time.monotonic()
+        channel_count = len(self._config.channels)
+        max_age_s = max(
+            0.0,
+            float(
+                getattr(
+                    self._config,
+                    "lcmv_realtime_preserve_max_reference_age_s",
+                    2.0,
+                )
+            ),
+        )
+        max_angle_error_deg = max(
+            0.0,
+            float(
+                getattr(
+                    self._config,
+                    "lcmv_realtime_preserve_guard_deg",
+                    20.0,
+                )
+            ),
+        )
+        with self._results_lock:
+            center = self._realtime_preserve_center_internal_deg
+            reference_angle = self._healthy_reference_internal_angle_deg
+            reference_age_s = (
+                now - self._healthy_reference_updated_monotonic_s
+                if self._healthy_reference_updated_monotonic_s is not None
+                else None
+            )
+            angle_error_deg = (
+                self._angle_distance_deg(center, reference_angle)
+                if center is not None and reference_angle is not None
+                else None
+            )
+            vector_ready = bool(
+                self._healthy_reference_vector is not None
+                and np.asarray(self._healthy_reference_vector).size == channel_count
+            )
+            covariance_ready = bool(
+                self._healthy_reference_covariance is not None
+                and np.asarray(self._healthy_reference_covariance).shape
+                == (channel_count, channel_count)
+            )
+            ready = bool(
+                self._realtime_preserve_stable
+                and center is not None
+                and vector_ready
+                and covariance_ready
+                and reference_age_s is not None
+                and 0.0 <= reference_age_s <= max_age_s
+                and angle_error_deg is not None
+                and angle_error_deg <= max_angle_error_deg
+                and self._healthy_reference_confidence >= 0.8
+            )
+        if not ready:
+            return False
+
+        self._lcmv_log.info(
+            "lcmv_auto_arm decision=arm_after_healthy_pvt "
+            "output_before_arm=uniform_array_sum pvt_healthy=true "
+            "observations_healthy=true cn0_healthy=true reference_age_s=%.3f "
+            "reference_angle_error_deg=%.3f",
+            float(reference_age_s),
+            float(angle_error_deg),
+        )
+        self.set_lcmv_test_enabled(True, source="auto_after_pvt")
+        return bool(self._lcmv_test_enabled)
 
     def _spatial_vector_diagnostics_payload(
         self,

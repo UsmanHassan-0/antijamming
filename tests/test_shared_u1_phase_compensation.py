@@ -114,6 +114,184 @@ def test_shared_u1_phase_renderer_pins_each_prn_to_one_synchronized_fifo(
         assert f"Channel{index}.RF_channel_ID={index}" in rendered
 
 
+def test_shared_u1_phase_renderer_uses_dynamic_channel_slots_without_pinned_prns(
+    tmp_path: Path,
+) -> None:
+    cfg = StreamConfig(
+        gnss_shared_u1_phase_compensation_enabled=True,
+        gnss_shared_u1_phase_satellites=(),
+        gnss_1c_channel_count=4,
+        gnss_channels_in_acquisition=4,
+        gnss_sdr_runtime_dir=tmp_path / "runtime",
+        gnss_sdr_log_dir=tmp_path / "glog",
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+    rendered = bridge._render_config()
+
+    assert "GNSS-SDR.num_sources=4" in rendered
+    assert "GNSS-SDR.synchronize_signal_sources=true" in rendered
+    assert ".satellite=" not in rendered
+    for index in range(4):
+        assert f"SignalSource{index}.filename=" in rendered
+        assert f"gnss_iq_channel_{index:02d}.fifo" in rendered
+        assert f"SignalConditioner{index}.implementation=Signal_Conditioner" in rendered
+        assert f"Channel{index}.signal=1C" in rendered
+        assert f"Channel{index}.RF_channel_ID={index}" in rendered
+
+
+def test_dynamic_source_reassignment_discards_old_prn_phase_state() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    shared = np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.complex128)
+    desired_g03 = np.asarray([1.0, 0.5j, 0.3, -0.2j], dtype=np.complex128)
+    desired_g10 = np.asarray([0.1j, 1.0, -0.4j, 0.7], dtype=np.complex128)
+    vectors = {
+        "G03": {
+            "desired_spatial_vector": desired_g03,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 1000,
+        },
+        "G10": {
+            "desired_spatial_vector": desired_g10,
+            "updated_monotonic": 10.02,
+            "tracking_sample_counter": 2000,
+        },
+    }
+    bank = SharedU1PhaseCompensationBank(
+        satellites=(),
+        source_count=2,
+        channel_count=4,
+        sample_rate_hz=4_000_000.0,
+        samples_per_chunk=20_000,
+        transition_s=1.0,
+    )
+
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        source_satellites=(3, 4),
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    old_rows, _ = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        source_satellites=(3, 4),
+        enabled_now=True,
+        now_monotonic=10.01,
+    )
+    reassigned_rows, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        source_satellites=(10, 4),
+        enabled_now=True,
+        now_monotonic=10.02,
+    )
+
+    assert not np.allclose(old_rows[0], common)
+    assert np.allclose(reassigned_rows[0], common)
+    assert status["G10"]["source_index"] == 0
+    assert status["G10"]["desired_vector_available"] is False
+    assert "G03" not in status
+
+
+def test_phase_compensation_above_six_db_is_allowed_when_weight_norm_is_safe() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    shared = np.asarray([0.45, 0.0, 0.0, 0.0], dtype=np.complex128)
+    desired = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)
+    vectors = {
+        "G04": {
+            "desired_spatial_vector": desired,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 1000,
+        }
+    }
+    bank = SharedU1PhaseCompensationBank(
+        satellites=(4,),
+        channel_count=4,
+        sample_rate_hz=4_000_000.0,
+        samples_per_chunk=20_000,
+        transition_s=1.0,
+        max_weight_norm=8.0,
+    )
+
+    before, _ = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    applied, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        enabled_now=True,
+        now_monotonic=10.01,
+    )
+
+    assert status["G04"]["amplitude_compensation_db"] > 6.0
+    assert status["G04"]["phase_compensation_applied"] is True
+    assert status["G04"]["phase_compensation_guard_reason"] is None
+    assert np.linalg.norm(applied[0]) < 8.0
+    assert np.allclose(
+        np.vdot(applied[0], desired),
+        np.vdot(before[0], desired),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_phase_compensation_still_rejects_unsafe_weight_norm() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    shared = np.asarray([0.01, 1.0, 1.0, 1.0], dtype=np.complex128)
+    desired = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)
+    vectors = {
+        "G04": {
+            "desired_spatial_vector": desired,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 1000,
+        }
+    }
+    bank = SharedU1PhaseCompensationBank(
+        satellites=(4,),
+        channel_count=4,
+        sample_rate_hz=4_000_000.0,
+        samples_per_chunk=20_000,
+        transition_s=1.0,
+        max_weight_norm=8.0,
+    )
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    applied, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        enabled_now=True,
+        now_monotonic=10.01,
+    )
+
+    assert np.allclose(applied[0], common)
+    assert status["G04"]["phase_compensation_applied"] is False
+    assert status["G04"]["phase_compensation_guard_reason"] == (
+        "phase_compensated_weight_norm_exceeded"
+    )
+
+
 def test_shared_u1_phase_runtime_labels_transport_and_actual_fifo_state(
     tmp_path: Path,
 ) -> None:
@@ -225,6 +403,7 @@ def test_prn_monitor_recovers_calibrated_spatial_iq_from_one_code_period(
         1023,
         0.0,
         45.0,
+        0,
     )
     recovered = monitor.desired_vectors_snapshot()["G03"]
 
