@@ -139,7 +139,7 @@ class MainWindow(QMainWindow):
         self._stream_summary_label = QLabel("Idle\nOutput: Uniform array IQ -> GNSS-SDR")
         self._expected_sources_spin = QSpinBox()
         self._expected_sources_control = self._build_expected_sources_control()
-        self._lcmv_test_checkbox = QCheckBox("LCMV Test Nulling")
+        self._lcmv_test_checkbox = QCheckBox("LCMV Status")
         self._lcmv_test_control = self._build_lcmv_test_control()
         self._rf_event_status_label = QLabel(
             "Optional ground truth: jammer UNKNOWN | bladeRF UNKNOWN"
@@ -153,8 +153,8 @@ class MainWindow(QMainWindow):
         self._operator_jammer_state = "UNKNOWN"
         self._operator_bladerf_state = "UNKNOWN"
         self._rf_event_control = self._build_rf_event_control()
-        self._lcmv_test_status_label = QLabel("LCMV Test Nulling: OFF")
-        self._lcmv_null_bearing_label = QLabel("Null bearing / MUSIC peak: --")
+        self._lcmv_test_status_label = QLabel("LCMV Status: OFF")
+        self._lcmv_null_bearing_label = QLabel("")
         self._stream_status_text = "Idle"
         self._receiver_fix_text = "Not available"
         self._tracking_prn_count = 0
@@ -513,7 +513,6 @@ class MainWindow(QMainWindow):
             self._rf_event_control,
             self._rf_event_status_label,
             self._lcmv_test_status_label,
-            self._lcmv_null_bearing_label,
             self._music_sources_label,
             self._doa_status_label,
             self._rx_clipping_label,
@@ -1058,7 +1057,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(*ZERO_MARGINS)
         layout.setSpacing(COMPACT_SPACING)
         self._lcmv_test_checkbox.setObjectName("lcmvTestCheckbox")
-        self._lcmv_test_checkbox.setAccessibleName("LCMV Test Nulling")
+        self._lcmv_test_checkbox.setAccessibleName("LCMV Status")
         self._lcmv_test_checkbox.setMinimumHeight(CONTROL_H)
         self._lcmv_test_checkbox.setStyleSheet(
             text_style(color=FG_TEXT, font_weight=700)
@@ -2054,30 +2053,14 @@ class MainWindow(QMainWindow):
             return str(int(nearest))
         return f"{number:.1f}"
 
-    def _format_effective_rank(self, value: object) -> str:
-        number = valid_float(value)
-        if number is None:
-            return "--"
-        return f"{number:.2f}"
-
     def _source_count_display_text(self, metrics: dict | None) -> str:
         configured = self._source_count_metric(metrics, "n_sources")
         if configured is None:
             configured = self._cfg.expected_sources
-        gap = self._source_count_metric(
-            metrics,
-            "source_estimate_gap",
-            "source_est_gap",
-        )
-        effective_rank = self._source_count_metric(
-            metrics,
-            "source_effective_rank",
-            "effective_rank",
-        )
+        peak_count = self._source_count_metric(metrics, "peak_count")
         return (
             f"set {self._format_source_count_estimate(configured)} | "
-            f"eig-gap {self._format_source_count_estimate(gap)} | "
-            f"eff-rank {self._format_effective_rank(effective_rank)}"
+            f"peak-count {self._format_source_count_estimate(peak_count)}"
         )
 
     def _refresh_source_count_status(self, metrics: dict | None) -> None:
@@ -2125,43 +2108,22 @@ class MainWindow(QMainWindow):
             )
         )
         armed = bool(spatial.get("lcmv_jammer_activation_armed", False)) and not jammer_latched
-        transition_active = bool(status.get("weight_transition_active", False))
-        transition_progress = valid_float(status.get("weight_transition_progress"))
+        preserve_mode = str(
+            getattr(self._cfg, "lcmv_preserve_constraint_mode", "uniform")
+        ).strip().lower()
+        bladeRF_preserve = preserve_mode == "realtime_bladerf_measured_u1"
 
         if not enabled or mode == "off":
-            value = "OFF: Uniform beamformer"
+            value = "uniform beamformer"
             color = INFO
         elif mode == "on":
-            value = "ON: Covariance LCMV null active, jammer latched"
-            if transition_active:
-                progress_text = (
-                    f" {100.0 * transition_progress:.0f}%"
-                    if transition_progress is not None
-                    else ""
-                )
-                value = f"ACTIVATING: Smooth weight transition{progress_text}"
-            active_method = str(
-                status.get("active_lcmv_method")
-                or status.get("active_lcmv_null_method")
-                or ""
-            ).strip()
-            if active_method:
-                value = f"{value}, method {active_method.replace('_', ' ')}"
-            valid_methods = status.get("candidate_methods_valid", [])
-            rejected_methods = status.get("candidate_methods_rejected", {})
-            valid_count = len(valid_methods) if isinstance(valid_methods, list) else 0
-            rejected_count = len(rejected_methods) if isinstance(rejected_methods, dict) else 0
-            if valid_count or rejected_count:
-                value = f"{value}, candidates {valid_count} valid/{rejected_count} rejected"
+            value = "bladeRF preserved" if bladeRF_preserve else "on"
             color = WARNING
         elif mode == "fallback":
-            value = (
-                "ARMED: Uniform output, waiting for jammer evidence"
-                if armed
-                else "FALLBACK: Uniform fallback"
-            )
-            if reason:
-                value = f"{value}, {reason.replace('_', ' ')}"
+            # In fallback we are still on uniform-output weights; the only
+            # meaningful operator-state is whether bladeRF preservation has
+            # already passed the post-PVT arm gate.
+            value = "bladeRF preserved" if (armed and bladeRF_preserve) else "uniform beamformer"
             color = INFO if armed else WARNING
         else:
             value = str(status.get("description", "--") or "--")
@@ -2169,65 +2131,9 @@ class MainWindow(QMainWindow):
 
         self._set_status_row(
             self._lcmv_test_status_label,
-            "LCMV Test Nulling",
+            "LCMV Status",
             value,
             color,
-        )
-
-        null_bearing = valid_float(status.get("null_bearing_deg"))
-        music_bearing = valid_float(status.get("music_bearing_deg"))
-        bearing = null_bearing if null_bearing is not None else music_bearing
-        if armed:
-            bearing = None
-        bearing_text = f"{bearing:.1f}°" if bearing is not None else "--"
-        if armed:
-            bearing_text = "not applied (armed uniform)"
-        output_metrics = status.get("output_metrics", {})
-        if not isinstance(output_metrics, dict):
-            output_metrics = {}
-        reduction_uniform_db = valid_float(
-            output_metrics.get("measured_output_reduction_vs_uniform_db")
-        )
-        reduction_raw_avg_db = valid_float(
-            output_metrics.get("measured_output_reduction_vs_raw_avg_channel_db")
-        )
-        jammer_suppression_available = bool(
-            spatial.get("jammer_only_suppression_estimate_available", False)
-        )
-        jammer_suppression_db = valid_float(
-            spatial.get("jammer_only_suppression_db")
-        )
-        jammer_target_suppression_db = valid_float(
-            spatial.get("jammer_only_target_suppression_db")
-        )
-        if (
-            mode == "on"
-            and jammer_suppression_available
-            and jammer_suppression_db is not None
-        ):
-            bearing_text = (
-                f"{bearing_text} | jammer-excess suppression "
-                f"{jammer_suppression_db:.1f} dB applied"
-            )
-            if (
-                transition_active
-                and jammer_target_suppression_db is not None
-            ):
-                bearing_text = (
-                    f"{bearing_text} / {jammer_target_suppression_db:.1f} dB target"
-                )
-        if reduction_uniform_db is not None and mode == "on":
-            bearing_text = (
-                f"{bearing_text} | total out reduction {reduction_uniform_db:.1f} dB"
-                " (wanted included)"
-            )
-            if reduction_raw_avg_db is not None:
-                bearing_text = f"{bearing_text} | raw-avg {reduction_raw_avg_db:.1f} dB"
-        self._set_status_row(
-            self._lcmv_null_bearing_label,
-            "Null bearing / MUSIC peak",
-            bearing_text,
-            color if bearing is not None else INFO,
         )
 
     def _refresh_doa_chips(self, metrics: dict) -> None:
@@ -2361,7 +2267,13 @@ class MainWindow(QMainWindow):
         )
         used_text = used_count if used_satellites == "--" else f"{used_count} ({used_satellites})"
         observables_count = self._format_count(snapshot.get("valid_observables_count"))
-        avg_cno = self._format_db_hz(snapshot.get("avg_tracking_cno_db_hz"))
+        # GNSS-SDR sometimes omits `avg_tracking_cno_db_hz` even while it reports
+        # a valid overall C/N0. Prefer the tracking monitor, but fall back to
+        # `avg_cno_db_hz` to avoid UI-only "C/N0 drop" artifacts.
+        avg_tracking_cno = snapshot.get("avg_tracking_cno_db_hz")
+        if valid_float(avg_tracking_cno) is None:
+            avg_tracking_cno = snapshot.get("avg_cno_db_hz")
+        avg_cno = self._format_db_hz(avg_tracking_cno)
         runtime_dir = Path(self._cfg.gnss_sdr_runtime_dir)
         receiver_log = Path(self._cfg.gnss_sdr_log_dir) / "receiver.log"
         udp_packets = (

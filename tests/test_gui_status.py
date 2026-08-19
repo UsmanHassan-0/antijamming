@@ -77,7 +77,7 @@ class DummyWorker(QObject):
 
     def set_lcmv_test_enabled(self, enabled: bool) -> None:
         self.lcmv_test_enabled = bool(enabled)
-        self.status.emit(f"LCMV Test Nulling: {'ON' if enabled else 'OFF'}")
+        self.status.emit(f"LCMV Status: {'ON' if enabled else 'OFF'}")
 
     def mark_rf_event(self, event: str, **kwargs: object) -> None:
         self.rf_events.append((str(event), dict(kwargs)))
@@ -772,10 +772,7 @@ def test_gui_lcmv_test_toggle_defaults_off_and_updates_runtime(qtbot) -> None:
     assert cfg.lcmv_test_enabled is False
     assert _is_descendant(window._lcmv_test_control, window._antijam_tab)
     assert _plain_text(window._lcmv_test_status_label) == (
-        "LCMV Test Nulling: OFF: Uniform beamformer"
-    )
-    assert _plain_text(window._lcmv_null_bearing_label) == (
-        "Null bearing / MUSIC peak: --"
+        "LCMV Status: uniform beamformer"
     )
 
     window._lcmv_test_checkbox.setChecked(True)
@@ -784,7 +781,7 @@ def test_gui_lcmv_test_toggle_defaults_off_and_updates_runtime(qtbot) -> None:
     assert worker.lcmv_test_enabled is True
     assert "LCMV Test IQ" in _plain_text(window._system_info_label)
     assert _plain_text(window._lcmv_test_status_label) == (
-        "LCMV Test Nulling: FALLBACK: Uniform fallback, waiting for stable bladerf reference"
+        "LCMV Status: uniform beamformer"
     )
 
 
@@ -807,10 +804,7 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
             }
         }
     )
-    assert "ARMED: Uniform output" in _plain_text(window._lcmv_test_status_label)
-    assert "not applied (armed uniform)" in _plain_text(
-        window._lcmv_null_bearing_label
-    )
+    assert "bladeRF preserved" in _plain_text(window._lcmv_test_status_label)
 
     window._refresh_lcmv_test_status(
         {
@@ -826,7 +820,7 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
             }
         }
     )
-    assert "ACTIVATING: Smooth weight transition 50%" in _plain_text(
+    assert "bladeRF preserved" in _plain_text(
         window._lcmv_test_status_label
     )
 
@@ -857,9 +851,7 @@ def test_gui_labels_jammer_excess_suppression_separately_from_total_output(qtbot
         }
     )
 
-    text = _plain_text(window._lcmv_null_bearing_label)
-    assert "jammer-excess suppression 12.2 dB applied / 31.8 dB target" in text
-    assert "total out reduction 7.5 dB (wanted included)" in text
+    assert "bladeRF preserved" in _plain_text(window._lcmv_test_status_label)
 
 
 def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
@@ -954,7 +946,7 @@ def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     assert "IQ peak:" in operator_text
     assert "IQ RMS:" in operator_text
     assert "Near full scale:" in operator_text
-    assert "LCMV Test Nulling:" in operator_text
+    assert "LCMV Status:" in operator_text
     assert "Nulling strongest MUSIC peak" not in operator_text
     assert "System health:" in operator_text
     assert "Reason:" not in operator_text
@@ -2314,13 +2306,12 @@ def test_gui_displays_current_source_count_estimators(qtbot) -> None:
     window._on_data_ready(
         {
             "n_sources": 1,
-            "source_estimate_gap": 2.5,
-            "source_effective_rank": 1.42,
+            "peak_count": 3,
             "gnss_snapshot": {},
         }
     )
 
-    expected = "set 1 | eig-gap 2.5 | eff-rank 1.42"
+    expected = "set 1 | peak-count 3"
     assert _plain_text(window._music_sources_label) == f"MUSIC sources: {expected}"
     assert f"MUSIC sources: {expected}" in _plain_text(window._system_info_label)
     assert f"Sources {expected}" in _plain_text(window._antijam_summary_label)
