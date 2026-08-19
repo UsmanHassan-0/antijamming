@@ -48,10 +48,8 @@ def test_compute_realtime_metrics_shapes_and_ranges() -> None:
     assert isinstance(metrics["noise_tail_white_like"], bool)
     assert np.isfinite(metrics["noise_tail_spread_db"])
     assert np.isfinite(metrics["noise_tail_flatness_db"])
-    assert isinstance(metrics["source_estimate_gap"], int)
     assert "source_estimate_mdl" not in metrics
     assert "source_estimate_aic" not in metrics
-    assert np.isfinite(metrics["source_effective_rank"])
     assert 0.0 <= metrics["doa_deg"] <= 359.0
     assert np.isfinite(metrics["doa_raw_spectrum"]).all()
     assert np.min(metrics["doa_raw_spectrum"]) >= -1e-9
@@ -158,10 +156,8 @@ def test_source_count_diagnostics_reports_single_dominant_source() -> None:
 
     diagnostics = source_count_diagnostics(x)
 
-    assert diagnostics["source_estimate_gap"] == 1
     assert np.asarray(diagnostics["covariance_eigenvalues"]).shape == (4,)
     assert np.asarray(diagnostics["covariance_eigen_gap_db"])[0] > 30.0
-    assert float(diagnostics["source_effective_rank"]) < 1.1
     assert int(diagnostics["noise_tail_count"]) == 3
     assert bool(diagnostics["noise_tail_testable"]) is True
     assert bool(diagnostics["noise_tail_white_like"]) is True

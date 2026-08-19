@@ -1250,9 +1250,8 @@ def test_healthy_reference_does_not_treat_music_local_peaks_as_emitters() -> Non
         }
     )
     runtime._latest_source_count_diagnostics = {
-        "source_estimate_gap": 1,
+        "n_sources": 1,
         "peak_count": 4,
-        "source_effective_rank": 2.66,
     }
     u1 = np.ones((4,), dtype=np.complex128) / 2.0
     x = np.tile(u1[:, None], (1, 64))
@@ -1264,7 +1263,6 @@ def test_healthy_reference_does_not_treat_music_local_peaks_as_emitters() -> Non
         u1=u1,
     )
 
-    assert payload["suspicious_source_structure"] is False
     assert payload["healthy_reference_update_allowed"] is True
     assert payload["healthy_reference_updated"] is True
 

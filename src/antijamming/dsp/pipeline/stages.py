@@ -368,6 +368,4 @@ def compute_realtime_metrics(
         "noise_tail_flatness_threshold_db": doa_metrics[
             "noise_tail_flatness_threshold_db"
         ],
-        "source_estimate_gap": doa_metrics["source_estimate_gap"],
-        "source_effective_rank": doa_metrics["source_effective_rank"],
     }

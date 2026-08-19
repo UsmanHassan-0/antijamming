@@ -170,8 +170,6 @@ def source_count_diagnostics_from_eigenvalues(
             "covariance_eigenvalues_db": np.zeros((0,), dtype=np.float64),
             "covariance_eigenvalues_rel_db": np.zeros((0,), dtype=np.float64),
             "covariance_eigen_gap_db": np.zeros((0,), dtype=np.float64),
-            "source_estimate_gap": 0,
-            "source_effective_rank": 0.0,
             **_noise_tail_diagnostics(evals_safe, source_count=noise_tail_sources),
         }
 
@@ -179,22 +177,13 @@ def source_count_diagnostics_from_eigenvalues(
     eig_rel_db = eig_db - float(eig_db[0])
     if evals_safe.size > 1:
         gap_db = 10.0 * np.log10(evals_safe[:-1] / evals_safe[1:])
-        finite_gap = np.where(np.isfinite(gap_db), gap_db, -np.inf)
-        source_estimate_gap = int(np.argmax(finite_gap) + 1)
     else:
         gap_db = np.zeros((0,), dtype=np.float64)
-        source_estimate_gap = 0
-    weights = evals_safe / max(float(np.sum(evals_safe)), 1e-30)
-    effective_rank = float(
-        np.exp(-np.sum(weights * np.log(np.maximum(weights, 1e-30))))
-    )
     return {
         "covariance_eigenvalues": evals_safe,
         "covariance_eigenvalues_db": np.asarray(eig_db, dtype=np.float64),
         "covariance_eigenvalues_rel_db": np.asarray(eig_rel_db, dtype=np.float64),
         "covariance_eigen_gap_db": np.asarray(gap_db, dtype=np.float64),
-        "source_estimate_gap": source_estimate_gap,
-        "source_effective_rank": effective_rank,
         **_noise_tail_diagnostics(evals_safe, source_count=noise_tail_sources),
     }
 

@@ -38,8 +38,6 @@ _WIRE_METRIC_KEYS = frozenset(
         "gnss_snapshot",
         "n_sources",
         "source_count",
-        "source_estimate_gap",
-        "source_effective_rank",
     }
 )
 

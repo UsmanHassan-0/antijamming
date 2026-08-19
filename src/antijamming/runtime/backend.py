@@ -300,8 +300,6 @@ class BackendRuntime:
         self._lcmv_jammer_detected_latched: bool = False
         self._latest_source_count_diagnostics: dict[str, object] = {
             "n_sources": max(int(self._expected_sources), 1),
-            "source_estimate_gap": None,
-            "source_effective_rank": None,
             "peak_count": None,
         }
         self._dsp_chunk_counter = 0
@@ -3972,7 +3970,6 @@ class BackendRuntime:
                 "cn0_healthy": False,
                 "observations_healthy": False,
                 "large_angle_jump": False,
-                "suspicious_source_structure": False,
             }
         bridge = self._gnss_bridge
         gnss_snapshot: dict[str, object] = {}
@@ -4055,25 +4052,8 @@ class BackendRuntime:
             for value in (raw_power_jump_db, cal_power_jump_db)
         )
         source_diag = dict(self._latest_source_count_diagnostics)
-        source_estimate_gap = self._optional_int(
-            source_diag.get("source_estimate_gap")
-        )
         peak_count = self._optional_int(source_diag.get("peak_count"))
-        effective_rank = self._finite_metric_float(source_diag.get("source_effective_rank"))
-        # MUSIC local-maximum count and covariance effective rank are useful
-        # diagnostics, but neither is a physical-emitter counter. A single
-        # wideband GNSS simulator observed through multipath/noise produced four
-        # local spectrum peaks and rank 2.66 in the 2026-08-15 healthy lab
-        # baseline. Treating either as a jammer veto prevented the measured U1
-        # and covariance from ever being captured. Only a material mismatch
-        # between the configured and estimated source counts is a hard source-
-        # structure warning here; power/angle/PVT/CN0 gates remain independent.
-        suspicious_source_structure = (
-            source_estimate_gap is not None and source_estimate_gap > 2
-        )
         if large_angle_jump:
-            jammer_confidence = max(jammer_confidence, 0.35)
-        if suspicious_source_structure:
             jammer_confidence = max(jammer_confidence, 0.35)
         if large_power_jump:
             jammer_confidence = max(jammer_confidence, 0.55)
@@ -4091,8 +4071,6 @@ class BackendRuntime:
             freeze_reasons.append(f"jammer_confidence_high:{jammer_confidence:.3f}")
         if large_angle_jump:
             freeze_reasons.append(f"large_angle_jump:{angle_jump_deg:.2f}")
-        if suspicious_source_structure:
-            freeze_reasons.append("suspicious_source_structure")
         if large_power_jump:
             freeze_reasons.append("large_power_jump")
         if not current_u1.size:
@@ -4105,7 +4083,6 @@ class BackendRuntime:
             and cno_ok
             and jammer_confidence < 0.25
             and not large_angle_jump
-            and not suspicious_source_structure
             and not large_power_jump
         )
 
@@ -4182,16 +4159,13 @@ class BackendRuntime:
             "healthy_reference_observations": observations,
             "healthy_reference_avg_cno_db_hz": self._json_float(avg_cno),
             "healthy_reference_angle_jump_deg": self._json_float(angle_jump_deg),
-            "source_estimate_gap": source_estimate_gap,
             "peak_count": peak_count,
-            "source_effective_rank": self._json_float(effective_rank),
             "large_angle_jump": bool(large_angle_jump),
             "large_power_jump": bool(large_power_jump),
             "raw_avg_channel_power_linear": self._json_float(raw_power),
             "cal_avg_channel_power_linear": self._json_float(cal_power),
             "raw_power_jump_db": self._json_float(raw_power_jump_db),
             "cal_power_jump_db": self._json_float(cal_power_jump_db),
-            "suspicious_source_structure": bool(suspicious_source_structure),
             "warning_lcmv_on_while_jammer_confidence_low": bool(
                 self._lcmv_test_enabled and jammer_confidence < 0.25
             ),
@@ -6315,8 +6289,6 @@ class BackendRuntime:
                 self._last_doa_ts = time.monotonic()
                 self._latest_source_count_diagnostics = {
                     "n_sources": int(doa_metrics.get("n_sources", max(int(self._expected_sources), 1))),
-                    "source_estimate_gap": doa_metrics.get("source_estimate_gap"),
-                    "source_effective_rank": doa_metrics.get("source_effective_rank"),
                     "peak_count": doa_metrics.get("doa_peak_count"),
                     "noise_tail_assumed_sources": doa_metrics.get("noise_tail_assumed_sources"),
                     "noise_tail_count": doa_metrics.get("noise_tail_count"),
@@ -6388,8 +6360,7 @@ class BackendRuntime:
                     "eig_db=[%s] eig_rel_db=[%s] eig_gap_db=[%s] "
                     "noise_tail_k=%d noise_tail_count=%d noise_tail_rel_db=[%s] "
                     "noise_tail_spread_db=%.2f noise_tail_flatness_db=%.2f "
-                    "noise_tail_white_like=%d "
-                    "source_est_gap=%d effective_rank=%.2f",
+                    "noise_tail_white_like=%d",
                     "music",
                     int(doa_metrics["n_sources"]),
                     doa_deg,
@@ -6416,8 +6387,6 @@ class BackendRuntime:
                     float(doa_metrics.get("noise_tail_spread_db", 0.0)),
                     float(doa_metrics.get("noise_tail_flatness_db", 0.0)),
                     int(bool(doa_metrics.get("noise_tail_white_like", False))),
-                    int(doa_metrics.get("source_estimate_gap", 0)),
-                    float(doa_metrics.get("source_effective_rank", 0.0)),
                 )
                 heavy_interval_s = self._lcmv_heavy_diagnostics_interval_s()
                 full_angle_age_s = (
@@ -6649,10 +6618,6 @@ class BackendRuntime:
                 np.asarray(doa_metrics.get("covariance_eigen_gap_db", []))[0]
                 if np.asarray(doa_metrics.get("covariance_eigen_gap_db", [])).size
                 else None
-            ),
-            "source_est_gap": int(doa_metrics.get("source_estimate_gap", 0)),
-            "effective_rank": self._json_float(
-                doa_metrics.get("source_effective_rank", 0.0)
             ),
             "classification_hints": self._classification_hint_payload(
                 primary_bearing=doa_display_deg,
@@ -6928,8 +6893,6 @@ class BackendRuntime:
                 "i_samples_calibrated": np.real(calibrated_preview),
                 "n_sources": max(int(self._expected_sources), 1),
                 "source_count": source_count,
-                "source_estimate_gap": source_count.get("source_estimate_gap"),
-                "source_effective_rank": source_count.get("source_effective_rank"),
             }
         )
         self._ui_metrics_seq += 1
