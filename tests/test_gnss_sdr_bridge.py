@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import io
 import json
 import logging
+import os
 from pathlib import Path
 import queue
+import threading
 import time
 
 import numpy as np
@@ -13,6 +16,7 @@ import pytest
 
 from antijamming.config import StreamConfig
 from antijamming.gnss import GnssSdrBridge
+from antijamming.gnss.sdr_bridge.bridge import GnssFifoWriteStall
 from antijamming.gnss.gnss_sdr import (
     PRN_CARRIER_LOCK_THRESHOLD,
     PRN_CNO_MAX_PEAK_TO_PEAK_DB,
@@ -51,6 +55,114 @@ def _runtime_loggers() -> dict[str, logging.Logger]:
 
 def _fifo_runtime_dir(tmp_path: Path) -> Path:
     return tmp_path / "gnss-sdr" / "logs" / "runtime" / "fifo-x300"
+
+
+def _pipe_backed_bridge(
+    tmp_path: Path,
+    *,
+    source_count: int,
+) -> tuple[GnssSdrBridge, list[int], list[int]]:
+    cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
+    bridge = GnssSdrBridge(cfg, _loggers())
+    bridge._fifo_paths = [tmp_path / f"source_{index}.fifo" for index in range(source_count)]
+    read_fds: list[int] = []
+    write_fds: list[int] = []
+    for _ in range(source_count):
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        read_fds.append(read_fd)
+        write_fds.append(write_fd)
+    bridge._fifo_fds = list(write_fds)
+    bridge._fifo_fd = write_fds[0]
+    bridge._fifo_source_bytes = [0 for _ in range(source_count)]
+    return bridge, read_fds, write_fds
+
+
+def _close_pipe_fds(*groups: list[int]) -> None:
+    for group in groups:
+        for fd in group:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_fifo_fair_poll_writes_each_source_without_serial_blocking(
+    tmp_path: Path,
+) -> None:
+    bridge, read_fds, write_fds = _pipe_backed_bridge(tmp_path, source_count=2)
+    bridge._fifo_write_stall_timeout_s = 0.5
+    samples = np.stack(
+        [
+            np.arange(16_384, dtype=np.float32).astype(np.complex64),
+            (10_000 + np.arange(16_384, dtype=np.float32)).astype(np.complex64),
+        ]
+    )
+    expected_bytes = samples.shape[1] * np.dtype(np.complex64).itemsize
+    received = [bytearray(), bytearray()]
+
+    def reader(index: int) -> None:
+        while len(received[index]) < expected_bytes:
+            chunk = os.read(read_fds[index], expected_bytes - len(received[index]))
+            if not chunk:
+                return
+            received[index].extend(chunk)
+
+    threads = [threading.Thread(target=reader, args=(index,)) for index in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        assert bridge.write(samples)
+        for thread in threads:
+            thread.join(timeout=1.0)
+            assert not thread.is_alive()
+        for index in range(2):
+            np.testing.assert_array_equal(
+                np.frombuffer(received[index], dtype=np.complex64),
+                samples[index],
+            )
+    finally:
+        _close_pipe_fds(write_fds, read_fds)
+
+
+def test_fifo_fair_poll_identifies_one_stalled_reader_with_bounded_latency(
+    tmp_path: Path,
+) -> None:
+    bridge, read_fds, write_fds = _pipe_backed_bridge(tmp_path, source_count=2)
+    bridge._fifo_write_stall_timeout_s = 0.05
+    for write_fd in write_fds:
+        fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+    samples = np.ones((2, 8192), dtype=np.complex64)
+    source_zero_done = threading.Event()
+
+    def drain_source_zero() -> None:
+        expected_bytes = samples.shape[1] * np.dtype(np.complex64).itemsize
+        received = 0
+        while received < expected_bytes:
+            chunk = os.read(read_fds[0], expected_bytes - received)
+            if not chunk:
+                return
+            received += len(chunk)
+        source_zero_done.set()
+
+    reader = threading.Thread(target=drain_source_zero)
+    started_at = time.monotonic()
+    try:
+        reader.start()
+        with pytest.raises(GnssFifoWriteStall) as caught:
+            bridge.write(samples)
+        elapsed_s = time.monotonic() - started_at
+        assert elapsed_s < 0.5
+        assert caught.value.stalled_sources == (1,)
+        assert caught.value.stalled_paths == (tmp_path / "source_1.fifo",)
+        assert len(caught.value.pending_bytes) == 1
+        assert caught.value.pending_bytes[0] > 0
+        assert "sources=1" in str(caught.value)
+        assert "source_1.fifo" in str(caught.value)
+        assert bridge._drop_count == 1
+    finally:
+        _close_pipe_fds(write_fds, read_fds)
+        reader.join(timeout=1.0)
 
 
 def _tracking_monitor_message(
