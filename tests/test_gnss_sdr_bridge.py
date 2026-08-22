@@ -2429,12 +2429,14 @@ class _FakePausableDevice:
     def __init__(self) -> None:
         self.paused = False
         self.stopped = False
+        self.stop_calls = 0
 
     def pause_stream(self) -> None:
         self.paused = True
 
     def stop(self) -> None:
         self.stopped = True
+        self.stop_calls += 1
 
 
 class _FakeStartupDevice:
@@ -2490,6 +2492,36 @@ def test_backend_preserved_usrp_stop_pauses_reusable_device() -> None:
     assert device.paused is True
     assert device.stopped is False
     assert statuses == ["Stopping USRP stream"]
+
+
+def test_backend_finalizer_stops_and_detaches_device_after_exception() -> None:
+    runtime = BackendRuntime(
+        StreamConfig(preserve_usrp_session_on_stop=False),
+        _runtime_loggers(),
+    )
+    device = _FakePausableDevice()
+    runtime._device = device  # type: ignore[assignment]
+
+    runtime._finalize_usrp_device()
+    runtime._finalize_usrp_device()
+
+    assert device.stop_calls == 1
+    assert runtime._device is None
+
+
+def test_backend_finalizer_pauses_and_retains_preserved_device() -> None:
+    runtime = BackendRuntime(
+        StreamConfig(preserve_usrp_session_on_stop=True),
+        _runtime_loggers(),
+    )
+    device = _FakePausableDevice()
+    runtime._device = device  # type: ignore[assignment]
+
+    runtime._finalize_usrp_device()
+
+    assert device.paused is True
+    assert device.stopped is False
+    assert runtime._device is device
 
 
 def test_backend_startup_probe_restarts_usrp_after_first_recv_socket_close(
