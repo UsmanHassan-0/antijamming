@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -115,6 +116,11 @@ class UsrpRxDevice:
         stream_args.channels = list(config.channels)
         self._rx_streamer = self._usrp.get_rx_stream(stream_args)
         self._metadata = uhd.types.RXMetadata()
+        # UHD does not promise that recv() and stream-control commands are
+        # safe when issued concurrently on one rx_streamer.  The headless IPC
+        # thread can request Stop while the RX worker is inside recv(), so all
+        # access to the streamer must cross this ownership boundary.
+        self._stream_lock = threading.Lock()
         self._stopping = False
         self._started = False
         self._startup_recv_pending = False
@@ -510,31 +516,60 @@ class UsrpRxDevice:
     def recv_chunk(self) -> RxChunkResult:
         if _RXEC is None:
             raise RuntimeError("UHD RX metadata types are unavailable.")
-        if self._stopping:
-            chunk = np.zeros((len(self._cfg.channels), 0), dtype=np.complex64)
-            return RxChunkResult(
-                chunk=chunk,
-                state="timeout",
-                got_samples=0,
-                error_code="stopping",
-                out_of_sequence=False,
-                time_spec_s=None,
+        with self._stream_lock:
+            if self._stopping:
+                chunk = np.zeros((len(self._cfg.channels), 0), dtype=np.complex64)
+                return RxChunkResult(
+                    chunk=chunk,
+                    state="timeout",
+                    got_samples=0,
+                    error_code="stopping",
+                    out_of_sequence=False,
+                    time_spec_s=None,
+                )
+            if not self._started:
+                self._issue_start_cont()
+            n = int(self._cfg.samples_per_chunk)
+            chunk = np.empty((len(self._cfg.channels), n), dtype=np.complex64)
+            timeout_s = (
+                0.05 if self._startup_recv_pending else self._steady_recv_timeout_s()
             )
-        if not self._started:
-            self._issue_start_cont()
-        n = self._cfg.samples_per_chunk
-        chunk = np.empty((len(self._cfg.channels), n), dtype=np.complex64)
-        timeout_s = 0.05 if self._startup_recv_pending else self._steady_recv_timeout_s()
-        got = self._rx_streamer.recv(chunk, self._metadata, timeout=timeout_s)
-        code = self._metadata.error_code
-        is_overflow = code in (_RXEC.overflow, _RXEC.late)
-        is_timeout = code == _RXEC.timeout
-        error_code = _metadata_error_code_name(code)
-        out_of_sequence = bool(getattr(self._metadata, "out_of_sequence", False))
-        time_spec_s = _metadata_time_spec_s(self._metadata)
-        if got > 0 or time.monotonic() >= self._startup_recv_deadline_monotonic:
-            self._startup_recv_pending = False
-        if got <= 0:
+            # The retained UHD 4.6 core shows its sc16->fc32 converter being
+            # asked for all 32,768 samples while its packet buffer ended after
+            # 7,992 int16 values.  Receive no more than UHD's advertised packet
+            # maximum per native call, then assemble the configured DSP chunk
+            # in owned NumPy memory.  This also follows UHD's Python example,
+            # which sizes recv_buffer from get_max_num_samps().
+            max_native_samps = max(1, int(self._rx_streamer.get_max_num_samps()))
+            got_total = 0
+            code = _RXEC.none
+            while got_total < n:
+                request_samps = min(max_native_samps, n - got_total)
+                native_chunk = np.empty(
+                    (len(self._cfg.channels), request_samps), dtype=np.complex64
+                )
+                got = int(
+                    self._rx_streamer.recv(
+                        native_chunk,
+                        self._metadata,
+                        timeout=timeout_s,
+                    )
+                )
+                code = self._metadata.error_code
+                if got > 0:
+                    accepted = min(got, request_samps)
+                    chunk[:, got_total : got_total + accepted] = native_chunk[:, :accepted]
+                    got_total += accepted
+                if got <= 0 or code != _RXEC.none:
+                    break
+            is_overflow = code in (_RXEC.overflow, _RXEC.late)
+            is_timeout = code == _RXEC.timeout
+            error_code = _metadata_error_code_name(code)
+            out_of_sequence = bool(getattr(self._metadata, "out_of_sequence", False))
+            time_spec_s = _metadata_time_spec_s(self._metadata)
+            if got_total > 0 or time.monotonic() >= self._startup_recv_deadline_monotonic:
+                self._startup_recv_pending = False
+        if got_total <= 0:
             if is_overflow:
                 return RxChunkResult(
                     chunk=chunk[:, :0],
@@ -564,47 +599,52 @@ class UsrpRxDevice:
         if is_overflow:
             # UHD may report overflow (or late) and still return valid samples. Keep draining.
             return RxChunkResult(
-                chunk=chunk[:, :got],
+                chunk=chunk[:, :got_total],
                 state="overflow",
-                got_samples=int(got),
+                got_samples=got_total,
                 error_code=error_code,
                 out_of_sequence=out_of_sequence,
                 time_spec_s=time_spec_s,
             )
         if is_timeout:
             return RxChunkResult(
-                chunk=chunk[:, :got],
+                chunk=chunk[:, :got_total],
                 state="timeout",
-                got_samples=int(got),
+                got_samples=got_total,
                 error_code=error_code,
                 out_of_sequence=out_of_sequence,
                 time_spec_s=time_spec_s,
             )
         return RxChunkResult(
-            chunk=chunk[:, :got],
+            chunk=chunk[:, :got_total],
             state="ok",
-            got_samples=int(got),
+            got_samples=got_total,
             error_code=error_code,
             out_of_sequence=out_of_sequence,
             time_spec_s=time_spec_s,
         )
 
     def restart_stream(self) -> None:
-        if self._stopping:
-            return
-        cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
-        cmd.stream_now = True
-        self._rx_streamer.issue_stream_cmd(cmd)
-        self._started = False
-        self._startup_recv_pending = False
-        self._startup_recv_deadline_monotonic = 0.0
-        self._issue_start_cont()
+        with self._stream_lock:
+            if self._stopping:
+                return
+            self._pause_stream_locked()
+            self._issue_start_cont()
 
     def stop(self) -> None:
-        self._stopping = True
-        self.pause_stream()
+        with self._stream_lock:
+            if self._stopping:
+                return
+            self._stopping = True
+            self._pause_stream_locked()
 
     def pause_stream(self) -> None:
+        with self._stream_lock:
+            self._pause_stream_locked()
+
+    def _pause_stream_locked(self) -> None:
+        if not self._started:
+            return
         cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
         cmd.stream_now = True
         self._rx_streamer.issue_stream_cmd(cmd)

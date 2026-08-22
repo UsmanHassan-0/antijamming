@@ -819,17 +819,7 @@ class BackendRuntime:
                 self._emit_status("Finalizing GNSS-SDR logs")
                 self._gnss_bridge.stop(self._stop_reason)
             self._gnss_bridge = None
-            if self._device is not None:
-                if bool(self._config.preserve_usrp_session_on_stop):
-                    try:
-                        self._device.pause_stream()
-                    except Exception:
-                        pass
-                    self._loggers["stream"].info(
-                        "USRP session preserved after stop; next start can reuse current LO/tune state."
-                    )
-                else:
-                    self._device = None
+            self._finalize_usrp_device()
             self._emit_status("USRP stream stopped")
             self._loggers["app"].info(
                 "USRP stream stopped (reason=%s, raw=%d, overflow=%d, timeout=%d, "
@@ -858,6 +848,30 @@ class BackendRuntime:
                     "failed" if self._stop_reason.startswith("exception:") else "stopped"
                 ),
             )
+
+    def _finalize_usrp_device(self) -> None:
+        """Leave no live UHD stream behind on normal or exceptional exit."""
+
+        device = self._device
+        if device is None:
+            return
+        if bool(self._config.preserve_usrp_session_on_stop):
+            try:
+                device.pause_stream()
+            except Exception:
+                pass
+            self._loggers["stream"].info(
+                "USRP session preserved after stop; next start can reuse current LO/tune state."
+            )
+            return
+        try:
+            # stop() is idempotent at the device boundary.  Calling it here is
+            # required for exceptions that bypass BackendRuntime.stop().
+            device.stop()
+        except Exception:
+            pass
+        finally:
+            self._device = None
 
     def _log_experiment_startup_context(self) -> None:
         manifest = dict(self._experiment_manifest)
