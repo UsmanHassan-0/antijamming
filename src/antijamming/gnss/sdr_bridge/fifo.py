@@ -65,7 +65,6 @@ class FifoMixin:
             try:
                 fd = os.open(selected_path, os.O_WRONLY | os.O_NONBLOCK)
                 self._configure_pipe(fd)
-                os.set_blocking(fd, True)
                 elapsed_s = time.monotonic() - started_at
                 if elapsed_s >= _FIFO_STARTUP_PROGRESS_INTERVAL_S:
                     self._report_startup(

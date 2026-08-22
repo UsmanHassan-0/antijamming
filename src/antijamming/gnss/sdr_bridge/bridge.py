@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import atexit
+import errno
 import logging
 import os
 import pty
+import select
 import shutil
 import subprocess
 import threading
@@ -32,6 +34,31 @@ from .process import ProcessMixin
 from .receiver_state import ReceiverStateMixin
 from .snapshot import SnapshotMixin
 from .udp_monitor import UdpMonitorMixin
+
+
+class GnssFifoWriteStall(RuntimeError):
+    """A bounded FIFO write failure with exact stalled-source provenance."""
+
+    def __init__(
+        self,
+        *,
+        stalled_sources: tuple[int, ...],
+        stalled_paths: tuple[Path, ...],
+        pending_bytes: tuple[int, ...],
+        timeout_s: float,
+    ) -> None:
+        self.stalled_sources = stalled_sources
+        self.stalled_paths = stalled_paths
+        self.pending_bytes = pending_bytes
+        self.timeout_s = float(timeout_s)
+        source_text = ",".join(str(value) for value in stalled_sources)
+        path_text = ",".join(str(value) for value in stalled_paths)
+        pending_text = ",".join(str(value) for value in pending_bytes)
+        super().__init__(
+            "GNSS-SDR FIFO reader stalled: "
+            f"sources={source_text} paths={path_text} "
+            f"pending_bytes={pending_text} timeout_s={self.timeout_s:.3f}"
+        )
 
 
 class GnssSdrBridge(
@@ -99,6 +126,10 @@ class GnssSdrBridge(
         self._write_time_total_s = 0.0
         self._write_max_latency_s = 0.0
         self._write_warn_threshold_s = 0.05
+        # Normal ten-source writes complete in a few milliseconds.  A quarter
+        # second allows transient scheduler jitter without letting a blocked
+        # reader consume the backend's multi-second raw queue unnoticed.
+        self._fifo_write_stall_timeout_s = 0.25
         self._pipe_size_bytes: int | None = None
         self._fifo_source_bytes: list[int] = []
         self._fifo_max_source_lead_bytes = 0
@@ -385,7 +416,8 @@ class GnssSdrBridge(
             self._receiver_log_path,
         )
         self._log.info(
-            "GNSS FIFO writer ready: blocking=true pipe_size=%s chunk_bytes=%d sample_rate=%.3f Msps software_if_bw=%.3f MHz",
+            "GNSS FIFO writer ready: blocking=false fair_poll=true stall_timeout_s=%.3f pipe_size=%s chunk_bytes=%d sample_rate=%.3f Msps software_if_bw=%.3f MHz",
+            self._fifo_write_stall_timeout_s,
             self._pipe_size_bytes if self._pipe_size_bytes is not None else "unknown",
             int(self._cfg.samples_per_chunk) * np.dtype(np.complex64).itemsize,
             float(self._cfg.sample_rate) / 1e6,
@@ -430,26 +462,12 @@ class GnssSdrBridge(
                 )
                 for start in range(0, arrays[0].size, stripe_samples):
                     stop = min(arrays[0].size, start + stripe_samples)
-                    for source_index, (fifo_fd, array) in enumerate(
-                        zip(fifo_fds, arrays)
-                    ):
-                        payload = memoryview(array[start:stop]).cast("B")
-                        while payload:
-                            written = os.write(fifo_fd, payload)
-                            if written <= 0:
-                                raise RuntimeError(
-                                    "GNSS-SDR FIFO write returned no progress"
-                                )
-                            self._fifo_source_bytes[source_index] += written
-                            if len(self._fifo_source_bytes) > 1:
-                                source_lead = max(self._fifo_source_bytes) - min(
-                                    self._fifo_source_bytes
-                                )
-                                self._fifo_max_source_lead_bytes = max(
-                                    self._fifo_max_source_lead_bytes,
-                                    source_lead,
-                                )
-                            payload = payload[written:]
+                    self._write_fifo_stripe_fair(
+                        fifo_fds=fifo_fds,
+                        arrays=arrays,
+                        start=start,
+                        stop=stop,
+                    )
             elapsed_s = time.monotonic() - started_at
             self._write_count += 1
             payload_bytes = sum(array.nbytes for array in arrays)
@@ -468,18 +486,117 @@ class GnssSdrBridge(
                     self._pipe_size_bytes if self._pipe_size_bytes is not None else "unknown",
                 )
             return True
-        except BlockingIOError:
+        except GnssFifoWriteStall:
             self._drop_count += 1
-            if self._drop_count == 1 or self._drop_count % 50 == 0:
-                self._log.warning(
-                    "GNSS-SDR FIFO backpressure: dropped %d IQ chunk(s).",
-                    self._drop_count,
-                )
-            return False
+            raise
         except BrokenPipeError as exc:
             raise RuntimeError("GNSS-SDR FIFO reader disconnected") from exc
         except OSError as exc:
             raise RuntimeError(f"GNSS-SDR FIFO write failed: {exc}") from exc
+
+    def _write_fifo_stripe_fair(
+        self,
+        *,
+        fifo_fds: tuple[int, ...],
+        arrays: list[np.ndarray],
+        start: int,
+        stop: int,
+    ) -> None:
+        """Write one equal-sized stripe without blocking behind one source.
+
+        All FIFO descriptors remain nonblocking.  ``poll`` services whichever
+        GNSS-SDR readers are currently writable, while a single deadline bounds
+        the whole stripe.  Completion of every source is required, so this does
+        not silently drop samples or advance one PRN stream to the next stripe.
+        """
+
+        payloads = [memoryview(array[start:stop]).cast("B") for array in arrays]
+        offsets = [0 for _ in payloads]
+        poller = select.poll()
+        fd_to_source: dict[int, int] = {}
+        event_mask = select.POLLOUT | select.POLLERR | select.POLLHUP | select.POLLNVAL
+        for source_index, fifo_fd in enumerate(fifo_fds):
+            poller.register(fifo_fd, event_mask)
+            fd_to_source[fifo_fd] = source_index
+
+        pending = set(range(len(payloads)))
+        timeout_s = max(0.001, float(self._fifo_write_stall_timeout_s))
+        deadline = time.monotonic() + timeout_s
+        while pending:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                self._raise_fifo_write_stall(
+                    pending=pending,
+                    payloads=payloads,
+                    offsets=offsets,
+                    timeout_s=timeout_s,
+                )
+            events = poller.poll(max(1, int(remaining_s * 1000.0)))
+            if not events:
+                self._raise_fifo_write_stall(
+                    pending=pending,
+                    payloads=payloads,
+                    offsets=offsets,
+                    timeout_s=timeout_s,
+                )
+            for fifo_fd, event in events:
+                source_index = fd_to_source.get(fifo_fd)
+                if source_index is None or source_index not in pending:
+                    continue
+                if event & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                    path = self._fifo_paths[source_index]
+                    raise RuntimeError(
+                        "GNSS-SDR FIFO reader disconnected: "
+                        f"source={source_index} path={path} poll_event={event}"
+                    )
+                if not event & select.POLLOUT:
+                    continue
+                payload = payloads[source_index]
+                offset = offsets[source_index]
+                try:
+                    written = os.write(fifo_fd, payload[offset:])
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        continue
+                    raise
+                if written <= 0:
+                    raise RuntimeError(
+                        "GNSS-SDR FIFO write returned no progress: "
+                        f"source={source_index} path={self._fifo_paths[source_index]}"
+                    )
+                offsets[source_index] += written
+                self._fifo_source_bytes[source_index] += written
+                if len(self._fifo_source_bytes) > 1:
+                    source_lead = max(self._fifo_source_bytes) - min(
+                        self._fifo_source_bytes
+                    )
+                    self._fifo_max_source_lead_bytes = max(
+                        self._fifo_max_source_lead_bytes,
+                        source_lead,
+                    )
+                if offsets[source_index] >= len(payload):
+                    pending.remove(source_index)
+                    poller.unregister(fifo_fd)
+
+    def _raise_fifo_write_stall(
+        self,
+        *,
+        pending: set[int],
+        payloads: list[memoryview],
+        offsets: list[int],
+        timeout_s: float,
+    ) -> None:
+        stalled_sources = tuple(sorted(pending))
+        raise GnssFifoWriteStall(
+            stalled_sources=stalled_sources,
+            stalled_paths=tuple(self._fifo_paths[index] for index in stalled_sources),
+            pending_bytes=tuple(
+                len(payloads[index]) - offsets[index] for index in stalled_sources
+            ),
+            timeout_s=timeout_s,
+        )
 
     def stop(self, reason: str = "normal stop") -> None:
         self._monitor_stop.set()
