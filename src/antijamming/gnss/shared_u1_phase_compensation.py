@@ -1326,6 +1326,11 @@ class SharedU1DesiredVectorMonitor:
         self._last_measurement_monotonic = 0.0
         self._code_cache: dict[int, np.ndarray] = {}
         self._aggregates: dict[str, _PrnAggregate] = {}
+        # Current tracking ownership by GNSS-SDR output/FIFO source.  The
+        # monitor worker is the sole writer.  A disappearance or reassignment
+        # is an epoch boundary: code-despread projectors from the old carrier
+        # lock must never be relabelled with a later measurement timestamp.
+        self._source_satellites: dict[int, str] = {}
         self._vectors_lock = threading.Lock()
         self._latest_vectors: dict[str, dict[str, object]] = {}
         self._handle = None
@@ -1494,16 +1499,75 @@ class SharedU1DesiredVectorMonitor:
         )
         return output, rows[0], changed
 
+    def _retire_satellite_epoch(self, satellite: str) -> None:
+        """Discard every datum owned by a completed tracking epoch."""
+
+        self._last_counter.pop(satellite, None)
+        self._aggregates.pop(satellite, None)
+        with self._vectors_lock:
+            self._latest_vectors.pop(satellite, None)
+
+    def _reconcile_tracking_epochs(
+        self,
+        assignments: dict[int, str],
+    ) -> None:
+        previous = self._source_satellites
+        previous_source_by_satellite = {
+            satellite: source_index
+            for source_index, satellite in previous.items()
+        }
+        retired = {
+            satellite
+            for source_index, satellite in previous.items()
+            if assignments.get(source_index) != satellite
+        }
+        # A PRN moving to another source is also a new epoch, even if it did
+        # not disappear from the same snapshot in between.
+        retired.update(
+            satellite
+            for source_index, satellite in assignments.items()
+            if satellite in previous_source_by_satellite
+            and previous_source_by_satellite[satellite] != source_index
+        )
+        for satellite in retired:
+            self._retire_satellite_epoch(satellite)
+        self._source_satellites = dict(assignments)
+
     def _measure_tracking(self) -> None:
-        entries = self._tracking_snapshot().get("tracking_monitor", [])
+        snapshot = self._tracking_snapshot()
+        entries = snapshot.get("tracking_monitor", [])
         if not isinstance(entries, list):
             return
+
+        # ``prns`` is the authoritative current lifecycle when present.  It
+        # prevents an archive-like tracking-monitor row from keeping a vector
+        # alive after the receiver has reported acquired/lost/idle.
+        prn_rows = snapshot.get("prns")
+        current_prns: dict[str, dict[str, object]] | None = None
+        if isinstance(prn_rows, list):
+            current_prns = {}
+            for row in prn_rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    row_prn = int(row.get("prn", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                row_satellite = str(
+                    row.get("satellite_id") or f"G{row_prn:02d}"
+                )
+                current_prns[row_satellite] = row
+
+        selected_entries: dict[int, tuple[dict[str, object], str, int]] = {}
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
             system = str(entry.get("system", "G")).upper()
             signal = str(entry.get("signal", ""))
-            prn = int(entry.get("prn", 0) or 0)
+            try:
+                prn = int(entry.get("prn", 0) or 0)
+            except (TypeError, ValueError):
+                continue
             satellite = str(entry.get("satellite_id") or f"G{prn:02d}")
             try:
                 tracking_channel = int(entry.get("channel", -1))
@@ -1514,17 +1578,54 @@ class SharedU1DesiredVectorMonitor:
                 if self._dynamic_sources
                 else self._satellite_rows.get(satellite, -1)
             )
-            counter = int(entry.get("tracking_sample_counter", 0) or 0)
-            cno = _finite_float(entry.get("cn0_db_hz"))
-            doppler = _finite_float(entry.get("carrier_doppler_hz"))
             if (
                 (not self._dynamic_sources and satellite not in self._satellite_rows)
                 or source_index < 0
                 or source_index >= self._source_count
                 or system not in {"G", "GPS"}
                 or signal != "1C"
-                or counter <= 0
-                or cno is None
+            ):
+                continue
+            if current_prns is not None:
+                current = current_prns.get(satellite)
+                try:
+                    current_channel = int(
+                        current.get("channel", -1) if current is not None else -1
+                    )
+                except (TypeError, ValueError):
+                    current_channel = -1
+                if (
+                    current is None
+                    or str(current.get("state", "")).lower() != "tracking"
+                    or current_channel != tracking_channel
+                ):
+                    continue
+            selected_entries[source_index] = (entry, satellite, prn)
+
+        assignments = {
+            source_index: satellite
+            for source_index, (_, satellite, _) in selected_entries.items()
+        }
+        self._reconcile_tracking_epochs(assignments)
+
+        for source_index, (entry, satellite, prn) in selected_entries.items():
+            try:
+                counter = int(entry.get("tracking_sample_counter", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            cno = _finite_float(entry.get("cn0_db_hz"))
+            doppler = _finite_float(entry.get("carrier_doppler_hz"))
+            if counter <= 0:
+                continue
+            previous_counter = self._last_counter.get(satellite)
+            if previous_counter is not None and counter < previous_counter:
+                # The receiver/sample-counter domain restarted without this
+                # polling thread necessarily observing an empty snapshot.
+                # Treat it as a new lock epoch rather than mixing old spatial
+                # projectors into measurements bearing the reset counter.
+                self._retire_satellite_epoch(satellite)
+            if (
+                cno is None
                 or cno < self._min_cno_db_hz
                 or doppler is None
                 or self._last_counter.get(satellite) == counter

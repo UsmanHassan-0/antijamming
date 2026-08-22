@@ -35,6 +35,72 @@ def _loggers() -> dict[str, logging.Logger]:
     }
 
 
+def _monitor_tracking_entry(
+    prn: int,
+    *,
+    channel: int = 0,
+    counter: int = 500,
+) -> dict[str, object]:
+    return {
+        "system": "GPS",
+        "signal": "1C",
+        "prn": prn,
+        "satellite_id": f"G{prn:02d}",
+        "channel": channel,
+        "tracking_sample_counter": counter,
+        "cn0_db_hz": 45.0,
+        "carrier_doppler_hz": 0.0,
+    }
+
+
+def _monitor_snapshot(
+    prn: int,
+    *,
+    channel: int = 0,
+    counter: int = 500,
+    state: str = "tracking",
+) -> dict[str, object]:
+    tracking = _monitor_tracking_entry(
+        prn, channel=channel, counter=counter
+    )
+    return {
+        "tracking_monitor": [tracking],
+        "prns": [
+            {
+                "prn": prn,
+                "satellite_id": f"G{prn:02d}",
+                "channel": channel,
+                "state": state,
+                "tracking_monitor_prn": prn,
+            }
+        ],
+    }
+
+
+def _add_monitor_quality_measurement(
+    monitor: SharedU1DesiredVectorMonitor,
+    *,
+    prn: int,
+    spatial: np.ndarray,
+    counter: int,
+    source_index: int = 0,
+) -> dict[str, object]:
+    code = gps_l1_ca_code(prn).astype(np.complex64)
+    raw = np.zeros((4, 1031), dtype=np.complex64)
+    raw[:, 5:1028] = spatial[:, None] * code[None, :]
+    monitor._append_span(
+        counter - 1028,
+        raw,
+        np.ones((1, 4), dtype=np.complex128),
+    )
+    measurement = monitor._correlate(
+        {}, f"G{prn:02d}", prn, counter, 0.0, 45.0, source_index
+    )
+    assert measurement is not None
+    assert measurement["quality_pass"] is True
+    return measurement
+
+
 def test_shared_u1_phase_rows_preserve_full_complex_response() -> None:
     common = np.ones((4,), dtype=np.complex128)
     # One shared spatial solution with a null toward [1,1,1,1].
@@ -1496,6 +1562,322 @@ def test_prn_monitor_rolling_window_forgets_an_old_spatial_vector(
     assert phase_invariant_coherence(
         recovered["desired_spatial_vector"], new
     ) > 1.0 - 1e-12
+
+
+@pytest.mark.parametrize(
+    "retirement_snapshot",
+    [
+        {"tracking_monitor": [], "prns": []},
+        _monitor_snapshot(3, state="lost"),
+    ],
+    ids=("snapshot_gap", "explicit_lost_state"),
+)
+def test_prn_monitor_same_source_reacquisition_starts_a_fresh_epoch(
+    tmp_path: Path,
+    retirement_snapshot: dict[str, object],
+) -> None:
+    current_snapshot = _monitor_snapshot(3)
+    old = np.asarray([1.0, 0.8j, -0.3, 0.2 - 0.1j])
+    new = np.asarray([0.2j, 1.0, 0.6 - 0.2j, -0.7])
+    monitor = SharedU1DesiredVectorMonitor(
+        sample_rate_hz=1_023_000.0,
+        channel_count=4,
+        phase_correction_vector=None,
+        tracking_snapshot=lambda: current_snapshot,
+        session_dir=tmp_path,
+        session_id="same-prn-new-epoch",
+        logger=logging.getLogger("test.shared_u1_phase.same_prn_epoch"),
+        satellites=(3,),
+        min_quality_measurements=2,
+        vector_window_measurements=4,
+    )
+    _add_monitor_quality_measurement(
+        monitor, prn=3, spatial=old, counter=10_000
+    )
+    _add_monitor_quality_measurement(
+        monitor, prn=3, spatial=old, counter=12_000
+    )
+    assert monitor.desired_vectors_snapshot()["G03"]["quality_pass_count"] == 2
+
+    # Establish source ownership and the duplicate-counter marker without
+    # perturbing the already-built projector aggregate.
+    original_correlate = monitor._correlate
+    observed: list[tuple[str, int, int]] = []
+
+    def observe_correlation(
+        entry: dict[str, object],
+        satellite: str,
+        prn: int,
+        counter: int,
+        doppler_hz: float,
+        cno_db_hz: float,
+        source_index: int,
+    ) -> dict[str, object]:
+        del entry, prn, doppler_hz, cno_db_hz
+        observed.append((satellite, counter, source_index))
+        return {"event": "test_tracking_measurement"}
+
+    monitor._correlate = observe_correlation  # type: ignore[method-assign]
+    monitor._measure_tracking()
+    assert observed == [("G03", 500, 0)]
+    assert monitor._last_counter == {"G03": 500}
+
+    current_snapshot = retirement_snapshot
+    monitor._measure_tracking()
+    assert monitor.desired_vectors_snapshot() == {}
+    assert "G03" not in monitor._aggregates
+    assert "G03" not in monitor._last_counter
+    assert monitor._source_satellites == {}
+
+    # The same receiver counter is accepted after reacquisition because the
+    # deduplication marker belongs to the retired epoch.
+    current_snapshot = _monitor_snapshot(3)
+    monitor._measure_tracking()
+    assert observed[-1] == ("G03", 500, 0)
+    assert len(observed) == 2
+
+    # Only post-reacquisition projectors may contribute.  One new sample is
+    # insufficient to publish; the second publishes a pure new-vector result.
+    monitor._correlate = original_correlate  # type: ignore[method-assign]
+    first = _add_monitor_quality_measurement(
+        monitor, prn=3, spatial=new, counter=30_000
+    )
+    assert first["aggregate_quality_pass_count"] == 1
+    assert monitor.desired_vectors_snapshot() == {}
+    second = _add_monitor_quality_measurement(
+        monitor, prn=3, spatial=new, counter=32_000
+    )
+    assert second["aggregate_quality_pass_count"] == 2
+    recovered = monitor.desired_vectors_snapshot()["G03"]
+    assert recovered["quality_pass_count"] == 2
+    assert recovered["rolling_quality_measurement_count"] == 2
+    assert phase_invariant_coherence(
+        recovered["desired_spatial_vector"], new
+    ) > 1.0 - 1e-12
+
+
+def test_prn_monitor_source_reassignment_retires_the_previous_prn(
+    tmp_path: Path,
+) -> None:
+    current_snapshot = _monitor_snapshot(3)
+    first = np.asarray([1.0, 0.8j, -0.3, 0.2 - 0.1j])
+    second = np.asarray([0.2j, 1.0, 0.6 - 0.2j, -0.7])
+    monitor = SharedU1DesiredVectorMonitor(
+        sample_rate_hz=1_023_000.0,
+        channel_count=4,
+        phase_correction_vector=None,
+        tracking_snapshot=lambda: current_snapshot,
+        session_dir=tmp_path,
+        session_id="source-reassignment",
+        logger=logging.getLogger("test.shared_u1_phase.source_reassignment"),
+        satellites=(),
+        source_count=1,
+        min_quality_measurements=1,
+    )
+    _add_monitor_quality_measurement(
+        monitor, prn=3, spatial=first, counter=10_000
+    )
+
+    original_correlate = monitor._correlate
+    monitor._correlate = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: {"event": "test_tracking_measurement"}
+    )
+    monitor._measure_tracking()
+    assert monitor._source_satellites == {0: "G03"}
+    assert monitor._last_counter == {"G03": 500}
+
+    current_snapshot = _monitor_snapshot(4)
+    monitor._measure_tracking()
+    assert monitor._source_satellites == {0: "G04"}
+    assert "G03" not in monitor._aggregates
+    assert "G03" not in monitor._last_counter
+    assert "G03" not in monitor.desired_vectors_snapshot()
+
+    monitor._correlate = original_correlate  # type: ignore[method-assign]
+    measurement = _add_monitor_quality_measurement(
+        monitor, prn=4, spatial=second, counter=30_000
+    )
+    assert measurement["aggregate_quality_pass_count"] == 1
+    assert set(monitor.desired_vectors_snapshot()) == {"G04"}
+
+
+def test_per_prn_bank_rejects_an_expired_published_vector() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    desired = np.asarray([1.0, 0.8j, -0.3, 0.2 - 0.1j])
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(),
+        source_count=1,
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+    rows, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": desired,
+                "updated_monotonic": 10.0,
+                "tracking_sample_counter": 100,
+            }
+        },
+        source_satellites=(3,),
+        enabled_now=False,
+        now_monotonic=20.0,
+        max_vector_age_s=2.5,
+    )
+
+    np.testing.assert_allclose(rows[0], common)
+    assert status["G03"]["desired_vector_available"] is False
+    assert status["G03"]["tracking_sample_counter"] is None
+
+
+def test_prn_monitor_randomized_assignment_epochs_never_leak_state(
+    tmp_path: Path,
+) -> None:
+    rng = np.random.default_rng(0xA11CE)
+    current_snapshot: dict[str, object] = {
+        "tracking_monitor": [],
+        "prns": [],
+    }
+    monitor = SharedU1DesiredVectorMonitor(
+        sample_rate_hz=1_023_000.0,
+        channel_count=4,
+        phase_correction_vector=None,
+        tracking_snapshot=lambda: current_snapshot,
+        session_dir=tmp_path,
+        session_id="randomized-epochs",
+        logger=logging.getLogger("test.shared_u1_phase.randomized_epochs"),
+        satellites=(),
+        source_count=1,
+        min_quality_measurements=1,
+    )
+    previous_satellite: str | None = None
+    expected_satellite: str | None = None
+    expected_epoch = 0
+    new_epoch = False
+    fake_calls = 0
+    previous_counter: int | None = None
+    counter_reset_epochs = 0
+
+    def publish_epoch_marker(
+        entry: dict[str, object],
+        satellite: str,
+        prn: int,
+        counter: int,
+        doppler_hz: float,
+        cno_db_hz: float,
+        source_index: int,
+    ) -> dict[str, object]:
+        nonlocal fake_calls
+        del entry, prn, doppler_hz, cno_db_hz
+        fake_calls += 1
+        assert satellite == expected_satellite
+        assert source_index == 0
+        if new_epoch:
+            # Reconciliation runs before correlation.  Any object from an
+            # earlier ownership epoch must already be gone, including when
+            # the same PRN has returned to the same source.
+            assert satellite not in monitor._aggregates
+            assert satellite not in monitor._last_counter
+            assert satellite not in monitor.desired_vectors_snapshot()
+        else:
+            aggregate = monitor._aggregates.get(satellite)
+            if aggregate is not None:
+                assert aggregate["epoch"] == expected_epoch
+        monitor._aggregates[satellite] = {  # type: ignore[assignment]
+            "epoch": expected_epoch,
+            "source_index": source_index,
+        }
+        with monitor._vectors_lock:
+            monitor._latest_vectors[satellite] = {
+                "desired_spatial_vector": np.full(
+                    (4,), complex(expected_epoch, 0.0), dtype=np.complex128
+                ),
+                "updated_monotonic": float(expected_epoch),
+                "tracking_sample_counter": counter,
+                "test_epoch": expected_epoch,
+            }
+        return {"event": "test_tracking_measurement"}
+
+    monitor._correlate = publish_epoch_marker  # type: ignore[method-assign]
+    counter = 1
+    for _ in range(2_000):
+        event = int(rng.integers(0, 5))
+        if event == 0:
+            # Complete snapshot gap.
+            current_snapshot = {"tracking_monitor": [], "prns": []}
+            expected_satellite = None
+        elif event == 1 and previous_satellite is not None:
+            # A stale monitor record contradicted by authoritative lost state.
+            lost_prn = int(previous_satellite[1:])
+            current_snapshot = _monitor_snapshot(
+                lost_prn, counter=counter, state="lost"
+            )
+            expected_satellite = None
+        else:
+            prn = 3 if event in {1, 2} else 4
+            # Exercise normal increments, exact duplicates, and counter resets.
+            counter = (
+                int(rng.integers(1, 8))
+                if int(rng.integers(0, 4)) == 0
+                else counter + int(rng.integers(0, 5))
+            )
+            current_snapshot = _monitor_snapshot(prn, counter=counter)
+            expected_satellite = f"G{prn:02d}"
+
+        new_epoch = bool(
+            expected_satellite is not None
+            and (
+                expected_satellite != previous_satellite
+                or (
+                    previous_counter is not None
+                    and counter < previous_counter
+                )
+            )
+        )
+        if new_epoch:
+            expected_epoch += 1
+            if (
+                expected_satellite == previous_satellite
+                and previous_counter is not None
+                and counter < previous_counter
+            ):
+                counter_reset_epochs += 1
+        monitor._measure_tracking()
+
+        expected_mapping = (
+            {0: expected_satellite}
+            if expected_satellite is not None
+            else {}
+        )
+        assert monitor._source_satellites == expected_mapping
+        expected_keys = (
+            {expected_satellite}
+            if expected_satellite is not None
+            else set()
+        )
+        assert set(monitor._aggregates) == expected_keys
+        assert set(monitor._last_counter) == expected_keys
+        assert set(monitor.desired_vectors_snapshot()) == expected_keys
+        if expected_satellite is not None:
+            assert (
+                monitor._aggregates[expected_satellite]["epoch"]
+                == expected_epoch
+            )
+            assert (
+                monitor.desired_vectors_snapshot()[expected_satellite][
+                    "test_epoch"
+                ]
+                == expected_epoch
+            )
+        previous_satellite = expected_satellite
+        previous_counter = counter if expected_satellite is not None else None
+
+    assert fake_calls > 500
+    assert counter_reset_epochs > 50
 
 
 def test_per_prn_module_contains_independent_covariance_solver() -> None:
