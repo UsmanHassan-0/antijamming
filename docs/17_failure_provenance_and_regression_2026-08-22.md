@@ -299,6 +299,13 @@ that unrelated stale expectation prevents claiming the entire Tramiq suite is
 green.  No exact historical crash frame exists, so the hardened branch still
 requires repeated live Stop/Exit and failure-path testing.
 
+Commit `d7d549b` adds two native sanitizer regression executables.  A 64 KiB
+input to exported `sdr_parse_nums()` now truncates safely to its 1024-byte local
+buffer, respects `SDR_MAX_NPRN`, and accepts a null input.  A maximum-satellite
+RTKLIB case surrounds the 4096-byte NMEA destination with a checked guard and
+measured RMC/GGA/GSA/GSV sizes of 81/92/386/2907 bytes.  Both tests pass under
+ASan and UBSan against the isolated native libraries.
+
 Regression criterion:
 
 1. Preserve current binaries and hashes, then make a separate debug-symbol and
@@ -316,6 +323,6 @@ Regression criterion:
   `fifo-resilience-experimental-20260822` at commits `d7cfdd8` and `ec5a5e9`;
   per-PRN beamforming work remains a separate experimental concern.
 - Keep the dirty deployed TramiqSDR tree unchanged.  Reliability work is
-  isolated on `reliability-experimental-20260822` at commits `3d552b3` and
-  `df995e2`.
+  isolated on `reliability-experimental-20260822` at commits `3d552b3`,
+  `df995e2`, and `d7d549b`.
 - Never call a fault fixed from a single non-reproduction.
