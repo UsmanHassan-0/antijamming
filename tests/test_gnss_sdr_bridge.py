@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 import queue
+import threading
 import time
 
 import numpy as np
@@ -2026,6 +2027,22 @@ class _FakeBridge:
         self.stop_reasons.append(reason)
 
 
+class _BlockingWriteBridge(_FakeBridge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_started = threading.Event()
+        self.release_first_write = threading.Event()
+        self.writes: list[np.ndarray] = []
+
+    def write(self, samples: np.ndarray) -> bool:
+        self.writes.append(np.array(samples, copy=True))
+        if len(self.writes) == 1:
+            self.write_started.set()
+            if not self.release_first_write.wait(timeout=2.0):
+                raise RuntimeError("test timed out waiting to release FIFO write")
+        return True
+
+
 class _FakeOverflowDevice:
     def __init__(self, channels: int) -> None:
         self.channels = channels
@@ -2199,6 +2216,7 @@ def test_backend_gnss_exception_path_pauses_handoff_only() -> None:
     assert bridge.stop_reasons == ["GNSS pipeline failed: fifo disconnected"]
     assert runtime._gnss_bridge is None
     assert runtime._gnss_raw_queue is None
+    assert runtime._gnss_output_queue is None
     assert runtime._running is True
     assert device.stopped is False
     assert failures == []
@@ -2311,3 +2329,50 @@ def test_backend_queues_contiguous_gnss_chunk_without_copy() -> None:
 
     assert raw_q.get_nowait() is chunk
     assert runtime._gnss_raw_drops == 0
+
+
+def test_backend_overlaps_beamforming_with_blocking_fifo_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = StreamConfig(gnss_shared_u1_phase_compensation_enabled=False)
+    runtime = BackendRuntime(cfg, _runtime_loggers())
+    bridge = _BlockingWriteBridge()
+    raw_q: queue.Queue = queue.Queue(maxsize=4)
+    output_q: queue.Queue = queue.Queue(maxsize=4)
+    runtime._gnss_bridge = bridge  # type: ignore[assignment]
+    runtime._gnss_raw_queue = raw_q
+    runtime._gnss_output_queue = output_q
+    runtime._running = True
+    monkeypatch.setattr(runtime, "_gnss_output_vector", lambda chunk: chunk[0])
+    monkeypatch.setattr(
+        runtime,
+        "_get_gnss_monitor_logical_weights_copy",
+        lambda: np.ones((1, len(cfg.channels)), dtype=np.complex128),
+    )
+
+    fifo_thread = threading.Thread(target=runtime._gnss_fifo_write_loop)
+    beamform_thread = threading.Thread(target=runtime._gnss_beamform_loop)
+    fifo_thread.start()
+    beamform_thread.start()
+    first = np.ones((len(cfg.channels), 8), dtype=np.complex64)
+    second = np.full((len(cfg.channels), 8), 2.0, dtype=np.complex64)
+    raw_q.put(first)
+    assert bridge.write_started.wait(timeout=1.0)
+    raw_q.put(second)
+
+    deadline = time.monotonic() + 1.0
+    while output_q.qsize() < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert raw_q.empty()
+    assert output_q.qsize() == 1
+
+    raw_q.put(None)
+    beamform_thread.join(timeout=1.0)
+    assert not beamform_thread.is_alive()
+    bridge.release_first_write.set()
+    assert runtime._put_shutdown_sentinel(output_q, timeout_s=1.0)
+    fifo_thread.join(timeout=1.0)
+    assert not fifo_thread.is_alive()
+    assert len(bridge.writes) == 2
+    np.testing.assert_array_equal(bridge.writes[0], first[0])
+    np.testing.assert_array_equal(bridge.writes[1], second[0])

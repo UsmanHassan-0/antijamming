@@ -2057,11 +2057,7 @@ class MainWindow(QMainWindow):
         configured = self._source_count_metric(metrics, "n_sources")
         if configured is None:
             configured = self._cfg.expected_sources
-        peak_count = self._source_count_metric(metrics, "peak_count")
-        return (
-            f"set {self._format_source_count_estimate(configured)} | "
-            f"peak-count {self._format_source_count_estimate(peak_count)}"
-        )
+        return f"set {self._format_source_count_estimate(configured)}"
 
     def _refresh_source_count_status(self, metrics: dict | None) -> None:
         value = self._source_count_display_text(metrics)
@@ -2101,13 +2097,13 @@ class MainWindow(QMainWindow):
         spatial = status.get("spatial_vector_diagnostics", {})
         if not isinstance(spatial, dict):
             spatial = {}
-        jammer_latched = bool(
+        jammer_active = bool(
             status.get(
-                "lcmv_jammer_detected_latched",
-                spatial.get("lcmv_jammer_detected_latched", False),
+                "lcmv_jammer_protection_active",
+                spatial.get("lcmv_jammer_protection_active", False),
             )
         )
-        armed = bool(spatial.get("lcmv_jammer_activation_armed", False)) and not jammer_latched
+        armed = bool(spatial.get("lcmv_jammer_activation_armed", False)) and not jammer_active
         preserve_mode = str(
             getattr(self._cfg, "lcmv_preserve_constraint_mode", "uniform")
         ).strip().lower()

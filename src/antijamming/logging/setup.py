@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import time
 
 
@@ -134,6 +136,121 @@ def _timestamp_pair() -> tuple[str, str, int]:
 
 def _session_manifest_path(session: RuntimeLogSession) -> Path:
     return session.session_dir / "session_manifest.json"
+
+
+def _git_output(repo_root: Path, *args: str) -> bytes | None:
+    try:
+        result = subprocess.run(
+            ("git", *args),
+            cwd=repo_root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _source_tree_provenance() -> dict[str, object]:
+    """Fingerprint the exact committed, tracked-dirty, and untracked source."""
+
+    repo_root = Path(__file__).resolve().parents[3]
+    head = _git_output(repo_root, "rev-parse", "HEAD")
+    status = _git_output(
+        repo_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    tracked_diff = _git_output(repo_root, "diff", "--binary", "HEAD", "--")
+    cached_diff = _git_output(repo_root, "diff", "--binary", "--cached", "--")
+    untracked = _git_output(
+        repo_root,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "repository_root": str(repo_root),
+        "git_available": head is not None,
+        "git_head": (
+            head.decode("ascii", errors="replace").strip()
+            if head is not None
+            else None
+        ),
+        "git_status_porcelain_v1": (
+            status.decode(errors="surrogateescape").replace("\0", "\n").rstrip()
+            if status is not None
+            else None
+        ),
+        "git_status_sha256": (
+            hashlib.sha256(status).hexdigest() if status is not None else None
+        ),
+        "git_tracked_diff_sha256": (
+            hashlib.sha256(tracked_diff).hexdigest()
+            if tracked_diff is not None
+            else None
+        ),
+        "git_tracked_diff_bytes": (
+            len(tracked_diff) if tracked_diff is not None else None
+        ),
+        "git_cached_diff_sha256": (
+            hashlib.sha256(cached_diff).hexdigest()
+            if cached_diff is not None
+            else None
+        ),
+        "git_cached_diff_bytes": (
+            len(cached_diff) if cached_diff is not None else None
+        ),
+    }
+    untracked_files: list[dict[str, object]] = []
+    for encoded in (untracked or b"").split(b"\0"):
+        if not encoded:
+            continue
+        relative = os.fsdecode(encoded)
+        candidate = repo_root / relative
+        record: dict[str, object] = {"path": relative}
+        try:
+            if candidate.is_symlink():
+                target = os.readlink(candidate)
+                target_bytes = os.fsencode(target)
+                record.update(
+                    {
+                        "type": "symlink",
+                        "target": target,
+                        "bytes": len(target_bytes),
+                        "sha256": hashlib.sha256(target_bytes).hexdigest(),
+                    }
+                )
+            elif candidate.is_file():
+                record.update(
+                    {
+                        "type": "file",
+                        "bytes": candidate.stat().st_size,
+                        "sha256": _sha256_file(candidate),
+                    }
+                )
+            else:
+                record["type"] = "missing_or_non_regular"
+        except OSError as exc:
+            record.update({"type": "unreadable", "error": str(exc)})
+        untracked_files.append(record)
+    payload["untracked_files"] = untracked_files
+    return payload
 
 
 def _write_manifest(session: RuntimeLogSession, **updates: object) -> None:
@@ -346,7 +463,12 @@ def reset_session_logs(
         started_wall_time_ns=started_wall_time_ns,
         started_monotonic_ns=time.monotonic_ns(),
     )
-    _write_manifest(session, outcome="running", finalized=False)
+    _write_manifest(
+        session,
+        outcome="running",
+        finalized=False,
+        source_provenance=_source_tree_provenance(),
+    )
     (log_dir / CURRENT_SESSION_FILE).write_text(
         str(session_dir) + "\n",
         encoding="utf-8",

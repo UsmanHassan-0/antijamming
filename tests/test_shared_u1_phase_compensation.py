@@ -4,10 +4,12 @@ import logging
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from antijamming.config import StreamConfig
 from antijamming.gnss import (
     GnssSdrBridge,
+    PerPrnMeasuredVectorBeamformerBank,
     SharedU1DesiredVectorMonitor,
     SharedU1PhaseCompensationBank,
     apply_shared_phase_fanout,
@@ -16,6 +18,11 @@ from antijamming.gnss.shared_u1_phase_compensation import (
     gps_l1_ca_code,
     phase_invariant_coherence,
 )
+from antijamming.gnss.sdr_bridge.constants import (
+    gnss_input_filter_group_delay_samples,
+    gnss_input_filter_tap_count,
+)
+from antijamming.gnss.sdr_bridge.fifo import PER_SOURCE_FIFO_STRIPE_SAMPLES
 from antijamming.logging import setup_logging
 from antijamming.runtime.backend import BackendRuntime
 
@@ -27,7 +34,7 @@ def _loggers() -> dict[str, logging.Logger]:
     }
 
 
-def test_shared_u1_phase_rows_preserve_each_prn_response_and_one_null() -> None:
+def test_shared_u1_phase_rows_preserve_full_complex_response() -> None:
     common = np.ones((4,), dtype=np.complex128)
     # One shared spatial solution with a null toward [1,1,1,1].
     shared = np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.complex128)
@@ -79,18 +86,20 @@ def test_shared_u1_phase_rows_preserve_each_prn_response_and_one_null() -> None:
         # Only one scalar may differ from the shared solution.
         ratios = row / shared
         assert np.allclose(ratios, ratios[0], rtol=1e-12, atol=1e-12)
-        # That scalar preserves the complete old complex response.
-        assert np.allclose(
-            np.vdot(row, desired),
-            np.vdot(before[row_index], desired),
-            rtol=1e-12,
-            atol=1e-12,
+        old_response = np.vdot(before[row_index], desired)
+        applied_response = np.vdot(row, desired)
+        assert applied_response == pytest.approx(old_response, abs=1e-12)
+        exact_scale = np.conj(old_response / np.vdot(shared, desired))
+        assert np.linalg.norm(row) == pytest.approx(
+            abs(exact_scale) * np.linalg.norm(shared)
         )
         # A scalar cannot move or fill the shared spatial null.
         assert abs(np.vdot(row, jammer)) < 1e-12
         assert status[satellite]["phase_compensation_applied"] is True
         assert status[satellite]["independent_per_prn_lcmv"] is False
-        assert status[satellite]["continuity_residual_abs"] < 1e-12
+        assert status[satellite]["amplitude_compensation_db"] == pytest.approx(
+            20.0 * np.log10(abs(exact_scale))
+        )
 
 
 def test_shared_u1_phase_renderer_pins_each_prn_to_one_synchronized_fifo(
@@ -112,6 +121,37 @@ def test_shared_u1_phase_renderer_pins_each_prn_to_one_synchronized_fifo(
         assert f"gnss_iq_G{prn:02d}.fifo" in rendered
         assert f"Channel{index}.satellite={prn}" in rendered
         assert f"Channel{index}.RF_channel_ID={index}" in rendered
+
+
+def test_ten_source_fifo_fanout_writes_one_full_chunk_per_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    satellites = tuple(range(1, 11))
+    cfg = StreamConfig(
+        gnss_shared_u1_phase_compensation_enabled=True,
+        gnss_shared_u1_phase_satellites=satellites,
+        samples_per_chunk=32_768,
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+    bridge._fifo_fds = list(range(len(satellites)))
+    calls: list[tuple[int, int]] = []
+
+    def fake_write(fd: int, payload: memoryview) -> int:
+        calls.append((fd, len(payload)))
+        return len(payload)
+
+    monkeypatch.setattr(
+        "antijamming.gnss.sdr_bridge.bridge.os.write",
+        fake_write,
+    )
+    samples = np.zeros((len(satellites), 32_768), dtype=np.complex64)
+
+    assert bridge.write(samples) is True
+    chunk_bytes = samples.shape[1] * np.dtype(np.complex64).itemsize
+    assert PER_SOURCE_FIFO_STRIPE_SAMPLES == samples.shape[1]
+    assert calls == [(index, chunk_bytes) for index in range(len(satellites))]
+    assert bridge._fifo_max_source_lead_bytes == chunk_bytes
+    assert bridge._write_bytes == len(satellites) * chunk_bytes
 
 
 def test_shared_u1_phase_renderer_uses_dynamic_channel_slots_without_pinned_prns(
@@ -194,13 +234,54 @@ def test_dynamic_source_reassignment_discards_old_prn_phase_state() -> None:
     )
 
     assert not np.allclose(old_rows[0], common)
-    assert np.allclose(reassigned_rows[0], common)
+    assert np.allclose(reassigned_rows[0], shared)
     assert status["G10"]["source_index"] == 0
     assert status["G10"]["desired_vector_available"] is False
+    assert status["G10"]["source"] == "shared_measured_u1_acquisition_new_prn"
     assert "G03" not in status
 
 
-def test_phase_compensation_above_six_db_is_allowed_when_weight_norm_is_safe() -> None:
+def test_unmapped_and_new_prn_sources_use_shared_protection_during_jamming() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    shared = np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.complex128)
+    bank = SharedU1PhaseCompensationBank(
+        satellites=(),
+        source_count=2,
+        channel_count=4,
+        sample_rate_hz=4_000_000.0,
+        samples_per_chunk=20_000,
+        transition_s=1.0,
+    )
+
+    waiting, _ = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors={},
+        source_satellites=(10, None),
+        enabled_now=True,
+        now_monotonic=10.0,
+    )
+    protected, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors={},
+        source_satellites=(10, None),
+        enabled_now=True,
+        now_monotonic=10.01,
+    )
+
+    assert np.allclose(waiting, np.vstack((common, common)))
+    assert np.allclose(protected, np.vstack((shared, shared)))
+    assert status["G10"]["source"] == "shared_measured_u1_acquisition_new_prn"
+    assert status["source_01"]["source"] == (
+        "shared_measured_u1_acquisition_waiting_for_channel_prn"
+    )
+    assert status["source_01"]["shared_protection_bridge_applied"] is True
+
+
+def test_large_exact_gain_request_preserves_complex_response_when_norm_is_safe() -> None:
     common = np.ones((4,), dtype=np.complex128)
     shared = np.asarray([0.45, 0.0, 0.0, 0.0], dtype=np.complex128)
     desired = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)
@@ -237,21 +318,21 @@ def test_phase_compensation_above_six_db_is_allowed_when_weight_norm_is_safe() -
         now_monotonic=10.01,
     )
 
-    assert status["G04"]["amplitude_compensation_db"] > 6.0
+    assert status["G04"]["requested_exact_amplitude_compensation_db"] > 6.0
+    assert status["G04"]["amplitude_compensation_db"] == pytest.approx(
+        status["G04"]["requested_exact_amplitude_compensation_db"]
+    )
     assert status["G04"]["phase_compensation_applied"] is True
     assert status["G04"]["phase_compensation_guard_reason"] is None
-    assert np.linalg.norm(applied[0]) < 8.0
-    assert np.allclose(
-        np.vdot(applied[0], desired),
-        np.vdot(before[0], desired),
-        rtol=1e-12,
-        atol=1e-12,
+    assert np.linalg.norm(applied[0]) == pytest.approx(1.0)
+    assert np.vdot(applied[0], desired) == pytest.approx(
+        np.vdot(before[0], desired), abs=1e-12
     )
 
 
 def test_phase_compensation_still_rejects_unsafe_weight_norm() -> None:
     common = np.ones((4,), dtype=np.complex128)
-    shared = np.asarray([0.01, 1.0, 1.0, 1.0], dtype=np.complex128)
+    shared = np.asarray([1.0, 10.0, 10.0, 10.0], dtype=np.complex128)
     desired = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)
     vectors = {
         "G04": {
@@ -303,10 +384,10 @@ def test_shared_u1_phase_runtime_labels_transport_and_actual_fifo_state(
     runtime = BackendRuntime(cfg, setup_logging(tmp_path))
 
     assert runtime._gnss_handoff_mode_label() == (
-        "shared_prn_phase_continuity_fanout"
+        "independent_per_prn_measured_vector_fanout"
     )
     assert runtime._fifo_output_source_label() == (
-        "shared_uniform_phase_reference_prn_fanout"
+        "independent_per_prn_measured_vector_fanout"
     )
 
 
@@ -356,12 +437,10 @@ def test_shared_u1_phase_waits_for_covariance_worker_without_missing_onset() -> 
     assert np.allclose(waiting[0], common)
     assert waiting_status["G03"]["shared_measured_u1_available"] is False
     assert applied_status["G03"]["phase_compensation_applied"] is True
-    assert np.allclose(
-        np.vdot(applied[0], desired),
-        np.vdot(waiting[0], desired),
-        rtol=1e-12,
-        atol=1e-12,
-    )
+    assert np.angle(
+        np.vdot(applied[0], desired) * np.conj(np.vdot(waiting[0], desired))
+    ) == pytest.approx(0.0, abs=1e-12)
+    assert np.linalg.norm(applied[0]) == pytest.approx(np.linalg.norm(shared))
 
 
 def test_prn_monitor_recovers_calibrated_spatial_iq_from_one_code_period(
@@ -418,6 +497,98 @@ def test_prn_monitor_recovers_calibrated_spatial_iq_from_one_code_period(
     ) > 1.0 - 1e-12
 
 
+def test_prn_monitor_compensates_post_fir_tracking_counter_delay(
+    tmp_path: Path,
+) -> None:
+    """Tracking counters after the FIR must address the matching pre-FIR IQ."""
+
+    fs = 4_000_000.0
+    delay = gnss_input_filter_group_delay_samples(fs)
+    assert gnss_input_filter_tap_count(fs) == 55
+    assert delay == 27
+
+    prn = 3
+    code = gps_l1_ca_code(prn)
+    code_rate_hz = 1_023_000.0
+    length = 4_000
+    chips = np.floor(
+        np.arange(length, dtype=np.float64) * code_rate_hz / fs
+    ).astype(np.int64) % code.size
+    replica = code[chips].astype(np.complex64)
+    spatial = np.asarray([1.0, 0.6 + 0.4j, -0.3 + 0.8j, 0.7 - 0.2j])
+    rng = np.random.default_rng(220826)
+    raw = (
+        2.0
+        / np.sqrt(2.0)
+        * (
+            rng.standard_normal((4, length + 70))
+            + 1j * rng.standard_normal((4, length + 70))
+        )
+    ).astype(np.complex64)
+    raw[:, 5 : 5 + length] += spatial[:, None] * replica[None, :]
+    raw_span_start = 100_000 - 5
+    raw_code_end_counter = 100_000 + length
+    tracking_counter = raw_code_end_counter + delay
+
+    aligned = SharedU1DesiredVectorMonitor(
+        sample_rate_hz=fs,
+        frontend_group_delay_samples=delay,
+        channel_count=4,
+        phase_correction_vector=None,
+        tracking_snapshot=lambda: {},
+        session_dir=tmp_path / "aligned",
+        session_id="aligned",
+        logger=logging.getLogger("test.shared_u1_phase.fir_aligned"),
+        satellites=(prn,),
+        min_quality_measurements=1,
+    )
+    aligned._append_span(
+        raw_span_start,
+        raw,
+        np.ones((1, 4), dtype=np.complex128),
+    )
+    aligned_measurement = aligned._correlate(
+        {}, "G03", prn, tracking_counter, 0.0, 45.0, 0
+    )
+
+    uncorrected = SharedU1DesiredVectorMonitor(
+        sample_rate_hz=fs,
+        channel_count=4,
+        phase_correction_vector=None,
+        tracking_snapshot=lambda: {},
+        session_dir=tmp_path / "uncorrected",
+        session_id="uncorrected",
+        logger=logging.getLogger("test.shared_u1_phase.fir_uncorrected"),
+        satellites=(prn,),
+        min_quality_measurements=1,
+    )
+    uncorrected._append_span(
+        raw_span_start,
+        raw,
+        np.ones((1, 4), dtype=np.complex128),
+    )
+    uncorrected_measurement = uncorrected._correlate(
+        {}, "G03", prn, tracking_counter, 0.0, 45.0, 0
+    )
+
+    assert aligned_measurement is not None
+    assert aligned_measurement["quality_pass"] is True
+    assert aligned_measurement["tracking_sample_counter"] == tracking_counter
+    assert aligned_measurement["raw_sample_counter"] == raw_code_end_counter
+    recovered = aligned.desired_vectors_snapshot()["G03"]
+    assert phase_invariant_coherence(
+        recovered["desired_spatial_vector"], spatial
+    ) > 0.998
+    # The former scalar wrong-code gate can falsely pass even at the wrong
+    # epoch.  Its recovered spatial vector is nevertheless noise dominated.
+    assert uncorrected_measurement is not None
+    assert uncorrected_measurement["quality_pass"] is True
+    uncorrected_vector = uncorrected.desired_vectors_snapshot()["G03"]
+    assert phase_invariant_coherence(
+        uncorrected_vector["desired_spatial_vector"], spatial
+    ) < 0.85
+
+
 def test_shared_u1_phase_rephases_every_later_covariance_update() -> None:
     common = np.ones((4,), dtype=np.complex128)
     first = np.asarray([0.8 + 0.1j, 0.2 - 0.3j, 1.1 + 0.2j, 0.5 + 0.4j])
@@ -464,18 +635,17 @@ def test_shared_u1_phase_rephases_every_later_covariance_update() -> None:
     )
 
     assert not np.allclose(first_rows, second_rows)
-    np.testing.assert_allclose(
-        np.vdot(second_rows[0], desired),
-        np.vdot(baseline[0], desired),
-        rtol=1e-12,
-        atol=1e-12,
+    assert np.vdot(second_rows[0], desired) == pytest.approx(
+        np.vdot(baseline[0], desired), abs=1e-12
     )
     ratios = second_rows[0] / second
     assert np.allclose(ratios, ratios[0], rtol=1e-12, atol=1e-12)
-    assert status["G05"]["continuity_residual_abs"] < 1e-12
+    assert status["G05"]["amplitude_compensation_db"] == pytest.approx(
+        20.0 * np.log10(abs(ratios[0]))
+    )
 
 
-def test_jammer_off_ramp_preserves_complex_response_at_every_chunk() -> None:
+def test_jammer_off_ramp_preserves_response_phase_at_every_chunk() -> None:
     common = np.ones((4,), dtype=np.complex128)
     shared = np.asarray([0.8 + 0.1j, 0.2 - 0.3j, 1.1 + 0.2j, 0.5 + 0.4j])
     desired = np.asarray([1.0, 0.8 + 0.1j, 0.5 - 0.2j, 0.4 + 0.3j])
@@ -526,16 +696,17 @@ def test_jammer_off_ramp_preserves_complex_response_at_every_chunk() -> None:
             now_monotonic=21.0 + chunk_index / 10.0,
         )
         ramp_rows.append(np.array(rows[0], copy=True))
-        np.testing.assert_allclose(
-            np.vdot(rows[0], desired),
-            preserved_response,
-            rtol=1e-12,
-            atol=1e-12,
-        )
+        assert np.angle(
+            np.vdot(rows[0], desired) * np.conj(preserved_response)
+        ) == pytest.approx(0.0, abs=1e-12)
         assert status["G05"]["independent_per_prn_lcmv"] is False
 
     assert not np.allclose(ramp_rows[0], ramp_rows[-1])
-    np.testing.assert_allclose(ramp_rows[-1], baseline[0], rtol=1e-12, atol=1e-12)
+    final_response = np.vdot(ramp_rows[-1], desired)
+    assert abs(final_response) == pytest.approx(abs(np.vdot(baseline[0], desired)))
+    ratios = ramp_rows[-1] / common
+    assert np.allclose(ratios, ratios[0], rtol=1e-12, atol=1e-12)
+    assert abs(ratios[0]) == pytest.approx(1.0)
 
 
 def test_shared_u1_phase_can_skip_per_chunk_status_allocation() -> None:
@@ -604,10 +775,462 @@ def test_noncollinear_transition_rows_use_general_matrix() -> None:
     np.testing.assert_array_equal(actual, expected)
 
 
-def test_shared_u1_phase_module_has_no_independent_covariance_solver() -> None:
+def test_per_prn_bank_uses_distinct_measured_rows_without_jammer() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    desired_3 = np.asarray([1.0, 0.8j, -0.4, 0.2 - 0.1j])
+    desired_4 = np.asarray([0.3j, 1.0, 0.6 - 0.2j, -0.7])
+    desired_3 /= np.linalg.norm(desired_3)
+    desired_4 /= np.linalg.norm(desired_4)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(3, 4),
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+    vectors = {
+        "G03": {
+            "desired_spatial_vector": desired_3,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 100,
+        },
+        "G04": {
+            "desired_spatial_vector": desired_4,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 200,
+        },
+    }
+
+    rows, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors=vectors,
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+
+    assert not np.allclose(rows[0], rows[1])
+    assert np.vdot(rows[0], desired_3) == pytest.approx(
+        np.vdot(common, desired_3), abs=1e-12
+    )
+    assert np.vdot(rows[1], desired_4) == pytest.approx(
+        np.vdot(common, desired_4), abs=1e-12
+    )
+    assert status["G03"]["independent_per_prn_beamforming"] is True
+    assert status["G04"]["independent_per_prn_beamforming"] is True
+    assert status["G03"]["desired_vector_frozen"] is False
+
+
+def test_per_prn_bank_lcmv_nulls_jammer_and_preserves_each_prn() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    desired_3 = np.asarray([1.0, 0.7j, -0.3, 0.4 - 0.2j])
+    desired_4 = np.asarray([0.2j, 1.0, 0.5 - 0.3j, -0.6])
+    jammer = np.asarray([1.0, -0.5j, 0.2 + 0.7j, -0.8])
+    desired_3 /= np.linalg.norm(desired_3)
+    desired_4 /= np.linalg.norm(desired_4)
+    jammer /= np.linalg.norm(jammer)
+    covariance = (
+        25.0 * np.outer(jammer, np.conj(jammer))
+        + np.eye(4, dtype=np.complex128)
+    )
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(3, 4),
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+    vectors = {
+        "G03": {
+            "desired_spatial_vector": desired_3,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 100,
+        },
+        "G04": {
+            "desired_spatial_vector": desired_4,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 200,
+        },
+    }
+    before, _ = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors=vectors,
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    protected, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=np.asarray([1.0, -1.0, 1.0, -1.0]),
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=10.1,
+    )
+
+    assert not np.allclose(protected[0], protected[1])
+    for index, (satellite, desired) in enumerate(
+        (("G03", desired_3), ("G04", desired_4))
+    ):
+        assert np.vdot(protected[index], desired) == pytest.approx(
+            np.vdot(before[index], desired), abs=1e-10
+        )
+        assert abs(np.vdot(protected[index], jammer)) < 1e-10
+        assert status[satellite]["independent_per_prn_lcmv"] is True
+        assert status[satellite]["continuity_residual_abs"] < 1e-10
+
+
+def test_per_prn_bank_adopts_a_new_prn_during_jamming() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    shared = np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.complex128)
+    jammer = np.asarray([1.0, -0.5j, 0.2 + 0.7j, -0.8])
+    jammer /= np.linalg.norm(jammer)
+    covariance = 20.0 * np.outer(jammer, np.conj(jammer)) + np.eye(4)
+    desired = np.asarray([0.3j, 1.0, 0.5 - 0.3j, -0.6])
+    desired /= np.linalg.norm(desired)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(),
+        source_count=1,
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+    waiting, _ = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors={},
+        source_satellites=(4,),
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=10.0,
+    )
+    adopted, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors={
+            "G04": {
+                "desired_spatial_vector": desired,
+                "updated_monotonic": 11.0,
+                "tracking_sample_counter": 500,
+            }
+        },
+        source_satellites=(4,),
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=11.0,
+    )
+
+    np.testing.assert_allclose(waiting[0], shared)
+    assert not np.allclose(adopted[0], shared)
+    assert abs(np.vdot(adopted[0], jammer)) < 1e-10
+    assert status["G04"]["independent_per_prn_lcmv"] is True
+
+
+def test_per_prn_bank_tracks_a_changed_desired_vector_without_response_jump() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    first = np.asarray([1.0, 0.7j, -0.3, 0.4 - 0.2j])
+    second = np.asarray([0.8 + 0.1j, 0.5j, -0.5, 0.6 - 0.1j])
+    first /= np.linalg.norm(first)
+    second /= np.linalg.norm(second)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(3,),
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+    initial, _ = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": first,
+                "updated_monotonic": 10.0,
+                "tracking_sample_counter": 100,
+            }
+        },
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    response_immediately_before_update = np.vdot(initial[0], second)
+    updated, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": second,
+                "updated_monotonic": 11.0,
+                "tracking_sample_counter": 200,
+            }
+        },
+        enabled_now=False,
+        now_monotonic=11.0,
+    )
+
+    assert np.vdot(updated[0], second) == pytest.approx(
+        response_immediately_before_update, abs=1e-12
+    )
+    assert status["G03"]["desired_vector_frozen"] is False
+    assert status["G03"]["tracking_sample_counter"] == 200
+
+
+def test_per_prn_bank_freezes_pre_jammer_vector_until_release() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    before_vector = np.asarray([1.0, 0.7j, -0.3, 0.4 - 0.2j])
+    contaminated_vector = np.asarray([0.2j, 1.0, 0.5 - 0.3j, -0.6])
+    jammer = np.asarray([1.0, -0.5j, 0.2 + 0.7j, -0.8])
+    before_vector /= np.linalg.norm(before_vector)
+    contaminated_vector /= np.linalg.norm(contaminated_vector)
+    jammer /= np.linalg.norm(jammer)
+    covariance = 20.0 * np.outer(jammer, np.conj(jammer)) + np.eye(4)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(3,),
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": before_vector,
+                "updated_monotonic": 10.0,
+                "tracking_sample_counter": 100,
+            }
+        },
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=True,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": before_vector,
+                "updated_monotonic": 10.0,
+                "tracking_sample_counter": 100,
+            }
+        },
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=10.1,
+    )
+    protected, active_status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=True,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": contaminated_vector,
+                "updated_monotonic": 11.0,
+                "tracking_sample_counter": 200,
+            }
+        },
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=11.0,
+    )
+
+    frozen = np.asarray(
+        active_status["G03"]["desired_spatial_vector"]["real"]
+    ) + 1j * np.asarray(
+        active_status["G03"]["desired_spatial_vector"]["imag"]
+    )
+    assert active_status["G03"]["desired_vector_frozen"] is True
+    assert active_status["G03"]["tracking_sample_counter"] == 100
+    assert phase_invariant_coherence(frozen, before_vector) > 1.0 - 1e-12
+    assert abs(np.vdot(protected[0], jammer)) < 1e-10
+
+    _, released_status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": contaminated_vector,
+                "updated_monotonic": 12.0,
+                "tracking_sample_counter": 200,
+            }
+        },
+        enabled_now=False,
+        now_monotonic=12.0,
+    )
+    assert released_status["G03"]["desired_vector_frozen"] is False
+    assert released_status["G03"]["tracking_sample_counter"] == 200
+
+
+def test_per_prn_jammer_transition_is_not_restarted_by_context_updates() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    desired = np.asarray([1.0, 0.7j, -0.3, 0.4 - 0.2j])
+    jammer = np.asarray([1.0, -0.5j, 0.2 + 0.7j, -0.8])
+    desired /= np.linalg.norm(desired)
+    jammer /= np.linalg.norm(jammer)
+    covariance = 20.0 * np.outer(jammer, np.conj(jammer)) + np.eye(4)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(3,),
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=1.0,
+    )
+    vectors = {
+        "G03": {
+            "desired_spatial_vector": desired,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 100,
+        }
+    }
+    baseline, _ = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors=vectors,
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    preserved_response = np.vdot(baseline[0], desired)
+
+    progresses = []
+    rows = baseline
+    for index in range(10):
+        shared = np.asarray(
+            [1.0, -1.0 + 0.001j * index, 1.0, -1.0],
+            dtype=np.complex128,
+        )
+        rows, status = bank.advance(
+            shared_common_weights=common,
+            shared_measured_u1_weights=shared,
+            shared_measured_u1_available=True,
+            desired_vectors=vectors,
+            enabled_now=True,
+            covariance=covariance,
+            jammer_vector=jammer,
+            now_monotonic=10.1 + index / 10.0,
+        )
+        progresses.append(status["G03"]["transition_progress"])
+        assert np.vdot(rows[0], desired) == pytest.approx(
+            preserved_response, abs=1e-10
+        )
+
+    assert progresses == pytest.approx([index / 10.0 for index in range(1, 11)])
+    assert abs(np.vdot(rows[0], jammer)) < 1e-10
+
+
+def test_per_prn_onset_bridge_preserves_full_complex_response() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    desired = np.asarray([1.0, 0.5j, 0.3, -0.2j], dtype=np.complex128)
+    desired /= np.linalg.norm(desired)
+    shared = np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.complex128)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(3,),
+        channel_count=4,
+        sample_rate_hz=4_000_000.0,
+        samples_per_chunk=32_768,
+        transition_s=0.0,
+    )
+    vectors = {
+        "G03": {
+            "desired_spatial_vector": desired,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 100,
+        }
+    }
+    baseline, _ = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=False,
+        desired_vectors=vectors,
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    protected, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        enabled_now=True,
+        covariance=None,
+        jammer_vector=None,
+        now_monotonic=10.1,
+    )
+
+    assert status["G03"]["source"] == (
+        "per_prn_phase_continuous_shared_onset_bridge"
+    )
+    assert np.vdot(protected[0], desired) == pytest.approx(
+        np.vdot(baseline[0], desired), abs=1e-12
+    )
+    ratios = protected[0] / shared
+    assert np.allclose(ratios, ratios[0], rtol=1e-12, atol=1e-12)
+    assert status["G03"]["continuity_residual_abs"] < 1e-12
+
+
+def test_prn_monitor_rolling_window_forgets_an_old_spatial_vector(
+    tmp_path: Path,
+) -> None:
+    fs = 1_023_000.0
+    prn = 3
+    code = gps_l1_ca_code(prn).astype(np.complex64)
+    old = np.asarray([1.0, 0.8j, -0.3, 0.2 - 0.1j])
+    new = np.asarray([0.2j, 1.0, 0.6 - 0.2j, -0.7])
+    monitor = SharedU1DesiredVectorMonitor(
+        sample_rate_hz=fs,
+        channel_count=4,
+        phase_correction_vector=None,
+        tracking_snapshot=lambda: {},
+        session_dir=tmp_path,
+        session_id="rolling",
+        logger=logging.getLogger("test.shared_u1_phase.rolling"),
+        satellites=(prn,),
+        min_quality_measurements=1,
+        vector_window_measurements=4,
+    )
+
+    counter = 10_000
+    for spatial in (old, old, old, old, new, new, new, new):
+        raw = np.zeros((4, 1031), dtype=np.complex64)
+        raw[:, 5:1028] = spatial[:, None] * code[None, :]
+        monitor._append_span(
+            counter - 1028,
+            raw,
+            np.ones((1, 4), dtype=np.complex128),
+        )
+        measurement = monitor._correlate(
+            {}, "G03", prn, counter, 0.0, 45.0, 0
+        )
+        assert measurement is not None
+        assert measurement["quality_pass"] is True
+        counter += 2_000
+
+    recovered = monitor.desired_vectors_snapshot()["G03"]
+    assert recovered["quality_pass_count"] == 8
+    assert recovered["rolling_quality_measurement_count"] == 4
+    assert phase_invariant_coherence(
+        recovered["desired_spatial_vector"], new
+    ) > 1.0 - 1e-12
+
+
+def test_per_prn_module_contains_independent_covariance_solver() -> None:
     source = Path(
         "src/antijamming/gnss/shared_u1_phase_compensation.py"
     ).read_text(encoding="utf-8")
-    assert "covariance_lcmv_vector_null_weights" not in source
-    assert "per_satellite_covariance_lcmv_candidate" not in source
-    assert "independent_per_prn_lcmv\": True" not in source
+    assert "covariance_lcmv_vector_null_weights" in source
+    assert "class PerPrnMeasuredVectorBeamformerBank" in source

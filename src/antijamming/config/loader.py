@@ -58,6 +58,7 @@ _OPTIONAL_JSON_DEFAULTS: dict[str, Any] = {
     "lcmv_realtime_preserve_max_reference_age_s": 2.0,
     "lcmv_jammer_activation_min_input_power_jump_db": 3.0,
     "lcmv_jammer_activation_min_generalized_gain_db": 6.0,
+    "lcmv_jammer_release_hold_s": 2.0,
     "lcmv_weight_transition_s": 1.0,
     "lcmv_candidate_methods_enabled": True,
     "lcmv_covariance_diagonal_loading_rel": 0.001,

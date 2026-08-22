@@ -1,10 +1,14 @@
-"""Shared measured-U1 LCMV with per-PRN complex-response continuity.
+"""Measured-vector GNSS beamforming with per-PRN response continuity.
 
 Every GNSS-SDR source uses the same spatial LCMV weight vector.  A complex
 scalar is applied per tracked PRN so switching to that shared vector preserves
 the PRN's previous complex array response.  Scalar multiplication cannot move
-or weaken the shared spatial null.  This module intentionally contains no
-independent per-PRN covariance solve.
+or weaken the shared spatial null.
+
+The legacy shared-row bank remains for regression comparison.  The runtime uses
+``PerPrnMeasuredVectorBeamformerBank`` so every mapped PRN receives its own
+measured-vector spatial row.  Complex-response continuity is a constraint on
+each spatial update; it is not used as a substitute for per-PRN beamforming.
 """
 
 from __future__ import annotations
@@ -22,6 +26,10 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
+
+from antijamming.dsp.beamforming.lcmv import (
+    covariance_lcmv_vector_null_weights,
+)
 
 
 GPS_L1_HZ = 1_575_420_000.0
@@ -161,8 +169,9 @@ class _RawSpan:
 
 @dataclass(slots=True)
 class _PrnAggregate:
-    count: int
-    projector_sum: np.ndarray
+    total_count: int
+    projectors: deque[np.ndarray]
+    source_index: int
 
 
 @dataclass(slots=True)
@@ -176,6 +185,7 @@ class _PhaseState:
     completed_chunks: int = 0
     source: str = "shared_common_weights"
     scale: complex = 1.0 + 0.0j
+    requested_amplitude_compensation_db: float | None = None
     continuity_residual_abs: float | None = None
     guard_reason: str | None = None
     post_onset_vector: np.ndarray | None = None
@@ -183,8 +193,28 @@ class _PhaseState:
     last_quality_counter: int | None = None
 
 
+@dataclass(slots=True)
+class _PerPrnState:
+    satellite: str
+    current: np.ndarray
+    start: np.ndarray
+    target: np.ndarray
+    desired: np.ndarray | None = None
+    source: str = "uniform_waiting_for_prn_vector"
+    total_chunks: int = 0
+    completed_chunks: int = 0
+    last_quality_counter: int | None = None
+    desired_updated_monotonic: float | None = None
+    guard_reason: str | None = None
+    continuity_residual_abs: float | None = None
+    desired_step_deg: float | None = None
+    lcmv_null_residual_abs: float | None = None
+    lcmv_condition_number: float | None = None
+    lcmv_weight_norm: float | None = None
+
+
 class SharedU1PhaseCompensationBank:
-    """Fan out one shared LCMV null with exact per-PRN response continuity."""
+    """Fan out one shared LCMV null with complex per-PRN continuity."""
 
     def __init__(
         self,
@@ -255,7 +285,7 @@ class SharedU1PhaseCompensationBank:
         requested: np.ndarray,
         desired: np.ndarray,
     ) -> tuple[np.ndarray | None, dict[str, object]]:
-        """Preserve ``w^H a`` exactly while changing the shared spatial row."""
+        """Preserve the established PRN's full complex response."""
 
         old_response = complex(np.vdot(start, desired))
         raw_response = complex(np.vdot(requested, desired))
@@ -266,6 +296,7 @@ class SharedU1PhaseCompensationBank:
             "preserved_response": old_response,
             "uncompensated_target_response": raw_response,
             "scale": 1.0 + 0.0j,
+            "requested_amplitude_compensation_db": None,
             "continuity_residual_abs": None,
             "guard_reason": None,
         }
@@ -273,7 +304,16 @@ class SharedU1PhaseCompensationBank:
             metrics["guard_reason"] = "shared_target_prn_response_near_zero"
             return None, metrics
         # np.vdot(gamma*w, a) = conj(gamma) * np.vdot(w, a).
-        scale = complex(np.conj(old_response / raw_response))
+        exact_scale = complex(np.conj(old_response / raw_response))
+        metrics["requested_amplitude_compensation_db"] = 20.0 * math.log10(
+            max(abs(exact_scale), 1e-300)
+        )
+        # A scalar cannot move or fill a spatial null.  Retaining the full
+        # complex scale therefore preserves the established tracking-loop
+        # amplitude and phase while leaving the shared spatial pattern intact.
+        # The norm guard below rejects an invalid target instead of silently
+        # weakening the desired PRN with a phase-only approximation.
+        scale = exact_scale
         metrics["scale"] = scale
         target = np.asarray(scale * requested, dtype=np.complex128)
         if (
@@ -305,6 +345,9 @@ class SharedU1PhaseCompensationBank:
         )
         state.guard_reason = str(metrics.get("guard_reason") or "") or None
         state.scale = complex(metrics.get("scale", 1.0 + 0.0j))
+        state.requested_amplitude_compensation_db = _finite_float(
+            metrics.get("requested_amplitude_compensation_db")
+        )
         state.continuity_residual_abs = _finite_float(
             metrics.get("continuity_residual_abs")
         )
@@ -391,10 +434,20 @@ class SharedU1PhaseCompensationBank:
         status: dict[str, object] = {}
         for row_index, prn in enumerate(active_satellites):
             if prn is None:
-                rows[row_index] = common
+                acquisition_row = (
+                    protection
+                    if enabled and shared_measured_u1_available
+                    else common
+                )
+                acquisition_source = (
+                    "shared_measured_u1_acquisition_waiting_for_channel_prn"
+                    if enabled and shared_measured_u1_available
+                    else "shared_common_waiting_for_channel_prn"
+                )
+                rows[row_index] = acquisition_row
                 if emit_status:
                     status[f"source_{row_index:02d}"] = {
-                        "source": "shared_common_waiting_for_channel_prn",
+                        "source": acquisition_source,
                         "source_index": row_index,
                         "satellite": None,
                         "applied_to_gnss_sdr": True,
@@ -402,24 +455,36 @@ class SharedU1PhaseCompensationBank:
                         "independent_per_prn_lcmv": False,
                         "desired_vector_available": False,
                         "phase_compensation_applied": False,
-                        "shared_protection_bridge_applied": False,
+                        "shared_protection_bridge_applied": bool(
+                            enabled and shared_measured_u1_available
+                        ),
                         "phase_compensation_guard_reason": (
                             "tracking channel has no current GPS PRN assignment"
                         ),
                         "transition_active": False,
                         "transition_progress": 1.0,
-                        "applied_logical_weights": _complex_payload(common),
+                        "applied_logical_weights": _complex_payload(acquisition_row),
                         "desired_spatial_vector": None,
                     }
                 continue
             satellite = f"G{prn:02d}"
             state = self._states.get(row_index)
             if state is None or state.satellite != satellite:
+                initial = (
+                    protection
+                    if enabled and shared_measured_u1_available
+                    else common
+                )
                 state = _PhaseState(
                     satellite=satellite,
-                    current=np.array(common, copy=True),
-                    start=np.array(common, copy=True),
-                    target=np.array(common, copy=True),
+                    current=np.array(initial, copy=True),
+                    start=np.array(initial, copy=True),
+                    target=np.array(initial, copy=True),
+                    source=(
+                        "shared_measured_u1_acquisition_new_prn"
+                        if enabled and shared_measured_u1_available
+                        else "shared_common_weights"
+                    ),
                 )
                 self._states[row_index] = state
             payload = desired_vectors.get(satellite, {})
@@ -484,7 +549,21 @@ class SharedU1PhaseCompensationBank:
                     or protection_changed
                 )
             )
-            if rising and protection_needs_update:
+            if enabled and state.desired is None and shared_measured_u1_available:
+                # Acquisition has no established carrier phase to preserve.
+                # Apply the shared protected row directly so new satellites can
+                # still acquire while the jammer is present.
+                state.current = np.array(protection, copy=True)
+                state.start = np.array(protection, copy=True)
+                state.target = np.array(protection, copy=True)
+                state.source = "shared_measured_u1_acquisition_new_prn"
+                state.total_chunks = 0
+                state.completed_chunks = 0
+                state.scale = 1.0 + 0.0j
+                state.requested_amplitude_compensation_db = None
+                state.continuity_residual_abs = None
+                state.guard_reason = None
+            elif rising and protection_needs_update:
                 self._start_transition(
                     state,
                     requested=protection,
@@ -578,6 +657,9 @@ class SharedU1PhaseCompensationBank:
                     if abs(state.scale) > 0.0
                     else None
                 ),
+                "requested_exact_amplitude_compensation_db": (
+                    state.requested_amplitude_compensation_db
+                ),
                 "continuity_residual_abs": state.continuity_residual_abs,
                 "applied_response": (
                     {"real": float(response.real), "imag": float(response.imag)}
@@ -600,8 +682,495 @@ class SharedU1PhaseCompensationBank:
         return rows, status
 
 
+class PerPrnMeasuredVectorBeamformerBank:
+    """Build one continuously updated spatial row for every mapped GPS PRN.
+
+    With no jammer, each row is the minimum-norm measured-vector combiner that
+    preserves the response already seen by that tracking channel.  With a
+    jammer, each row is an independent covariance LCMV solution constrained by
+    that PRN's measured vector and the measured jammer vector.  Every target is
+    then scaled so ``w_new**H a_prn == w_old**H a_prn``.  The scale therefore
+    cannot move or fill the LCMV null, and no arbitrary dB gain cap is used.
+    """
+
+    def __init__(
+        self,
+        *,
+        satellites: tuple[int, ...],
+        channel_count: int,
+        sample_rate_hz: float,
+        samples_per_chunk: int,
+        transition_s: float,
+        source_count: int | None = None,
+        max_weight_norm: float = 8.0,
+    ) -> None:
+        self._satellites = tuple(int(value) for value in satellites)
+        self._source_count = (
+            len(self._satellites)
+            if self._satellites
+            else max(1, int(source_count or 0))
+        )
+        self._channel_count = int(channel_count)
+        chunk_s = max(1, int(samples_per_chunk)) / max(1.0, float(sample_rate_hz))
+        self._transition_chunks = (
+            0
+            if float(transition_s) <= 0.0
+            else max(1, int(math.ceil(float(transition_s) / chunk_s)))
+        )
+        self._max_weight_norm = max(float(max_weight_norm), 1e-6)
+        self._states: dict[int, _PerPrnState] = {}
+        self._jammer_previous = False
+        self._last_shared_protection: np.ndarray | None = None
+
+    @staticmethod
+    def _valid_vector(value: object, size: int) -> np.ndarray | None:
+        vector = np.asarray(
+            value if value is not None else [], dtype=np.complex128
+        ).reshape(-1)
+        if (
+            vector.size != int(size)
+            or not np.all(np.isfinite(vector))
+            or float(np.linalg.norm(vector)) <= np.finfo(np.float64).tiny
+        ):
+            return None
+        return vector / float(np.linalg.norm(vector))
+
+    @staticmethod
+    def _align_to_reference(
+        desired: np.ndarray,
+        reference: np.ndarray | None,
+    ) -> np.ndarray:
+        return SharedU1PhaseCompensationBank._align_to_reference(
+            desired, reference
+        )
+
+    @staticmethod
+    def _advance_transition(state: _PerPrnState) -> None:
+        if state.total_chunks <= 0 or state.completed_chunks >= state.total_chunks:
+            return
+        state.completed_chunks += 1
+        alpha = state.completed_chunks / float(state.total_chunks)
+        state.current = np.asarray(
+            (1.0 - alpha) * state.start + alpha * state.target,
+            dtype=np.complex128,
+        )
+
+    def _set_target(
+        self,
+        state: _PerPrnState,
+        target: np.ndarray,
+        *,
+        source: str,
+        immediate: bool,
+    ) -> bool:
+        requested = np.asarray(target, dtype=np.complex128).reshape(-1)
+        if (
+            requested.size != self._channel_count
+            or not np.all(np.isfinite(requested))
+        ):
+            state.guard_reason = "per-PRN target is invalid"
+            return False
+        norm = float(np.linalg.norm(requested))
+        if not np.isfinite(norm) or norm > self._max_weight_norm:
+            state.guard_reason = (
+                "per-PRN target norm exceeded: "
+                f"{norm:.6g} > {self._max_weight_norm:.6g}"
+            )
+            return False
+        state.start = np.array(state.current, copy=True)
+        state.target = np.array(requested, copy=True)
+        state.source = str(source)
+        state.total_chunks = 1 if immediate else self._transition_chunks
+        state.completed_chunks = 0
+        state.guard_reason = None
+        if state.total_chunks == 0:
+            state.current = np.array(state.target, copy=True)
+        return True
+
+    def _continuous_scale(
+        self,
+        *,
+        state: _PerPrnState,
+        requested: np.ndarray,
+        desired: np.ndarray,
+    ) -> np.ndarray:
+        preserved = complex(np.vdot(state.current, desired))
+        raw = complex(np.vdot(requested, desired))
+        floor = 1e-10 * max(
+            1.0, float(np.linalg.norm(requested) * np.linalg.norm(desired))
+        )
+        if abs(raw) <= floor:
+            raise ValueError("per-PRN requested response is near zero")
+        scale = complex(np.conj(preserved / raw))
+        target = np.asarray(scale * requested, dtype=np.complex128)
+        state.continuity_residual_abs = float(
+            abs(np.vdot(target, desired) - preserved)
+        )
+        return target
+
+    def _matched_target(
+        self,
+        state: _PerPrnState,
+        desired: np.ndarray,
+    ) -> np.ndarray:
+        """Minimum-norm row with exactly the current PRN response."""
+
+        response = complex(np.vdot(state.current, desired))
+        power = float(np.vdot(desired, desired).real)
+        if power <= np.finfo(np.float64).tiny:
+            raise ValueError("per-PRN desired vector has zero power")
+        target = np.asarray(desired * np.conj(response) / power, dtype=np.complex128)
+        state.continuity_residual_abs = float(
+            abs(np.vdot(target, desired) - response)
+        )
+        state.lcmv_null_residual_abs = None
+        state.lcmv_condition_number = None
+        state.lcmv_weight_norm = float(np.linalg.norm(target))
+        return target
+
+    def _lcmv_target(
+        self,
+        state: _PerPrnState,
+        *,
+        desired: np.ndarray,
+        covariance: np.ndarray,
+        jammer_vector: np.ndarray,
+        diagonal_loading_rel: float,
+        diagonal_loading_abs: float,
+        condition_number_limit: float,
+    ) -> np.ndarray:
+        result = covariance_lcmv_vector_null_weights(
+            covariance=covariance,
+            null_vector=jammer_vector,
+            preserve_vector=desired,
+            diagonal_loading_rel=diagonal_loading_rel,
+            diagonal_loading_abs=diagonal_loading_abs,
+            condition_number_limit=condition_number_limit,
+            max_weight_norm=self._max_weight_norm,
+        )
+        target = self._continuous_scale(
+            state=state,
+            requested=np.asarray(result.weights, dtype=np.complex128),
+            desired=desired,
+        )
+        state.lcmv_null_residual_abs = float(
+            abs(np.vdot(target, result.null_vector))
+        )
+        state.lcmv_condition_number = float(result.condition_number)
+        state.lcmv_weight_norm = float(np.linalg.norm(target))
+        return target
+
+    def _phase_continuous_shared_fallback(
+        self,
+        state: _PerPrnState,
+        *,
+        desired: np.ndarray,
+        shared: np.ndarray,
+    ) -> np.ndarray:
+        """Bridge covariance publication while preserving complex response."""
+
+        preserved = complex(np.vdot(state.current, desired))
+        raw = complex(np.vdot(shared, desired))
+        if abs(raw) <= 1e-10:
+            raise ValueError("shared fallback has near-zero PRN response")
+        scale = complex(np.conj(preserved / raw))
+        target = np.asarray(scale * shared, dtype=np.complex128)
+        state.continuity_residual_abs = float(
+            abs(np.vdot(target, desired) - preserved)
+        )
+        state.lcmv_null_residual_abs = None
+        state.lcmv_condition_number = None
+        state.lcmv_weight_norm = float(np.linalg.norm(target))
+        return target
+
+    def advance(
+        self,
+        *,
+        shared_common_weights: np.ndarray,
+        shared_measured_u1_weights: np.ndarray,
+        shared_measured_u1_available: bool,
+        desired_vectors: dict[str, dict[str, object]],
+        source_satellites: tuple[int | None, ...] | None = None,
+        enabled_now: bool,
+        covariance: np.ndarray | None = None,
+        jammer_vector: np.ndarray | None = None,
+        diagonal_loading_rel: float = 1e-3,
+        diagonal_loading_abs: float = 0.0,
+        condition_number_limit: float = 1e8,
+        now_monotonic: float | None = None,
+        max_vector_age_s: float = 2.5,
+        emit_status: bool = True,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        common = np.asarray(shared_common_weights, dtype=np.complex128).reshape(-1)
+        shared = np.asarray(
+            shared_measured_u1_weights, dtype=np.complex128
+        ).reshape(-1)
+        if common.size != self._channel_count or shared.size != self._channel_count:
+            raise ValueError("per-PRN beamformer weight length mismatch")
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        jammer_active = bool(enabled_now)
+        jammer_rising = jammer_active and not self._jammer_previous
+        jammer_falling = not jammer_active and self._jammer_previous
+        self._jammer_previous = jammer_active
+        context_changed = bool(
+            shared_measured_u1_available
+            and (
+                self._last_shared_protection is None
+                or not np.allclose(
+                    self._last_shared_protection, shared, rtol=1e-7, atol=1e-9
+                )
+            )
+        )
+        if context_changed:
+            self._last_shared_protection = np.array(shared, copy=True)
+        cov = np.asarray(
+            covariance if covariance is not None else [], dtype=np.complex128
+        )
+        null = self._valid_vector(jammer_vector, self._channel_count)
+        lcmv_context_available = bool(
+            shared_measured_u1_available
+            and cov.shape == (self._channel_count, self._channel_count)
+            and np.all(np.isfinite(cov))
+            and null is not None
+        )
+
+        if self._satellites:
+            active_satellites: tuple[int | None, ...] = tuple(self._satellites)
+        else:
+            supplied = tuple(source_satellites or ())
+            active_satellites = tuple(
+                (
+                    int(supplied[index])
+                    if index < len(supplied) and supplied[index] is not None
+                    else None
+                )
+                for index in range(self._source_count)
+            )
+        rows = np.empty(
+            (self._source_count, self._channel_count), dtype=np.complex128
+        )
+        status: dict[str, object] = {}
+        for row_index, prn in enumerate(active_satellites):
+            if prn is None:
+                row = shared if jammer_active and shared_measured_u1_available else common
+                rows[row_index] = row
+                if emit_status:
+                    status[f"source_{row_index:02d}"] = {
+                        "source": (
+                            "shared_protected_acquisition_waiting_for_prn"
+                            if jammer_active and shared_measured_u1_available
+                            else "uniform_acquisition_waiting_for_prn"
+                        ),
+                        "source_index": row_index,
+                        "satellite": None,
+                        "applied_to_gnss_sdr": True,
+                        "shared_spatial_solution": True,
+                        "independent_per_prn_lcmv": False,
+                        "independent_per_prn_beamforming": False,
+                        "desired_vector_available": False,
+                        "transition_active": False,
+                        "applied_logical_weights": _complex_payload(row),
+                        "desired_spatial_vector": None,
+                    }
+                continue
+
+            satellite = f"G{int(prn):02d}"
+            state = self._states.get(row_index)
+            reassigned = state is None or state.satellite != satellite
+            if reassigned:
+                initial = (
+                    shared
+                    if jammer_active and shared_measured_u1_available
+                    else common
+                )
+                state = _PerPrnState(
+                    satellite=satellite,
+                    current=np.array(initial, copy=True),
+                    start=np.array(initial, copy=True),
+                    target=np.array(initial, copy=True),
+                    source=(
+                        "shared_protected_new_prn_waiting_for_vector"
+                        if jammer_active and shared_measured_u1_available
+                        else "uniform_new_prn_waiting_for_vector"
+                    ),
+                )
+                self._states[row_index] = state
+
+            payload = desired_vectors.get(satellite, {})
+            vector = self._valid_vector(
+                payload.get("desired_spatial_vector"), self._channel_count
+            )
+            updated = _finite_float(payload.get("updated_monotonic"))
+            age = now - updated if updated is not None else math.inf
+            fresh = bool(0.0 <= age <= max(0.1, float(max_vector_age_s)))
+            try:
+                quality_counter = int(payload.get("tracking_sample_counter"))
+            except (TypeError, ValueError):
+                quality_counter = None
+            vector_changed = bool(
+                vector is not None
+                and fresh
+                and quality_counter is not None
+                and quality_counter != state.last_quality_counter
+            )
+            # Keep every established pre-jammer desired vector fixed for the
+            # full protection interval.  Otherwise jammer-contaminated or
+            # low-C/N0 measurements can redefine what the LCMV row preserves.
+            # A source acquired during jamming may still adopt its first valid
+            # vector; it is frozen immediately after that first adoption.
+            adopt_vector = bool(
+                vector_changed and (not jammer_active or state.desired is None)
+            )
+            if adopt_vector:
+                aligned = self._align_to_reference(vector, state.desired)
+                state.desired_step_deg = (
+                    None
+                    if state.desired is None
+                    else float(
+                        np.degrees(
+                            np.arccos(
+                                np.sqrt(
+                                    np.clip(
+                                        phase_invariant_coherence(
+                                            state.desired, aligned
+                                        ),
+                                        0.0,
+                                        1.0,
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+                state.desired = aligned
+                state.last_quality_counter = quality_counter
+                state.desired_updated_monotonic = updated
+
+            transition_in_progress = bool(
+                state.total_chunks > 0
+                and state.completed_chunks < state.total_chunks
+            )
+
+            needs_target = bool(
+                state.desired is not None
+                and (
+                    adopt_vector
+                    or jammer_rising
+                    or jammer_falling
+                    or (
+                        jammer_active
+                        and context_changed
+                        and not transition_in_progress
+                    )
+                    or not state.source.startswith("per_prn_")
+                )
+            )
+            if needs_target:
+                try:
+                    if jammer_active and lcmv_context_available:
+                        target = self._lcmv_target(
+                            state,
+                            desired=state.desired,
+                            covariance=cov,
+                            jammer_vector=null,
+                            diagonal_loading_rel=diagonal_loading_rel,
+                            diagonal_loading_abs=diagonal_loading_abs,
+                            condition_number_limit=condition_number_limit,
+                        )
+                        source_label = "per_prn_measured_vector_lcmv"
+                    elif jammer_active and shared_measured_u1_available:
+                        target = self._phase_continuous_shared_fallback(
+                            state,
+                            desired=state.desired,
+                            shared=shared,
+                        )
+                        source_label = "per_prn_phase_continuous_shared_onset_bridge"
+                    else:
+                        target = self._matched_target(state, state.desired)
+                        source_label = "per_prn_measured_vector_matched"
+                    self._set_target(
+                        state,
+                        target,
+                        source=source_label,
+                        immediate=reassigned,
+                    )
+                except (ValueError, np.linalg.LinAlgError) as exc:
+                    state.guard_reason = str(exc)
+
+            self._advance_transition(state)
+            rows[row_index] = state.current
+            if not emit_status:
+                continue
+            response = (
+                complex(np.vdot(state.current, state.desired))
+                if state.desired is not None
+                else None
+            )
+            desired_age = (
+                now - state.desired_updated_monotonic
+                if state.desired_updated_monotonic is not None
+                else math.inf
+            )
+            transition_active = bool(
+                state.total_chunks > 0
+                and state.completed_chunks < state.total_chunks
+            )
+            status_key = (
+                satellite
+                if satellite not in status
+                else f"{satellite}@source_{row_index:02d}"
+            )
+            status[status_key] = {
+                "source": state.source,
+                "source_index": row_index,
+                "satellite": satellite,
+                "applied_to_gnss_sdr": True,
+                "shared_spatial_solution": not state.source.startswith("per_prn_"),
+                "independent_per_prn_lcmv": state.source == (
+                    "per_prn_measured_vector_lcmv"
+                ),
+                "independent_per_prn_beamforming": state.source.startswith(
+                    "per_prn_"
+                ),
+                "desired_vector_available": state.desired is not None,
+                "desired_vector_frozen": bool(
+                    jammer_active and state.desired is not None
+                ),
+                "desired_vector_age_s": (
+                    desired_age if math.isfinite(desired_age) else None
+                ),
+                "desired_vector_step_deg": state.desired_step_deg,
+                "tracking_sample_counter": state.last_quality_counter,
+                "jammer_context_available": lcmv_context_available,
+                "phase_compensation_applied": state.desired is not None,
+                "phase_compensation_guard_reason": state.guard_reason,
+                "continuity_residual_abs": state.continuity_residual_abs,
+                "lcmv_null_residual_abs": state.lcmv_null_residual_abs,
+                "lcmv_condition_number": state.lcmv_condition_number,
+                "lcmv_weight_norm": state.lcmv_weight_norm,
+                "applied_response": (
+                    {"real": float(response.real), "imag": float(response.imag)}
+                    if response is not None
+                    else None
+                ),
+                "transition_active": transition_active,
+                "transition_progress": (
+                    state.completed_chunks / float(state.total_chunks)
+                    if transition_active
+                    else 1.0
+                ),
+                "applied_logical_weights": _complex_payload(state.current),
+                "desired_spatial_vector": (
+                    _complex_payload(state.desired)
+                    if state.desired is not None
+                    else None
+                ),
+            }
+        return rows, status
+
+
 class SharedU1DesiredVectorMonitor:
-    """Measure PRN spatial vectors without generating any beamformer weights."""
+    """Measure current PRN spatial vectors from a rolling quality window."""
 
     def __init__(
         self,
@@ -615,12 +1184,17 @@ class SharedU1DesiredVectorMonitor:
         logger: logging.Logger,
         satellites: tuple[int, ...],
         source_count: int | None = None,
+        frontend_group_delay_samples: int = 0,
         retention_s: float = 0.75,
         measurement_interval_s: float = 1.0,
         min_cno_db_hz: float = 30.0,
         min_quality_measurements: int = 3,
+        vector_window_measurements: int = 12,
     ) -> None:
         self._fs = float(sample_rate_hz)
+        self._frontend_group_delay_samples = int(frontend_group_delay_samples)
+        if self._frontend_group_delay_samples < 0:
+            raise ValueError("frontend_group_delay_samples must be non-negative")
         self._channel_count = int(channel_count)
         correction = phase_correction_vector or tuple(
             1.0 + 0.0j for _ in range(self._channel_count)
@@ -638,6 +1212,10 @@ class SharedU1DesiredVectorMonitor:
         self._measurement_interval_s = max(0.2, float(measurement_interval_s))
         self._min_cno_db_hz = float(min_cno_db_hz)
         self._min_quality_measurements = max(1, int(min_quality_measurements))
+        self._vector_window_measurements = max(
+            self._min_quality_measurements,
+            int(vector_window_measurements),
+        )
         self._satellite_rows = {
             f"G{int(prn):02d}": index for index, prn in enumerate(satellites)
         }
@@ -692,8 +1270,15 @@ class SharedU1DesiredVectorMonitor:
                 "dynamic_channel_prn_mapping": self._dynamic_sources,
                 "source_count": self._source_count,
                 "purpose": (
-                    "PRN code-despread desired vectors for shared measured-U1 "
-                    "LCMV complex-response compensation; no per-PRN LCMV solve"
+                    "rolling PRN code-despread desired vectors for independent "
+                    "per-PRN measured-vector beamforming and LCMV"
+                ),
+                "vector_window_measurements": self._vector_window_measurements,
+                "tracking_counter_domain": "post_input_filter",
+                "raw_iq_domain": "pre_input_filter",
+                "frontend_group_delay_samples": self._frontend_group_delay_samples,
+                "tracking_to_raw_counter_offset_samples": (
+                    -self._frontend_group_delay_samples
                 ),
             }
         )
@@ -872,6 +1457,7 @@ class SharedU1DesiredVectorMonitor:
         cno_db_hz: float,
         source_index: int,
     ) -> dict[str, object] | None:
+        raw_counter = counter - self._frontend_group_delay_samples
         code_rate_hz = GPS_CA_RATE_HZ * (1.0 + doppler_hz / GPS_L1_HZ)
         nominal_length = self._fs * GPS_CA_LENGTH / code_rate_hz
         lengths = sorted(
@@ -882,8 +1468,8 @@ class SharedU1DesiredVectorMonitor:
         )
         margin = 3
         extracted = self._extract(
-            counter - max(lengths) - margin,
-            counter + margin,
+            raw_counter - max(lengths) - margin,
+            raw_counter + margin,
             source_index,
         )
         if extracted is None:
@@ -942,24 +1528,34 @@ class SharedU1DesiredVectorMonitor:
         aggregate = self._aggregates.get(satellite)
         if quality_pass:
             projector = np.outer(instantaneous, np.conj(instantaneous))
-            if aggregate is None:
-                aggregate = _PrnAggregate(1, np.asarray(projector, dtype=np.complex128))
+            if aggregate is None or aggregate.source_index != source_index:
+                aggregate = _PrnAggregate(
+                    total_count=0,
+                    projectors=deque(maxlen=self._vector_window_measurements),
+                    source_index=source_index,
+                )
                 self._aggregates[satellite] = aggregate
-            else:
-                aggregate.count += 1
-                aggregate.projector_sum += projector
+            aggregate.total_count += 1
+            aggregate.projectors.append(
+                np.asarray(projector, dtype=np.complex128)
+            )
         if aggregate is None:
             aggregate_vector = _align_common_phase(instantaneous)
             aggregate_count = 0
+            rolling_count = 0
             concentration = None
         else:
+            rolling_count = len(aggregate.projectors)
+            projector_mean = np.mean(
+                np.stack(tuple(aggregate.projectors), axis=0), axis=0
+            )
             eigenvalues, eigenvectors = np.linalg.eigh(
-                aggregate.projector_sum / max(aggregate.count, 1)
+                projector_mean
             )
             aggregate_vector = _align_common_phase(
                 eigenvectors[:, int(np.argmax(eigenvalues))]
             )
-            aggregate_count = aggregate.count
+            aggregate_count = aggregate.total_count
             concentration = float(
                 np.max(eigenvalues)
                 / max(float(np.sum(eigenvalues)), np.finfo(np.float64).tiny)
@@ -971,7 +1567,9 @@ class SharedU1DesiredVectorMonitor:
                         aggregate_vector, dtype=np.complex128
                     ),
                     "quality_pass_count": aggregate_count,
+                    "rolling_quality_measurement_count": rolling_count,
                     "tracking_sample_counter": int(counter),
+                    "raw_sample_counter": int(raw_counter),
                     "updated_monotonic": float(time.monotonic()),
                 }
         return {
@@ -981,12 +1579,15 @@ class SharedU1DesiredVectorMonitor:
             "prn": prn,
             "source_index": source_index,
             "tracking_sample_counter": counter,
+            "raw_sample_counter": raw_counter,
+            "frontend_group_delay_samples": self._frontend_group_delay_samples,
             "cn0_db_hz": cno_db_hz,
             "carrier_doppler_hz": doppler_hz,
             "reported_carrier_phase_rads": _finite_float(
                 entry.get("carrier_phase_rads")
             ),
             "aggregate_quality_pass_count": aggregate_count,
+            "rolling_quality_measurement_count": rolling_count,
             "aggregate_projector_concentration": concentration,
             "desired_spatial_vector": _complex_payload(aggregate_vector),
             "prompt_vs_wrong_code_db": prompt_vs_off_db,
@@ -1021,6 +1622,7 @@ class SharedU1DesiredVectorMonitor:
 
 __all__ = [
     "apply_shared_phase_fanout",
+    "PerPrnMeasuredVectorBeamformerBank",
     "SharedU1DesiredVectorMonitor",
     "SharedU1PhaseCompensationBank",
     "gps_l1_ca_code",

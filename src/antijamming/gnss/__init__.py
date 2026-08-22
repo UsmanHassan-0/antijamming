@@ -2,6 +2,7 @@
 
 from .gnss_sdr import GnssSdrBridge
 from .shared_u1_phase_compensation import (
+    PerPrnMeasuredVectorBeamformerBank,
     SharedU1DesiredVectorMonitor,
     SharedU1PhaseCompensationBank,
     apply_shared_phase_fanout,
@@ -9,6 +10,7 @@ from .shared_u1_phase_compensation import (
 
 __all__ = [
     "GnssSdrBridge",
+    "PerPrnMeasuredVectorBeamformerBank",
     "SharedU1DesiredVectorMonitor",
     "SharedU1PhaseCompensationBank",
     "apply_shared_phase_fanout",

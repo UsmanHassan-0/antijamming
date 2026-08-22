@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import numpy as np
@@ -17,14 +18,15 @@ from antijamming.config import StreamConfig
 from antijamming.config.schemas.runtime import VALID_LCMV_METHODS
 from antijamming.gnss import (
     GnssSdrBridge,
+    PerPrnMeasuredVectorBeamformerBank,
     SharedU1DesiredVectorMonitor,
-    SharedU1PhaseCompensationBank,
     apply_shared_phase_fanout,
 )
 from antijamming.gnss.sdr_bridge.constants import (
     PVT_DEGRADED_PDOP_THRESHOLD,
     PVT_LOW_OBSERVATION_COUNT,
     PVT_LOW_USED_SATELLITE_COUNT,
+    gnss_input_filter_group_delay_samples,
 )
 from antijamming.radio.transport import collect_host_transport_report
 from antijamming.logging import (
@@ -117,6 +119,17 @@ _RUNTIME_POWER_SCALAR_KEYS = frozenset(
     )
 )
 
+_GNSS_OUTPUT_QUEUE_MAXSIZE = 64
+
+
+@dataclass(frozen=True, slots=True)
+class _GnssFifoWorkItem:
+    """One ordered beamformer result awaiting the blocking FIFO writer."""
+
+    raw_chunk: np.ndarray
+    output: np.ndarray
+    logical_weights: np.ndarray
+
 # =============================================================================
 # Threaded Backend Runtime
 # =============================================================================
@@ -202,9 +215,11 @@ class BackendRuntime:
         self._phase_thread: threading.Thread | None = None
         self._doa_thread: threading.Thread | None = None
         self._gnss_handoff_thread: threading.Thread | None = None
+        self._gnss_fifo_thread: threading.Thread | None = None
         self._gnss_raw_queue: queue.Queue | None = None
+        self._gnss_output_queue: queue.Queue | None = None
         self._shared_u1_phase_monitor: SharedU1DesiredVectorMonitor | None = None
-        self._shared_u1_phase_bank: SharedU1PhaseCompensationBank | None = None
+        self._shared_u1_phase_bank: PerPrnMeasuredVectorBeamformerBank | None = None
         self._last_shared_u1_phase_status_log_ts = 0.0
         self._shared_u1_desired_vectors_cache: dict[str, dict[str, object]] = {}
         self._shared_u1_source_satellites_cache: tuple[int | None, ...] = ()
@@ -215,6 +230,9 @@ class BackendRuntime:
         self._gnss_raw_q_highwater: int = 0
         self._gnss_raw_q_interval_highwater: int = 0
         self._gnss_raw_q_marks_logged: set[int] = set()
+        self._gnss_output_q_highwater: int = 0
+        self._gnss_output_q_interval_highwater: int = 0
+        self._gnss_output_q_marks_logged: set[int] = set()
         self._gnss_failure_lock = threading.Lock()
         self._gnss_pipeline_failed = False
 
@@ -298,9 +316,10 @@ class BackendRuntime:
         self._realtime_preserve_frozen_reference_age_s: float | None = None
         self._realtime_preserve_frozen_reference_angle_error_deg: float | None = None
         self._lcmv_jammer_detected_latched: bool = False
+        self._lcmv_jammer_protection_active: bool = False
+        self._lcmv_jammer_last_evidence_monotonic_s: float | None = None
         self._latest_source_count_diagnostics: dict[str, object] = {
             "n_sources": max(int(self._expected_sources), 1),
-            "peak_count": None,
         }
         self._dsp_chunk_counter = 0
 
@@ -316,6 +335,12 @@ class BackendRuntime:
             initial_weights, copy=True
         )
         self._shared_measured_u1_protection_available = False
+        self._shared_measured_u1_protection_covariance = np.empty(
+            (0, 0), dtype=np.complex128
+        )
+        self._shared_measured_u1_protection_null_vector = np.empty(
+            (0,), dtype=np.complex128
+        )
         self._latest_shared_u1_phase_logical_weights = np.empty(
             (0, len(config.channels)), dtype=np.complex128
         )
@@ -551,6 +576,9 @@ class BackendRuntime:
                 self._gnss_raw_q_highwater = 0
                 self._gnss_raw_q_interval_highwater = 0
                 self._gnss_raw_q_marks_logged.clear()
+                self._gnss_output_q_highwater = 0
+                self._gnss_output_q_interval_highwater = 0
+                self._gnss_output_q_marks_logged.clear()
                 self._gnss_fifo_samples_written = 0
                 shared_phase_fanout = self._shared_phase_fanout_enabled()
                 satellites = tuple(
@@ -566,7 +594,7 @@ class BackendRuntime:
                     self._config.gnss_shared_u1_phase_transition_s
                 )
                 if shared_phase_fanout:
-                    self._shared_u1_phase_bank = SharedU1PhaseCompensationBank(
+                    self._shared_u1_phase_bank = PerPrnMeasuredVectorBeamformerBank(
                         satellites=satellites,
                         channel_count=len(self._config.channels),
                         sample_rate_hz=float(self._config.sample_rate),
@@ -576,9 +604,9 @@ class BackendRuntime:
                         max_weight_norm=self._lcmv_weight_norm_limit(),
                     )
                     self._handoff_log.info(
-                        "Shared measured-U1 phase fanout enabled: mapping=%s satellites=%s "
+                        "Independent per-PRN measured-vector fanout enabled: mapping=%s satellites=%s "
                         "sources=%d transition_s=%.3f min_suppression_db=%.1f "
-                        "independent_per_prn_lcmv=false",
+                        "independent_per_prn_lcmv=true",
                         "pinned" if satellites else "dynamic_channel_to_prn",
                         (
                             ",".join(f"G{value:02d}" for value in satellites)
@@ -609,6 +637,11 @@ class BackendRuntime:
                         )
                     self._shared_u1_phase_monitor = SharedU1DesiredVectorMonitor(
                         sample_rate_hz=float(self._config.sample_rate),
+                        frontend_group_delay_samples=(
+                            gnss_input_filter_group_delay_samples(
+                                float(self._config.sample_rate)
+                            )
+                        ),
                         channel_count=len(self._config.channels),
                         phase_correction_vector=self._config.phase_correction_vector,
                         tracking_snapshot=self._gnss_bridge.snapshot,
@@ -624,19 +657,44 @@ class BackendRuntime:
                     self._shared_u1_phase_monitor.start()
                 else:
                     self._shared_u1_phase_monitor = None
-                self._gnss_handoff_thread = threading.Thread(
-                    target=self._gnss_beamform_loop,
-                    name="gnss_ordered_handoff",
+                self._gnss_output_queue = queue.Queue(
+                    maxsize=_GNSS_OUTPUT_QUEUE_MAXSIZE
+                )
+                output_source_count = (
+                    shared_phase_source_count if shared_phase_fanout else 1
+                )
+                retained_bytes_per_item = (
+                    len(self._config.channels) + output_source_count
+                ) * int(self._config.samples_per_chunk) * np.dtype(np.complex64).itemsize
+                output_queue_memory_mib = (
+                    _GNSS_OUTPUT_QUEUE_MAXSIZE
+                    * retained_bytes_per_item
+                    / float(1024 * 1024)
+                )
+                self._gnss_fifo_thread = threading.Thread(
+                    target=self._gnss_fifo_write_loop,
+                    name="gnss_fifo_write",
                     daemon=True,
                 )
+                self._gnss_handoff_thread = threading.Thread(
+                    target=self._gnss_beamform_loop,
+                    name="gnss_beamform",
+                    daemon=True,
+                )
+                self._gnss_fifo_thread.start()
                 self._gnss_handoff_thread.start()
                 self._loggers["transport"].info(
-                    "GNSS pipeline: thread gnss_ordered_handoff "
-                    "(raw_q=%d, buffer=%.2fs, memory=%.1f MiB); recv() publishes "
-                    "ordered queue-backed work items.",
+                    "GNSS pipeline: threads gnss_beamform -> gnss_fifo_write "
+                    "(raw_q=%d, raw_buffer=%.2fs, raw_memory=%.1f MiB, "
+                    "output_q=%d, output_buffer=%.2fs, retained_memory=%.1f MiB); "
+                    "recv, beamforming, and blocking FIFO I/O run as ordered "
+                    "overlapped stages.",
                     gnss_raw_q_maxsize,
                     gnss_queue_buffer_s,
                     gnss_queue_bytes / float(1024 * 1024),
+                    _GNSS_OUTPUT_QUEUE_MAXSIZE,
+                    _GNSS_OUTPUT_QUEUE_MAXSIZE * gnss_chunk_s,
+                    output_queue_memory_mib,
                 )
             self._prime_usrp_rx_startup()
             for line in self._device.startup_report_lines():
@@ -721,7 +779,17 @@ class BackendRuntime:
                     except Exception:
                         pass
                     self._gnss_handoff_thread = None
+            if self._gnss_fifo_thread is not None:
+                oq = self._gnss_output_queue
+                if oq is not None:
+                    self._put_shutdown_sentinel(oq, timeout_s=1.0)
+                try:
+                    self._gnss_fifo_thread.join(timeout=4.0)
+                except Exception:
+                    pass
+                self._gnss_fifo_thread = None
             self._gnss_raw_queue = None
+            self._gnss_output_queue = None
             if self._shared_u1_phase_monitor is not None:
                 self._shared_u1_phase_monitor.stop()
                 self._shared_u1_phase_monitor = None
@@ -730,9 +798,12 @@ class BackendRuntime:
             self._shared_u1_source_satellites_cache = ()
             if self._config.gnss_sdr_enable:
                 self._loggers["transport"].info(
-                    "GNSS queue summary: raw_highwater=%d/%d raw_rejections=%d",
+                    "GNSS queue summary: raw_highwater=%d/%d output_highwater=%d/%d "
+                    "raw_rejections=%d",
                     self._gnss_raw_q_highwater,
                     max(1, int(self._config.gnss_feed_queue_maxsize)),
+                    self._gnss_output_q_highwater,
+                    _GNSS_OUTPUT_QUEUE_MAXSIZE,
                     self._gnss_raw_drops,
                 )
             for t in [self._phase_thread, self._doa_thread]:
@@ -952,11 +1023,15 @@ class BackendRuntime:
                     6.0,
                 )
             ),
+            "lcmv_jammer_release_hold_s": self._json_float(
+                getattr(self._config, "lcmv_jammer_release_hold_s", 2.0)
+            ),
             "lcmv_weight_transition_s": self._json_float(
                 getattr(self._config, "lcmv_weight_transition_s", 1.0)
             ),
             "lcmv_jammer_activation_angle_only_forbidden": True,
-            "lcmv_jammer_activation_latches_until_disable": True,
+            "lcmv_jammer_history_latches_until_disable": True,
+            "lcmv_jammer_protection_releases_without_current_evidence": True,
             "lcmv_test_max_weight_norm": self._json_float(
                 self._config.lcmv_test_max_weight_norm
             ),
@@ -1364,6 +1439,7 @@ class BackendRuntime:
                     "music_internal_angle_deg",
                     "music_display_bearing_deg",
                     "lcmv_jammer_detected_latched",
+                    "lcmv_jammer_protection_active",
                     "lcmv_jammer_activation_armed",
                     "lcmv_jammer_activation_evidence_now",
                     "lcmv_jammer_activation_input_power_jump_db",
@@ -1636,6 +1712,8 @@ class BackendRuntime:
         self._realtime_preserve_frozen_reference_age_s = None
         self._realtime_preserve_frozen_reference_angle_error_deg = None
         self._lcmv_jammer_detected_latched = False
+        self._lcmv_jammer_protection_active = False
+        self._lcmv_jammer_last_evidence_monotonic_s = None
 
     def _realtime_preserve_tracker_payload_locked(self) -> dict[str, object]:
         return {
@@ -1697,6 +1775,9 @@ class BackendRuntime:
             ),
             "lcmv_jammer_detected_latched": bool(
                 self._lcmv_jammer_detected_latched
+            ),
+            "lcmv_jammer_protection_active": bool(
+                self._lcmv_jammer_protection_active
             ),
         }
 
@@ -1913,6 +1994,8 @@ class BackendRuntime:
                         reference_angle_error_deg
                     )
                     self._lcmv_jammer_detected_latched = False
+                    self._lcmv_jammer_protection_active = False
+                    self._lcmv_jammer_last_evidence_monotonic_s = None
                     frozen_reason = (
                         "armed on uniform weights with frozen measured bladeRF U1 "
                         f"internal={self._realtime_preserve_frozen_internal_deg:.2f} deg "
@@ -1933,6 +2016,8 @@ class BackendRuntime:
                         reference_angle_error_deg
                     )
                     self._lcmv_jammer_detected_latched = False
+                    self._lcmv_jammer_protection_active = False
+                    self._lcmv_jammer_last_evidence_monotonic_s = None
                     blockers: list[str] = []
                     if not self._realtime_preserve_stable or center is None:
                         blockers.append("live angle cluster is not stable")
@@ -2575,7 +2660,11 @@ class BackendRuntime:
             "rx_gnss_queue_publish",
             "gnss_queue_wait",
             "gnss_combiner_compute",
+            "gnss_health_metrics",
+            "gnss_output_queue_publish",
+            "gnss_fifo_queue_wait",
             "gnss_fifo_write",
+            "gnss_monitor_submit",
             "dsp_phase",
             "dsp_doa",
             "ui_gnss_snapshot",
@@ -2626,6 +2715,21 @@ class BackendRuntime:
             maxsize = max(1, int(q.maxsize) or configured_max)
         interval_highwater = max(int(self._gnss_raw_q_interval_highwater), qsize)
         self._gnss_raw_q_interval_highwater = qsize
+        output_q = self._gnss_output_queue
+        if output_q is None:
+            output_qsize = 0
+            output_maxsize = _GNSS_OUTPUT_QUEUE_MAXSIZE
+        else:
+            output_qsize = int(output_q.qsize())
+            output_maxsize = max(
+                1,
+                int(output_q.maxsize) or _GNSS_OUTPUT_QUEUE_MAXSIZE,
+            )
+        output_interval_highwater = max(
+            int(self._gnss_output_q_interval_highwater),
+            output_qsize,
+        )
+        self._gnss_output_q_interval_highwater = output_qsize
         return {
             "qsize": qsize,
             "maxsize": maxsize,
@@ -2636,6 +2740,20 @@ class BackendRuntime:
             "lifetime_highwater_pct": 100.0
             * max(int(self._gnss_raw_q_highwater), interval_highwater)
             / maxsize,
+            "output_qsize": output_qsize,
+            "output_maxsize": output_maxsize,
+            "output_pct": 100.0 * output_qsize / output_maxsize,
+            "output_interval_highwater": output_interval_highwater,
+            "output_interval_highwater_pct": 100.0
+            * output_interval_highwater
+            / output_maxsize,
+            "output_lifetime_highwater": max(
+                int(self._gnss_output_q_highwater),
+                output_interval_highwater,
+            ),
+            "output_lifetime_highwater_pct": 100.0
+            * max(int(self._gnss_output_q_highwater), output_interval_highwater)
+            / output_maxsize,
         }
 
     def _peek_transport_queue_snapshot(self) -> dict[str, float | int]:
@@ -2720,6 +2838,9 @@ class BackendRuntime:
             "GNSS transport heartbeat: raw_q=%d/%d raw_q_pct=%.1f "
             "raw_q_interval_highwater=%d/%d raw_q_interval_highwater_pct=%.1f "
             "raw_q_lifetime_highwater=%d/%d raw_q_lifetime_highwater_pct=%.1f "
+            "output_q=%d/%d output_q_pct=%.1f "
+            "output_q_interval_highwater=%d/%d output_q_interval_highwater_pct=%.1f "
+            "output_q_lifetime_highwater=%d/%d output_q_lifetime_highwater_pct=%.1f "
             "raw_rejections=%d rx_recv_avg_ms=%.2f rx_recv_max_ms=%.2f rx_recv_n=%d "
             "rx_gnss_queue_publish_avg_ms=%.2f rx_gnss_queue_publish_max_ms=%.2f "
             "rx_gnss_queue_publish_n=%d gnss_queue_wait_avg_ms=%.2f "
@@ -2745,6 +2866,15 @@ class BackendRuntime:
             int(qstats["lifetime_highwater"]),
             int(qstats["maxsize"]),
             float(qstats["lifetime_highwater_pct"]),
+            int(qstats["output_qsize"]),
+            int(qstats["output_maxsize"]),
+            float(qstats["output_pct"]),
+            int(qstats["output_interval_highwater"]),
+            int(qstats["output_maxsize"]),
+            float(qstats["output_interval_highwater_pct"]),
+            int(qstats["output_lifetime_highwater"]),
+            int(qstats["output_maxsize"]),
+            float(qstats["output_lifetime_highwater_pct"]),
             int(self._gnss_raw_drops),
             self._perf_ms(snapshot, "rx_recv", "avg"),
             self._perf_ms(snapshot, "rx_recv", "max"),
@@ -2978,8 +3108,10 @@ class BackendRuntime:
         weights: np.ndarray,
         *,
         available: bool = True,
+        covariance: np.ndarray | None = None,
+        null_vector: np.ndarray | None = None,
     ) -> None:
-        """Publish the one shared covariance-LCMV measured-U1 target."""
+        """Publish fallback weights and the covariance context for per-PRN LCMV."""
 
         selected = np.asarray(weights, dtype=np.complex128).reshape(-1)
         if selected.size != len(self._config.channels) or not np.all(
@@ -2991,6 +3123,33 @@ class BackendRuntime:
                 selected, copy=True
             )
             self._shared_measured_u1_protection_available = bool(available)
+            if available and covariance is not None and null_vector is not None:
+                candidate_covariance = np.asarray(
+                    covariance, dtype=np.complex128
+                )
+                candidate_null = np.asarray(
+                    null_vector, dtype=np.complex128
+                ).reshape(-1)
+                if (
+                    candidate_covariance.shape
+                    == (len(self._config.channels), len(self._config.channels))
+                    and candidate_null.size == len(self._config.channels)
+                    and np.all(np.isfinite(candidate_covariance))
+                    and np.all(np.isfinite(candidate_null))
+                ):
+                    self._shared_measured_u1_protection_covariance = np.array(
+                        candidate_covariance, copy=True
+                    )
+                    self._shared_measured_u1_protection_null_vector = np.array(
+                        candidate_null, copy=True
+                    )
+            elif not available:
+                self._shared_measured_u1_protection_covariance = np.empty(
+                    (0, 0), dtype=np.complex128
+                )
+                self._shared_measured_u1_protection_null_vector = np.empty(
+                    (0,), dtype=np.complex128
+                )
 
     def _get_shared_measured_u1_protection_weights_copy(self) -> np.ndarray:
         with self._beamformer_lock:
@@ -3002,6 +3161,21 @@ class BackendRuntime:
     def _shared_measured_u1_protection_is_available(self) -> bool:
         with self._beamformer_lock:
             return bool(self._shared_measured_u1_protection_available)
+
+    def _get_per_prn_lcmv_context_copy(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        with self._beamformer_lock:
+            return (
+                np.array(
+                    self._shared_measured_u1_protection_covariance,
+                    copy=True,
+                ),
+                np.array(
+                    self._shared_measured_u1_protection_null_vector,
+                    copy=True,
+                ),
+            )
 
     def _get_gnss_monitor_logical_weights_copy(self) -> np.ndarray:
         """Return the weights that produced the IQ streams GNSS-SDR received."""
@@ -3117,7 +3291,7 @@ class BackendRuntime:
         return tuple(mapped)
 
     def _gnss_shared_u1_phase_output_matrix(self, chunk: np.ndarray) -> np.ndarray:
-        """Return phase-aligned copies of one shared beam for GPS source slots."""
+        """Return one measured-vector spatial beam per GPS source slot."""
 
         self._advance_beamformer_transition()
         source = np.asarray(chunk, dtype=np.complex64)
@@ -3142,15 +3316,21 @@ class BackendRuntime:
                 )
         with self._results_lock:
             jammer_latched = bool(self._lcmv_jammer_detected_latched)
-        enabled_now = bool(self._lcmv_test_enabled and jammer_latched)
-        common = self._get_beamformer_target_weights_copy()
+            jammer_active = bool(self._lcmv_jammer_protection_active)
+        enabled_now = bool(self._lcmv_test_enabled and jammer_active)
+        # Unmapped acquisition sources use the common/shared fallback. Mapped
+        # sources use an independent measured-vector row before, during, and
+        # after jamming.
+        common = uniform_weights(len(self._config.channels))
         protection = self._get_shared_measured_u1_protection_weights_copy()
+        protection_available = self._shared_measured_u1_protection_is_available()
+        protection_covariance, protection_null = (
+            self._get_per_prn_lcmv_context_copy()
+        )
         logical, status = bank.advance(
             shared_common_weights=common,
             shared_measured_u1_weights=protection,
-            shared_measured_u1_available=(
-                self._shared_measured_u1_protection_is_available()
-            ),
+            shared_measured_u1_available=protection_available,
             # The monitor itself updates at 1 Hz. Re-reading and normalizing
             # the same ten vectors on every 8.2 ms IQ chunk is pure overhead.
             desired_vectors=(
@@ -3158,6 +3338,25 @@ class BackendRuntime:
             ),
             source_satellites=self._shared_u1_source_satellites_cache,
             enabled_now=enabled_now,
+            covariance=protection_covariance,
+            jammer_vector=protection_null,
+            diagonal_loading_rel=float(
+                getattr(
+                    self._config,
+                    "lcmv_covariance_diagonal_loading_rel",
+                    0.001,
+                )
+            ),
+            diagonal_loading_abs=float(
+                getattr(
+                    self._config,
+                    "lcmv_covariance_diagonal_loading_abs",
+                    0.0,
+                )
+            ),
+            condition_number_limit=float(
+                self._config.lcmv_test_condition_number_limit
+            ),
             now_monotonic=now,
             emit_status=emit_status,
         )
@@ -3197,6 +3396,16 @@ class BackendRuntime:
                 for payload in status.values()
                 if bool(payload.get("transition_active", False))
             )
+            per_prn_count = sum(
+                1
+                for payload in status.values()
+                if bool(payload.get("independent_per_prn_beamforming", False))
+            )
+            per_prn_lcmv_count = sum(
+                1
+                for payload in status.values()
+                if bool(payload.get("independent_per_prn_lcmv", False))
+            )
             self._handoff_log.info(
                 "shared_u1_phase_compensation_status %s",
                 json.dumps(
@@ -3205,20 +3414,24 @@ class BackendRuntime:
                         "applied_to_gnss_sdr": True,
                         "common_pvt_solver": True,
                         "jammer_latched": jammer_latched,
+                        "jammer_protection_active": jammer_active,
                         "enabled_now": enabled_now,
-                        "independent_per_prn_lcmv": False,
-                        "active_per_prn_source_count": 0,
+                        "independent_per_prn_lcmv": True,
+                        "active_per_prn_source_count": per_prn_count,
+                        "active_per_prn_lcmv_source_count": per_prn_lcmv_count,
                         "phase_compensated_shared_protection_count": bridge_count,
                         "transitioning_source_count": transitioning_count,
-                        "phase_compensation": "per_prn_complex_response_continuity",
+                        "phase_compensation": (
+                            "constraint_on_each_per_prn_spatial_update"
+                        ),
                         "scalar_fanout_chunks": self._shared_u1_scalar_fanout_chunks,
                         "matrix_fallback_chunks": (
                             self._shared_u1_matrix_fallback_chunks
                         ),
                         "latest_output_path": (
-                            "one_shared_beam_plus_prn_scalars"
+                            "collinear_rows_optimized"
                             if scalar_fast_path
-                            else "general_transition_matrix"
+                            else "independent_per_prn_spatial_matrix"
                         ),
                         "dynamic_source_satellites": [
                             (f"G{value:02d}" if value is not None else None)
@@ -3296,10 +3509,7 @@ class BackendRuntime:
 
     def _gnss_handoff_mode_label(self) -> str:
         if self._shared_phase_fanout_enabled():
-            # This names the fixed transport architecture. The current
-            # uniform/measured-U1 state is recorded separately by
-            # _fifo_output_source_label().
-            return "shared_prn_phase_continuity_fanout"
+            return "independent_per_prn_measured_vector_fanout"
         if self._lcmv_test_enabled:
             status = self._lcmv_status_copy()
             if str(status.get("mode", "")).lower() == "on":
@@ -3677,7 +3887,7 @@ class BackendRuntime:
         rejection = self._method_safety_rejection_reason(
             result=result,
             target_suppression_db=target_suppression_db,
-            enforce_white_noise_gain=False,
+            enforce_white_noise_gain=True,
         )
 
         payload.update(
@@ -4051,8 +4261,6 @@ class BackendRuntime:
             value is not None and value > 6.0
             for value in (raw_power_jump_db, cal_power_jump_db)
         )
-        source_diag = dict(self._latest_source_count_diagnostics)
-        peak_count = self._optional_int(source_diag.get("peak_count"))
         if large_angle_jump:
             jammer_confidence = max(jammer_confidence, 0.35)
         if large_power_jump:
@@ -4103,8 +4311,22 @@ class BackendRuntime:
                 dtype=np.complex128,
                 copy=True,
             )
-            self._healthy_reference_internal_angle_deg = music_internal_deg
-            self._healthy_reference_display_bearing_deg = music_bearing_deg
+            # The realtime bladeRF tracker already resolves local-peak swaps by
+            # following the continuous peak cluster.  Keep the measured-U1
+            # reference associated with that tracked cluster instead of the
+            # instantaneous primary MUSIC label, which can flip between nearly
+            # equal direct-path and multipath lobes while U1 remains coherent.
+            reference_internal_deg = self._finite_metric_float(
+                self._realtime_preserve_center_internal_deg
+                if self._realtime_preserve_stable
+                else music_internal_deg
+            )
+            if reference_internal_deg is None:
+                reference_internal_deg = float(music_internal_deg)
+            self._healthy_reference_internal_angle_deg = reference_internal_deg
+            self._healthy_reference_display_bearing_deg = (
+                internal_angle_to_operator_bearing_deg(reference_internal_deg)
+            )
             self._healthy_reference_updated_monotonic_s = time.monotonic()
             self._healthy_reference_confidence = healthy_score
             if raw_power is not None:
@@ -4159,7 +4381,6 @@ class BackendRuntime:
             "healthy_reference_observations": observations,
             "healthy_reference_avg_cno_db_hz": self._json_float(avg_cno),
             "healthy_reference_angle_jump_deg": self._json_float(angle_jump_deg),
-            "peak_count": peak_count,
             "large_angle_jump": bool(large_angle_jump),
             "large_power_jump": bool(large_power_jump),
             "raw_avg_channel_power_linear": self._json_float(raw_power),
@@ -4213,10 +4434,11 @@ class BackendRuntime:
     ) -> dict[str, object]:
         """Detect a jammer-on change against the exact frozen arm-time baseline.
 
-        Angular movement alone is intentionally not activation evidence.  The
-        latch is set only when both input power and a covariance spatial mode
-        rise above the frozen jammer-off baseline; once set it remains set until
-        the operator disables LCMV.
+        Angular movement alone is intentionally not activation evidence. The
+        historical detection latch remains available for diagnostics, while
+        protection itself releases after a short current-evidence hold. This
+        prevents stale LCMV weights from nulling the desired transmitter after
+        the jammer disappears.
         """
 
         with self._results_lock:
@@ -4227,7 +4449,7 @@ class BackendRuntime:
             )
             baseline_raw_power = self._realtime_preserve_frozen_raw_power_linear
             baseline_cal_power = self._realtime_preserve_frozen_cal_power_linear
-            latched_before = bool(self._lcmv_jammer_detected_latched)
+            active_before = bool(self._lcmv_jammer_protection_active)
 
         current = np.asarray(covariance, dtype=np.complex128)
         raw_metrics = raw_power_metrics if isinstance(raw_power_metrics, dict) else {}
@@ -4298,14 +4520,42 @@ class BackendRuntime:
             and input_power_jump_db >= min_input_jump_db
             and generalized_gain_db >= min_generalized_gain_db
         )
-        if evidence_now and not latched_before:
-            with self._results_lock:
+        now_monotonic = time.monotonic()
+        release_hold_s = max(
+            0.0,
+            float(getattr(self._config, "lcmv_jammer_release_hold_s", 2.0)),
+        )
+        with self._results_lock:
+            if evidence_now:
                 self._lcmv_jammer_detected_latched = True
-        latched_after = latched_before or evidence_now
+                self._lcmv_jammer_protection_active = True
+                self._lcmv_jammer_last_evidence_monotonic_s = now_monotonic
+            elif (
+                self._lcmv_jammer_protection_active
+                and self._lcmv_jammer_last_evidence_monotonic_s is not None
+                and now_monotonic - self._lcmv_jammer_last_evidence_monotonic_s
+                >= release_hold_s
+            ):
+                self._lcmv_jammer_protection_active = False
+            latched_after = bool(self._lcmv_jammer_detected_latched)
+            active_after = bool(self._lcmv_jammer_protection_active)
+            last_evidence_after = self._lcmv_jammer_last_evidence_monotonic_s
+        release_remaining_s = None
+        if active_after and not evidence_now and last_evidence_after is not None:
+            release_remaining_s = max(
+                0.0,
+                release_hold_s - (now_monotonic - last_evidence_after),
+            )
         return {
             "lcmv_jammer_activation_armed": True,
             "lcmv_jammer_activation_evidence_now": evidence_now,
             "lcmv_jammer_detected_latched": latched_after,
+            "lcmv_jammer_protection_active": active_after,
+            "lcmv_jammer_protection_was_active": active_before,
+            "lcmv_jammer_release_hold_s": self._json_float(release_hold_s),
+            "lcmv_jammer_release_remaining_s": self._json_float(
+                release_remaining_s
+            ),
             "lcmv_jammer_activation_raw_power_jump_db": self._json_float(
                 raw_power_jump_db
             ),
@@ -4329,6 +4579,136 @@ class BackendRuntime:
             ),
             "lcmv_jammer_activation_angle_only_forbidden": True,
         }
+
+    def _fast_realtime_measured_u1_protection_update(
+        self,
+        *,
+        corrected_chunk: np.ndarray,
+        raw_power_metrics: dict[str, object] | None,
+        cal_power_metrics: dict[str, object] | None,
+    ) -> dict[str, object]:
+        """Arm the measured-U1 GNSS row before the slower MUSIC scan finishes.
+
+        The realtime measured-U1 mode does not need a bearing in order to detect
+        a large covariance change or build its shared protection row.  Running
+        this small 4x4 covariance/eigensolve in the phase worker closes the
+        otherwise unprotected interval caused by the full 1,441-point MUSIC
+        scan.  The ordinary DoA worker remains authoritative for bearings,
+        diagnostics, later weight updates, and jammer release.
+        """
+
+        preserve_mode = str(
+            getattr(self._config, "lcmv_preserve_constraint_mode", "uniform")
+        ).strip().lower()
+        if not self._lcmv_test_enabled or preserve_mode != "realtime_bladerf_measured_u1":
+            return {"fast_protection_attempted": False}
+
+        with self._results_lock:
+            preserve_vector = (
+                np.array(self._realtime_preserve_frozen_vector, copy=True)
+                if self._realtime_preserve_frozen_vector is not None
+                else np.zeros((0,), dtype=np.complex128)
+            )
+        expected_channels = len(self._config.channels)
+        corrected = np.asarray(corrected_chunk, dtype=np.complex128)
+        if (
+            corrected.ndim != 2
+            or corrected.shape[0] != expected_channels
+            or preserve_vector.size != expected_channels
+        ):
+            return {"fast_protection_attempted": False}
+
+        covariance = spatial_covariance(corrected)
+        activation = self._lcmv_jammer_activation_evidence(
+            covariance=covariance,
+            raw_power_metrics=raw_power_metrics,
+            cal_power_metrics=cal_power_metrics,
+        )
+        payload: dict[str, object] = {
+            "fast_protection_attempted": True,
+            **activation,
+        }
+        if not bool(activation.get("lcmv_jammer_activation_evidence_now", False)):
+            return payload
+        if (
+            bool(activation.get("lcmv_jammer_protection_was_active", False))
+            and self._shared_measured_u1_protection_is_available()
+        ):
+            payload["fast_protection_published"] = False
+            payload["fast_protection_reason"] = "protection row already available"
+            return payload
+
+        try:
+            _, eigenvectors = covariance_eigendecomposition_from_matrix(covariance)
+            u1 = np.asarray(eigenvectors[:, 0], dtype=np.complex128).reshape(-1)
+            preserve_norm = normalize_complex_vector(preserve_vector)
+            u1_norm = normalize_complex_vector(u1)
+            desired_identity_coherence = float(abs(np.vdot(preserve_norm, u1_norm)))
+            if desired_identity_coherence >= 0.95:
+                raise ValueError(
+                    "dominant U1 matches the frozen desired transmitter "
+                    f"(coherence={desired_identity_coherence:.3f})"
+                )
+            result = covariance_lcmv_vector_null_weights(
+                covariance=covariance,
+                null_vector=u1,
+                preserve_vector=preserve_vector,
+                diagonal_loading_rel=float(
+                    getattr(self._config, "lcmv_covariance_diagonal_loading_rel", 0.001)
+                ),
+                diagonal_loading_abs=float(
+                    getattr(self._config, "lcmv_covariance_diagonal_loading_abs", 0.0)
+                ),
+                condition_number_limit=float(
+                    self._config.lcmv_test_condition_number_limit
+                ),
+                max_weight_norm=self._lcmv_weight_norm_limit(),
+            )
+            weights = np.asarray(result.weights, dtype=np.complex128).reshape(-1)
+            uniform = uniform_weights(expected_channels)
+            target_suppression_db = ratio_db(
+                self._vector_response_power(uniform, u1_norm),
+                self._vector_response_power(weights, u1_norm),
+            )
+            rejection = self._method_safety_rejection_reason(
+                result=result,
+                target_suppression_db=target_suppression_db,
+                enforce_white_noise_gain=True,
+            )
+            if rejection:
+                raise ValueError(rejection)
+        except Exception as exc:
+            payload["fast_protection_published"] = False
+            payload["fast_protection_reason"] = str(exc)
+            self._lcmv_log.warning(
+                "fast measured-U1 protection rejected: %s",
+                exc,
+            )
+            return payload
+
+        self._set_shared_measured_u1_protection_weights(
+            weights,
+            covariance=covariance,
+            null_vector=u1,
+        )
+        payload.update(
+            {
+                "fast_protection_published": True,
+                "fast_protection_reason": "first jammer-evidence covariance row published",
+                "fast_protection_target_suppression_db": self._json_float(
+                    target_suppression_db
+                ),
+            }
+        )
+        self._lcmv_log.warning(
+            "fast measured-U1 protection published before MUSIC scan: "
+            "input_power_jump_db=%s predicted_u1_suppression_db=%s",
+            self._format_optional_float(
+                activation.get("lcmv_jammer_activation_input_power_jump_db")
+            ),
+            self._format_optional_float(target_suppression_db),
+        )
+        return payload
 
     def _update_healthy_reference_tracking_from_music(
         self,
@@ -4750,8 +5130,8 @@ class BackendRuntime:
         payload.update(self._healthy_reference_payload(u1_norm))
         if isinstance(run_state_payload, dict):
             payload.update(run_state_payload)
-        jammer_latched = bool(
-            payload.get("lcmv_jammer_detected_latched", False)
+        jammer_active = bool(
+            payload.get("lcmv_jammer_protection_active", False)
             or (target_angle_policy or {}).get(
                 "lcmv_target_confirmed_jammer_bearing",
                 False,
@@ -4762,7 +5142,7 @@ class BackendRuntime:
                 current_covariance=covariance,
                 uniform_weights_vector=uniform_w,
                 target_weights=active_w,
-                jammer_latched=jammer_latched,
+                jammer_latched=jammer_active,
             )
         )
         active_method_payload: dict[str, object] = {}
@@ -4936,20 +5316,50 @@ class BackendRuntime:
         if not self._lcmv_test_enabled:
             return
 
+        preserve_mode = str(
+            getattr(self._config, "lcmv_preserve_constraint_mode", "uniform")
+        ).strip().lower()
+        activation_payload: dict[str, object] | None = None
+        if preserve_mode == "realtime_bladerf_measured_u1":
+            # Jammer release must be evaluated even when target selection finds
+            # no valid peak outside the frozen bladeRF guard. Previously those
+            # target-selection exits ran first, so protection could remain
+            # active forever after the physical jammer disappeared.
+            try:
+                activation_covariance = (
+                    spatial_covariance(
+                        np.asarray(calibrated_chunk, dtype=np.complex128)
+                    )
+                    if covariance_matrix is None
+                    else np.asarray(covariance_matrix, dtype=np.complex128)
+                )
+                activation_payload = self._lcmv_jammer_activation_evidence(
+                    covariance=activation_covariance,
+                    raw_power_metrics=raw_power_metrics,
+                    cal_power_metrics=cal_power_metrics,
+                )
+            except Exception:
+                # The validated processing block below owns shape/covariance
+                # error reporting. Do not mask that diagnostic here.
+                activation_payload = None
+
         music_internal = self._finite_metric_float(music_internal_deg)
         music_bearing = self._finite_metric_float(music_bearing_deg)
         if music_internal is None or music_bearing is None:
+            fallback_diagnostics = None
+            if preserve_mode == "realtime_bladerf_measured_u1":
+                fallback_diagnostics = self._realtime_preserve_tracker_payload()
+                if activation_payload is not None:
+                    fallback_diagnostics.update(activation_payload)
             self._activate_lcmv_test_fallback(
                 "no valid MUSIC bearing available",
                 music_internal_deg=music_internal,
                 music_bearing_deg=music_bearing,
+                spatial_vector_diagnostics=fallback_diagnostics,
             )
             return
 
         target_angle_policy = self._lcmv_target_angle_policy(music_bearing)
-        preserve_mode = str(
-            getattr(self._config, "lcmv_preserve_constraint_mode", "uniform")
-        ).strip().lower()
         target_angle_policy.update(
             {
                 "lcmv_target_selection_mode": str(
@@ -4966,6 +5376,8 @@ class BackendRuntime:
         if preserve_mode == "realtime_bladerf_measured_u1":
             tracker_payload = self._realtime_preserve_tracker_payload()
             target_angle_policy.update(tracker_payload)
+            if activation_payload is not None:
+                target_angle_policy.update(activation_payload)
             frozen_internal = self._finite_metric_float(
                 tracker_payload.get("realtime_bladerf_frozen_internal_deg")
             )
@@ -5023,6 +5435,7 @@ class BackendRuntime:
                     ),
                     music_internal_deg=music_internal,
                     music_bearing_deg=music_bearing,
+                    spatial_vector_diagnostics=target_angle_policy,
                 )
                 return
             blade_min = target_angle_policy.get("expected_bladeRF_bearing_min")
@@ -5087,20 +5500,21 @@ class BackendRuntime:
                 covariance_matrix=covariance,
             )
             if preserve_mode == "realtime_bladerf_measured_u1":
-                activation_payload = self._lcmv_jammer_activation_evidence(
-                    covariance=covariance,
-                    raw_power_metrics=raw_power_metrics,
-                    cal_power_metrics=cal_power_metrics,
-                )
+                if activation_payload is None:
+                    activation_payload = self._lcmv_jammer_activation_evidence(
+                        covariance=covariance,
+                        raw_power_metrics=raw_power_metrics,
+                        cal_power_metrics=cal_power_metrics,
+                    )
                 run_state_payload.update(activation_payload)
                 target_angle_policy.update(activation_payload)
-                jammer_latched = bool(
-                    activation_payload.get("lcmv_jammer_detected_latched", False)
+                jammer_active = bool(
+                    activation_payload.get("lcmv_jammer_protection_active", False)
                 )
                 target_angle_policy["lcmv_target_confirmed_jammer_bearing"] = (
-                    jammer_latched
+                    jammer_active
                 )
-                if not jammer_latched:
+                if not jammer_active:
                     target_angle_policy["lcmv_target_classification"] = (
                         "unconfirmed_non_preserve_peak_while_armed"
                     )
@@ -5285,6 +5699,20 @@ class BackendRuntime:
                 u1_method_power = self._vector_response_power(weights, u1_norm)
                 if "u1" in method_name or "measured" in method_name:
                     target_suppression_db = ratio_db(u1_ref_power, u1_method_power)
+                    preserved_norm = normalize_complex_vector(preserve_vector)
+                    desired_identity_coherence = (
+                        float(abs(np.vdot(preserved_norm, u1_norm)))
+                        if preserved_norm.size == u1_norm.size and u1_norm.size
+                        else None
+                    )
+                    if (
+                        desired_identity_coherence is not None
+                        and desired_identity_coherence >= 0.95
+                    ):
+                        return (
+                            "dominant U1 matches the frozen desired transmitter "
+                            f"(coherence={desired_identity_coherence:.3f})"
+                        )
                 else:
                     target_suppression_db = ratio_db(ideal_ref_power, ideal_method_power)
                 return self._method_safety_rejection_reason(
@@ -5293,21 +5721,24 @@ class BackendRuntime:
                     enforce_white_noise_gain=enforce_white_noise_gain,
                 )
 
-            # Publish every accepted measured-U1 covariance update.  Each PRN
-            # receives this one spatial row with a scalar that preserves its
-            # previous complex response; no PRN-specific LCMV solve exists.
+            # Publish every accepted measured-U1 covariance/null context.
+            # The GNSS fanout bank consumes that context to solve an
+            # independent LCMV row for each mapped PRN; this shared row is
+            # retained only for unmapped acquisition channels and fallback.
             if covariance_u1_result is not None:
                 protection_rejection = _preflight_rejection(
                     "covariance_lcmv_measured_u1",
                     covariance_u1_result,
-                    enforce_white_noise_gain=False,
+                    enforce_white_noise_gain=True,
                 )
                 if not protection_rejection:
                     self._set_shared_measured_u1_protection_weights(
                         np.asarray(
                             getattr(covariance_u1_result, "weights", []),
                             dtype=np.complex128,
-                        )
+                        ),
+                        covariance=covariance,
+                        null_vector=u1,
                     )
 
             active_lcmv_null_method = self._lcmv_test_null_method
@@ -5330,7 +5761,7 @@ class BackendRuntime:
             active_safety_reason = _preflight_rejection(
                 active_lcmv_method,
                 active_result,
-                enforce_white_noise_gain=False,
+                enforce_white_noise_gain=True,
             )
             if active_safety_reason:
                 raise ValueError(f"active LCMV method rejected: {active_safety_reason}")
@@ -5567,7 +5998,7 @@ class BackendRuntime:
                         False,
                     )
                     and not spatial_vector_diagnostics.get(
-                        "lcmv_jammer_detected_latched",
+                        "lcmv_jammer_protection_active",
                         False,
                     )
                 )
@@ -5909,11 +6340,13 @@ class BackendRuntime:
             try:
                 compute_t0 = time.monotonic()
                 gnss_vector = self._gnss_output_vector(chunk)
+                logical_weights = self._get_gnss_monitor_logical_weights_copy()
                 self._record_runtime_timing(
                     "gnss_combiner_compute",
                     time.monotonic() - compute_t0,
                 )
                 if gnss_vector.size > 0:
+                    health_t0 = time.monotonic()
                     health_vector = (
                         gnss_vector[0]
                         if gnss_vector.ndim == 2
@@ -5941,37 +6374,108 @@ class BackendRuntime:
                             samples_per_chunk=int(gnss_vector.size)
                         )
                         self._reset_gnss_fifo_signal_health()
-                    write_t0 = time.monotonic()
-                    sample_start = int(self._gnss_fifo_samples_written)
-                    if not bridge.write(gnss_vector):
-                        raise RuntimeError(
-                            "GNSS-SDR FIFO did not accept the contiguous IQ chunk"
-                        )
-                    monitor = self._shared_u1_phase_monitor
-                    if monitor is not None:
-                        monitor.submit(
-                            sample_start,
-                            chunk,
-                            self._get_gnss_monitor_logical_weights_copy(),
-                        )
-                    stream_sample_count = int(
-                        gnss_vector.shape[-1]
-                        if gnss_vector.ndim == 2
-                        else gnss_vector.size
+                    self._record_runtime_timing(
+                        "gnss_health_metrics",
+                        time.monotonic() - health_t0,
                     )
-                    self._gnss_fifo_samples_written = (
-                        sample_start + stream_sample_count
+                    output_q = self._gnss_output_queue
+                    if output_q is None:
+                        break
+                    item = _GnssFifoWorkItem(
+                        raw_chunk=chunk,
+                        output=gnss_vector,
+                        logical_weights=logical_weights,
                     )
-                    self._record_runtime_timing("gnss_fifo_write", time.monotonic() - write_t0)
+                    publish_t0 = time.monotonic()
+                    if not self._publish_gnss_fifo_work(output_q, item):
+                        break
+                    self._record_runtime_timing(
+                        "gnss_output_queue_publish",
+                        time.monotonic() - publish_t0,
+                    )
+            except Exception as exc:
+                self._handle_gnss_pipeline_error(exc)
+                break
+
+    def _publish_gnss_fifo_work(
+        self,
+        output_q: queue.Queue,
+        item: _GnssFifoWorkItem,
+    ) -> bool:
+        """Apply lossless backpressure between beamforming and FIFO writing."""
+
+        while self._running and self._gnss_output_queue is output_q:
+            try:
+                output_q.put(item, timeout=0.25)
+            except queue.Full:
+                continue
+            self._record_queue_occupancy(output_q, "output")
+            return True
+        return False
+
+    def _gnss_fifo_write_loop(self) -> None:
+        while True:
+            output_q = self._gnss_output_queue
+            if output_q is None:
+                return
+            try:
+                wait_t0 = time.monotonic()
+                item = output_q.get(timeout=0.25)
+                self._record_runtime_timing(
+                    "gnss_fifo_queue_wait",
+                    time.monotonic() - wait_t0,
+                )
+            except queue.Empty:
+                self._record_runtime_timing(
+                    "gnss_fifo_queue_wait",
+                    time.monotonic() - wait_t0,
+                )
+                if not self._running:
+                    break
+                continue
+            if item is None:
+                break
+            bridge = self._gnss_bridge
+            if bridge is None or not bridge.active:
+                break
+            try:
+                write_t0 = time.monotonic()
+                sample_start = int(self._gnss_fifo_samples_written)
+                if not bridge.write(item.output):
+                    raise RuntimeError(
+                        "GNSS-SDR FIFO did not accept the contiguous IQ chunk"
+                    )
+                stream_sample_count = int(
+                    item.output.shape[-1]
+                    if item.output.ndim == 2
+                    else item.output.size
+                )
+                self._gnss_fifo_samples_written = sample_start + stream_sample_count
+                self._record_runtime_timing(
+                    "gnss_fifo_write",
+                    time.monotonic() - write_t0,
+                )
+                monitor = self._shared_u1_phase_monitor
+                if monitor is not None:
+                    monitor_t0 = time.monotonic()
+                    monitor.submit(
+                        sample_start,
+                        item.raw_chunk,
+                        item.logical_weights,
+                    )
+                    self._record_runtime_timing(
+                        "gnss_monitor_submit",
+                        time.monotonic() - monitor_t0,
+                    )
             except Exception as exc:
                 self._handle_gnss_pipeline_error(exc)
                 break
 
     def _fifo_output_source_label(self) -> str:
         if self._shared_phase_fanout_enabled():
-            if self._lcmv_test_enabled and self._lcmv_jammer_detected_latched:
-                return "shared_measured_u1_phase_compensated_prn_fanout"
-            return "shared_uniform_phase_reference_prn_fanout"
+            if self._lcmv_test_enabled and self._lcmv_jammer_protection_active:
+                return "independent_per_prn_measured_vector_lcmv_fanout"
+            return "independent_per_prn_measured_vector_fanout"
         if bool(self._beamformer_transition_payload().get("weight_transition_active")):
             return "weight_transition"
         mode = self._gnss_handoff_mode_label()
@@ -5994,9 +6498,11 @@ class BackendRuntime:
             self._gnss_pipeline_failed = True
             raw_q = self._gnss_raw_queue
             self._gnss_raw_queue = None
+            output_q = self._gnss_output_queue
+            self._gnss_output_queue = None
             bridge = self._gnss_bridge
             self._gnss_bridge = None
-            thread = self._gnss_handoff_thread
+            threads = (self._gnss_handoff_thread, self._gnss_fifo_thread)
 
         self._loggers["errors"].error("%s", msg)
         self._loggers["transport"].error("%s", status_msg)
@@ -6006,9 +6512,16 @@ class BackendRuntime:
                 raw_q.put_nowait(None)
             except queue.Full:
                 pass
+        if output_q is not None:
+            try:
+                output_q.put_nowait(None)
+            except queue.Full:
+                pass
         if bridge is not None:
             bridge.stop(msg)
-        if thread is not None and thread is not threading.current_thread():
+        for thread in threads:
+            if thread is None or thread is threading.current_thread():
+                continue
             try:
                 thread.join(timeout=0.5)
             except Exception:
@@ -6041,26 +6554,49 @@ class BackendRuntime:
     def _record_queue_occupancy(self, q: queue.Queue, which: str) -> None:
         qsize = int(q.qsize())
         maxsize = max(1, int(q.maxsize))
-        self._gnss_raw_q_interval_highwater = max(
-            int(self._gnss_raw_q_interval_highwater),
-            qsize,
-        )
+        if which == "output":
+            self._gnss_output_q_interval_highwater = max(
+                int(self._gnss_output_q_interval_highwater),
+                qsize,
+            )
+            lifetime_highwater = self._gnss_output_q_highwater
+            seen_marks = self._gnss_output_q_marks_logged
+        else:
+            self._gnss_raw_q_interval_highwater = max(
+                int(self._gnss_raw_q_interval_highwater),
+                qsize,
+            )
+            lifetime_highwater = self._gnss_raw_q_highwater
+            seen_marks = self._gnss_raw_q_marks_logged
         ratio = 100.0 * qsize / maxsize
         marks = [25, 50, 75, 90, 100]
-        if qsize <= self._gnss_raw_q_highwater:
+        if qsize <= lifetime_highwater:
             return
-        self._gnss_raw_q_highwater = qsize
-        seen_marks = self._gnss_raw_q_marks_logged
+        if which == "output":
+            self._gnss_output_q_highwater = qsize
+        else:
+            self._gnss_raw_q_highwater = qsize
         for mark in marks:
             if ratio >= mark and mark not in seen_marks:
                 seen_marks.add(mark)
                 self._loggers["transport"].info(
                     "GNSS %s queue high-water: %d/%d (%.0f%%).",
-                    "raw",
+                    which,
                     qsize,
                     maxsize,
                     ratio,
                 )
+
+    @staticmethod
+    def _put_shutdown_sentinel(q: queue.Queue, *, timeout_s: float) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            try:
+                q.put(None, timeout=max(0.001, min(0.1, deadline - time.monotonic())))
+                return True
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    return False
 
     def _publish_gnss_raw_chunk(self, q: queue.Queue, chunk: np.ndarray) -> None:
         # recv_chunk allocates a new array for each receive. Avoid an
@@ -6138,6 +6674,15 @@ class BackendRuntime:
                     phase_metrics["complex_samples_calibrated"], dtype=np.complex64
                 )
                 self._last_phase_ts = time.monotonic()
+            self._fast_realtime_measured_u1_protection_update(
+                corrected_chunk=calibrated_chunk,
+                raw_power_metrics={
+                    key: value for key, value in phase_diag.items() if key.startswith("raw_")
+                },
+                cal_power_metrics={
+                    key: value for key, value in phase_diag.items() if key.startswith("cal_")
+                },
+            )
             now = time.monotonic()
             if (now - self._last_phase_log_ts) >= self._doa_log_interval_s:
                 self._loggers["phase"].info(
@@ -6289,7 +6834,6 @@ class BackendRuntime:
                 self._last_doa_ts = time.monotonic()
                 self._latest_source_count_diagnostics = {
                     "n_sources": int(doa_metrics.get("n_sources", max(int(self._expected_sources), 1))),
-                    "peak_count": doa_metrics.get("doa_peak_count"),
                     "noise_tail_assumed_sources": doa_metrics.get("noise_tail_assumed_sources"),
                     "noise_tail_count": doa_metrics.get("noise_tail_count"),
                     "noise_tail_white_like": doa_metrics.get("noise_tail_white_like"),
@@ -6352,10 +6896,10 @@ class BackendRuntime:
                 bartlett_peaks = doa_metrics.get("bartlett_peaks", [])
                 self._loggers["doa"].info(
                     "doa method=%s nsrc=%d doa_deg_internal=%.2f doa_display_deg=%.2f "
-                    "display=top_zero_clockwise max_raw_spec=%.4f peak_count=%d "
+                    "display=top_zero_clockwise max_raw_spec=%.4f "
                     "peaks_internal=[%s] peaks_display=[%s] "
                     "bartlett_deg_internal=%.2f bartlett_display_deg=%.2f "
-                    "bartlett_peak_count=%d bartlett_peaks_internal=[%s] "
+                    "bartlett_peaks_internal=[%s] "
                     "bartlett_peaks_display=[%s] "
                     "eig_db=[%s] eig_rel_db=[%s] eig_gap_db=[%s] "
                     "noise_tail_k=%d noise_tail_count=%d noise_tail_rel_db=[%s] "
@@ -6366,12 +6910,10 @@ class BackendRuntime:
                     doa_deg,
                     doa_display_deg,
                     float(np.max(raw_spec)),
-                    int(doa_metrics.get("doa_peak_count", 0)),
                     self._format_doa_peaks(doa_peaks, display_angles=False),
                     self._format_doa_peaks(doa_peaks, display_angles=True),
                     float(bartlett_deg) if bartlett_deg is not None else float("nan"),
                     float(bartlett_display_deg),
-                    int(doa_metrics.get("bartlett_peak_count", 0)),
                     self._format_doa_peaks(bartlett_peaks, display_angles=False),
                     self._format_doa_peaks(bartlett_peaks, display_angles=True),
                     self._format_float_vector(doa_metrics.get("covariance_eigenvalues_db", [])),
@@ -6570,7 +7112,6 @@ class BackendRuntime:
             "all_peak_internal_angles_deg": peak_internal,
             "all_peak_display_bearings_deg": peak_display,
             "all_peak_relative_db": peak_relative_db,
-            "peak_count": int(doa_metrics.get("doa_peak_count", 0)),
             "peaks": peaks,
             "bartlett": {
                 "index": int(bartlett_index),
@@ -6578,7 +7119,6 @@ class BackendRuntime:
                 "display_deg": self._json_float(bartlett_display),
                 "raw_spectrum": self._json_float(bartlett_raw[bartlett_index]),
                 "rel_db": self._json_float(bartlett_rel_db[bartlett_index]),
-                "peak_count": int(doa_metrics.get("bartlett_peak_count", 0)),
                 "peaks": bartlett_peaks,
                 "all_peak_internal_angles_deg": bartlett_peak_internal,
                 "all_peak_display_bearings_deg": bartlett_peak_display,
@@ -7174,6 +7714,12 @@ class BackendRuntime:
         raw_q_text = (
             f"{raw_q.qsize()}/{max(1, int(raw_q.maxsize))}" if raw_q is not None else "--"
         )
+        output_q = self._gnss_output_queue
+        output_q_text = (
+            f"{output_q.qsize()}/{max(1, int(output_q.maxsize))}"
+            if output_q is not None
+            else "--"
+        )
         tracking_prns = self._format_satellite_ids(
             gnss_snapshot.get("tracking_satellites"),
             gnss_snapshot.get("tracking_prns"),
@@ -7219,7 +7765,7 @@ class BackendRuntime:
         if not fifo_source:
             fifo_source = self._fifo_output_source_label()
         self._handoff_log.info(
-            "runtime->GNSS snapshot: mode=%s fifo_source=%s raw_q=%s "
+            "runtime->GNSS snapshot: mode=%s fifo_source=%s raw_q=%s output_q=%s "
             "lcmv_enabled=%s lcmv_mode=%s active_lcmv_method=%s active_lcmv_null_method=%s "
             "active_lcmv_weights_source=%s active_lcmv_null_internal_angle_deg=%s "
             "active_lcmv_null_display_bearing_deg=%s active_lcmv_fallback_reason=%s "
@@ -7243,6 +7789,7 @@ class BackendRuntime:
             self._gnss_handoff_mode_label(),
             fifo_source,
             raw_q_text,
+            output_q_text,
             bool(lcmv_status.get("enabled", False)),
             str(lcmv_status.get("mode", "off")),
             str(lcmv_status.get("active_lcmv_method", self._lcmv_test_null_method)),

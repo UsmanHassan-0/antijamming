@@ -30,7 +30,7 @@ def test_summarize_lcmv_run_parses_small_fake_logs(tmp_path) -> None:
     )
     (logs / "doa.log").write_text(
         "2026-07-04 05:44:14,000 | INFO | doa method=music nsrc=1 "
-        "doa_deg_internal=350.00 doa_display_deg=100.00 peak_count=2 "
+        "doa_deg_internal=350.00 doa_display_deg=100.00 "
         "noise_tail_spread_db=4.20 noise_tail_flatness_db=0.70 "
         "noise_tail_white_like=0 "
         "source_est_gap=2 effective_rank=1.50\n",

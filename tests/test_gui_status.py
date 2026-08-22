@@ -2296,7 +2296,7 @@ def test_gui_shows_doa_and_rx_health(qtbot) -> None:
     qtbot.wait(1)
 
 
-def test_gui_displays_current_source_count_estimators(qtbot) -> None:
+def test_gui_displays_configured_music_source_count(qtbot) -> None:
     cfg = StreamConfig(expected_sources=1)
     worker = DummyWorker()
     window = MainWindow(cfg, worker)  # type: ignore[arg-type]
@@ -2306,12 +2306,11 @@ def test_gui_displays_current_source_count_estimators(qtbot) -> None:
     window._on_data_ready(
         {
             "n_sources": 1,
-            "peak_count": 3,
             "gnss_snapshot": {},
         }
     )
 
-    expected = "set 1 | peak-count 3"
+    expected = "set 1"
     assert _plain_text(window._music_sources_label) == f"MUSIC sources: {expected}"
     assert f"MUSIC sources: {expected}" in _plain_text(window._system_info_label)
     assert f"Sources {expected}" in _plain_text(window._antijam_summary_label)

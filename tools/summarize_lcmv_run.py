@@ -41,7 +41,6 @@ class IntervalStats:
     start: datetime
     end: datetime | None = None
     doa: list[float] = field(default_factory=list)
-    peak_counts: Counter[int] = field(default_factory=Counter)
     noise_tail_spread_db: list[float] = field(default_factory=list)
     noise_tail_flatness_db: list[float] = field(default_factory=list)
     noise_tail_white_like: Counter[str] = field(default_factory=Counter)
@@ -366,7 +365,6 @@ def assign_metrics_to_intervals(
             continue
         if kind == "doa":
             append_float(interval.doa, data.get("doa_display_deg"))
-            increment_int(interval.peak_counts, data.get("peak_count"))
             append_float(interval.noise_tail_spread_db, data.get("noise_tail_spread_db"))
             append_float(interval.noise_tail_flatness_db, data.get("noise_tail_flatness_db"))
             white_like = data.get("noise_tail_white_like")
@@ -1299,7 +1297,6 @@ def contains_text(path: Path, needle: str) -> bool:
 def print_interval(interval: IntervalStats) -> None:
     print(f"  {interval.name}: {format_ts(interval.start)} -> {format_ts(interval.end)}")
     print(f"    MUSIC primary bearing: {stat(interval.doa)}")
-    print(f"    peak_count distribution: {dict(interval.peak_counts) or '--'}")
     print(f"    noise_tail_spread_db: {stat(interval.noise_tail_spread_db)}")
     print(f"    noise_tail_flatness_db: {stat(interval.noise_tail_flatness_db)}")
     print(f"    noise_tail_white_like distribution: {dict(interval.noise_tail_white_like) or '--'}")

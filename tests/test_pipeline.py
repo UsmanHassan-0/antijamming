@@ -56,10 +56,8 @@ def test_compute_realtime_metrics_shapes_and_ranges() -> None:
     assert np.isfinite(metrics["bartlett_raw_spectrum"]).all()
     assert np.min(metrics["bartlett_raw_spectrum"]) >= -1e-9
     assert isinstance(metrics["doa_peaks"], list)
-    assert metrics["doa_peak_count"] == len(metrics["doa_peaks"])
-    assert metrics["doa_peak_count"] >= 1
+    assert len(metrics["doa_peaks"]) >= 1
     assert isinstance(metrics["bartlett_peaks"], list)
-    assert metrics["bartlett_peak_count"] == len(metrics["bartlett_peaks"])
 
 
 def test_doa_shared_covariance_matches_independent_reference_formulas() -> None:

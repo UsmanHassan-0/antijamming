@@ -24,6 +24,35 @@ GNSS_INPUT_FILTER_STOPBAND_ATTENUATION_DB = 40.0
 GNSS_INPUT_FILTER_CUTOFF_HZ = 1_385_000.0
 GNSS_INPUT_FILTER_TRANSITION_WIDTH_HZ = 175_000.0
 
+# GNU Radio's firdes.low_pass() uses the Hamming-window attenuation estimate
+# below when GNSS-SDR renders Freq_Xlating_Fir_Filter in low-pass mode.  Keep
+# the calculation here because the per-PRN monitor observes IQ before this FIR
+# while tracking_sample_counter is reported after it.
+GNSS_INPUT_FILTER_HAMMING_ATTENUATION_DB = 53.0
+
+
+def gnss_input_filter_tap_count(sample_rate_hz: float) -> int:
+    """Return the odd Hamming FIR length produced by GNU Radio firdes."""
+
+    sample_rate = float(sample_rate_hz)
+    if sample_rate <= 0.0:
+        raise ValueError("sample_rate_hz must be positive")
+    taps = int(
+        GNSS_INPUT_FILTER_HAMMING_ATTENUATION_DB
+        * sample_rate
+        / (22.0 * GNSS_INPUT_FILTER_TRANSITION_WIDTH_HZ)
+    )
+    taps = max(1, taps)
+    if taps % 2 == 0:
+        taps += 1
+    return taps
+
+
+def gnss_input_filter_group_delay_samples(sample_rate_hz: float) -> int:
+    """Return the linear-phase FIR group delay in samples."""
+
+    return (gnss_input_filter_tap_count(sample_rate_hz) - 1) // 2
+
 # GNSS-SDR tracking monitor UDP exposes current C/N0. The receiver view
 # qualifies non-PVT bars from decoded telemetry plus stable C/N0 history;
 # GNSS-SDR still decides actual loss of lock.
@@ -42,10 +71,13 @@ PVT_LOW_USED_SATELLITE_COUNT = 3
 
 __all__ = [
     "GNSS_INPUT_FILTER_CUTOFF_HZ",
+    "GNSS_INPUT_FILTER_HAMMING_ATTENUATION_DB",
     "GNSS_INPUT_FILTER_PASSBAND_RIPPLE_DB",
     "GNSS_INPUT_FILTER_STOPBAND_HZ",
     "GNSS_INPUT_FILTER_STOPBAND_ATTENUATION_DB",
     "GNSS_INPUT_FILTER_TRANSITION_WIDTH_HZ",
+    "gnss_input_filter_group_delay_samples",
+    "gnss_input_filter_tap_count",
     "GPS_L1_CA_CODE_RATE_HZ",
     "GPS_L1_CA_FREQ_HZ",
     "GPS_L1_CA_NULL_TO_NULL_BANDWIDTH_HZ",

@@ -77,7 +77,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.gnss_1c_channel_count == 10
     assert cfg.gnss_channels_in_acquisition == 10
     assert cfg.ui_update_interval_s == 0.1
-    assert cfg.dsp_update_interval_s == 0.1
+    assert cfg.dsp_update_interval_s == 0.02
     assert cfg.prn_chart_update_interval_s == 0.1
     assert cfg.skyplot_update_interval_s == 0.1
     assert cfg.lcmv_test_enabled is False
@@ -94,6 +94,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_realtime_preserve_max_reference_age_s == 2.0
     assert cfg.lcmv_jammer_activation_min_input_power_jump_db == 3.0
     assert cfg.lcmv_jammer_activation_min_generalized_gain_db == 6.0
+    assert cfg.lcmv_jammer_release_hold_s == 2.0
     assert cfg.lcmv_weight_transition_s == 1.0
     assert VALID_LCMV_METHODS == {
         "covariance_lcmv_ideal",
@@ -109,7 +110,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.one_run_segmentation_enabled is True
     assert cfg.healthy_reference_capture_enabled is True
     assert cfg.lcmv_auto_arm_after_pvt is True
-    assert cfg.process_every_n_chunks == 15
+    assert cfg.process_every_n_chunks == 2
     assert cfg.samples_per_chunk == 32768
     assert cfg.gnss_feed_queue_maxsize == 512
     assert cfg.auto_rate_backoff is False
@@ -531,10 +532,10 @@ def test_runtime_config_applies_opt_in_partial_overlay(
     assert cfg.rx_clipping_component_threshold == 0.98
     assert cfg.rx_clipping_fraction_threshold == 0.001
     assert cfg.ui_update_interval_s == 0.1
-    assert cfg.dsp_update_interval_s == 0.1
+    assert cfg.dsp_update_interval_s == 0.02
     assert cfg.prn_chart_update_interval_s == 0.1
     assert cfg.skyplot_update_interval_s == 0.1
-    assert cfg.process_every_n_chunks == 15
+    assert cfg.process_every_n_chunks == 2
     assert cfg.samples_per_chunk == 32768
     assert cfg.gnss_feed_queue_maxsize == 512
     assert cfg.usrp_addr.startswith(str(profile["usrp_addr"]))

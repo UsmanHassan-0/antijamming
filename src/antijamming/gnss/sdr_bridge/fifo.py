@@ -13,7 +13,12 @@ import numpy as np
 
 _FIFO_STARTUP_PROGRESS_INTERVAL_S = 10.0
 _GNSS_STARTUP_CONSOLE_ENV = "ANTIJAM_GNSS_STARTUP_CONSOLE"
-PER_SOURCE_FIFO_STRIPE_SAMPLES = 4096
+# One 32,768-sample complex64 chunk is 262,144 bytes, while startup raises
+# every FIFO pipe to 1 MiB on the deployment host.  Writing one full runtime
+# chunk per source cuts the ten-source fanout from 80 syscalls/chunk to 10
+# without changing sample order or dropping data.  Smaller chunks naturally
+# use their full size in ``GnssSdrBridge.write``.
+PER_SOURCE_FIFO_STRIPE_SAMPLES = 32_768
 
 
 def complex64_contiguous_vector(samples: np.ndarray) -> np.ndarray:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 from pathlib import Path
@@ -60,6 +61,30 @@ def test_session_finalization_retains_root_logs_and_dual_event_ledger(tmp_path) 
     manifest = json.loads((session.session_dir / "session_manifest.json").read_text())
     assert manifest["finalized"] is True
     assert manifest["stop_reason"] == "unit test"
+
+
+def test_session_manifest_fingerprints_committed_dirty_and_untracked_source(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    setup_module = importlib.import_module("antijamming.logging.setup")
+    expected = {
+        "schema_version": 1,
+        "git_head": "abc123",
+        "git_status_sha256": "status-hash",
+        "git_tracked_diff_sha256": "diff-hash",
+        "untracked_files": [
+            {"path": "notes.txt", "bytes": 4, "sha256": "file-hash"}
+        ],
+    }
+    monkeypatch.setattr(setup_module, "_source_tree_provenance", lambda: expected)
+
+    session = reset_session_logs(tmp_path, setup_logging(tmp_path))
+    manifest = json.loads(
+        (session.session_dir / "session_manifest.json").read_text()
+    )
+
+    assert manifest["source_provenance"] == expected
 
 
 def test_finalization_does_not_overwrite_exact_pid_scoped_gnss_artifacts(
