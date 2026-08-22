@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import select
 
 import numpy as np
 import pytest
@@ -102,7 +103,7 @@ def test_shared_u1_phase_rows_preserve_full_complex_response() -> None:
         )
 
 
-def test_shared_u1_phase_renderer_pins_each_prn_to_one_synchronized_fifo(
+def test_shared_u1_phase_renderer_pins_each_prn_without_global_fifo_backpressure(
     tmp_path: Path,
 ) -> None:
     cfg = StreamConfig(
@@ -115,7 +116,8 @@ def test_shared_u1_phase_renderer_pins_each_prn_to_one_synchronized_fifo(
     rendered = bridge._render_config()
 
     assert "GNSS-SDR.num_sources=4" in rendered
-    assert "GNSS-SDR.synchronize_signal_sources=true" in rendered
+    assert "GNSS-SDR.synchronize_signal_sources=false" in rendered
+    assert "GNSS-SDR.synchronize_signal_sources=true" not in rendered
     for index, prn in enumerate((3, 4, 7, 8)):
         assert f"SignalSource{index}.filename=" in rendered
         assert f"gnss_iq_G{prn:02d}.fifo" in rendered
@@ -136,6 +138,19 @@ def test_ten_source_fifo_fanout_writes_one_full_chunk_per_source(
     bridge._fifo_fds = list(range(len(satellites)))
     calls: list[tuple[int, int]] = []
 
+    class WritablePoll:
+        def __init__(self) -> None:
+            self._fds: list[int] = []
+
+        def register(self, fd: int, _event_mask: int) -> None:
+            self._fds.append(fd)
+
+        def unregister(self, fd: int) -> None:
+            self._fds.remove(fd)
+
+        def poll(self, _timeout_ms: int) -> list[tuple[int, int]]:
+            return [(fd, select.POLLOUT) for fd in self._fds]
+
     def fake_write(fd: int, payload: memoryview) -> int:
         calls.append((fd, len(payload)))
         return len(payload)
@@ -143,6 +158,10 @@ def test_ten_source_fifo_fanout_writes_one_full_chunk_per_source(
     monkeypatch.setattr(
         "antijamming.gnss.sdr_bridge.bridge.os.write",
         fake_write,
+    )
+    monkeypatch.setattr(
+        "antijamming.gnss.sdr_bridge.bridge.select.poll",
+        WritablePoll,
     )
     samples = np.zeros((len(satellites), 32_768), dtype=np.complex64)
 
@@ -154,7 +173,7 @@ def test_ten_source_fifo_fanout_writes_one_full_chunk_per_source(
     assert bridge._write_bytes == len(satellites) * chunk_bytes
 
 
-def test_shared_u1_phase_renderer_uses_dynamic_channel_slots_without_pinned_prns(
+def test_shared_u1_phase_renderer_uses_independent_dynamic_channel_slots(
     tmp_path: Path,
 ) -> None:
     cfg = StreamConfig(
@@ -169,7 +188,8 @@ def test_shared_u1_phase_renderer_uses_dynamic_channel_slots_without_pinned_prns
     rendered = bridge._render_config()
 
     assert "GNSS-SDR.num_sources=4" in rendered
-    assert "GNSS-SDR.synchronize_signal_sources=true" in rendered
+    assert "GNSS-SDR.synchronize_signal_sources=false" in rendered
+    assert "GNSS-SDR.synchronize_signal_sources=true" not in rendered
     assert ".satellite=" not in rendered
     for index in range(4):
         assert f"SignalSource{index}.filename=" in rendered
