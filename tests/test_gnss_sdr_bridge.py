@@ -1763,6 +1763,55 @@ def test_bridge_loss_of_lock_clears_tracking_cno_stability(tmp_path: Path) -> No
     assert prn["cno_unstable_reason"] == "too_few_samples"
 
 
+def test_bridge_loss_requires_fresh_udp_before_same_prn_is_mapped_again(
+    tmp_path: Path,
+) -> None:
+    bridge = _make_tracking_bridge(tmp_path)
+    runtime = BackendRuntime(bridge._cfg, _runtime_loggers())
+    tracking_line = (
+        "Pull-in: Number of samples between Acquisition and Tracking = 1303 "
+        "( 0.00032575 s)for satellite GPS PRN 8 (Block III) in channel 0"
+    )
+    bridge._handle_runtime_line(tracking_line)
+    _append_tracking_monitor_sample(bridge, cno_db_hz=38.0, prn=8)
+    assert runtime._tracking_source_satellites(bridge.snapshot())[0] == 8
+
+    bridge._handle_runtime_line(
+        "Loss of lock in channel 0, satellite GPS PRN 8 (Block III) "
+        "(carrier_lock_fail_counter:5001 code_lock_fail_counter : 0)"
+    )
+    lost = bridge.snapshot()
+    assert lost["prns"][0]["state"] == "lost"
+    assert "tracking_monitor_prn" not in lost["prns"][0]
+    assert runtime._tracking_source_satellites(lost)[0] is None
+
+    bridge._handle_runtime_line(tracking_line)
+    reacquiring = bridge.snapshot()
+    assert reacquiring["prns"][0]["state"] == "tracking"
+    assert "tracking_monitor_prn" not in reacquiring["prns"][0]
+    assert runtime._tracking_source_satellites(reacquiring)[0] is None
+
+    _append_tracking_monitor_sample(bridge, cno_db_hz=38.0, prn=8)
+    assert runtime._tracking_source_satellites(bridge.snapshot())[0] == 8
+
+
+def test_bridge_idle_retires_tracking_state_and_current_mapping(tmp_path: Path) -> None:
+    bridge = _make_tracking_bridge(tmp_path)
+    runtime = BackendRuntime(bridge._cfg, _runtime_loggers())
+    bridge._handle_runtime_line(
+        "Pull-in: Number of samples between Acquisition and Tracking = 1303 "
+        "( 0.00032575 s)for satellite GPS PRN 8 (Block III) in channel 0"
+    )
+    _append_tracking_monitor_sample(bridge, cno_db_hz=38.0, prn=8)
+    assert runtime._tracking_source_satellites(bridge.snapshot())[0] == 8
+
+    bridge._handle_runtime_line("Channel 0 Idle state")
+    idle = bridge.snapshot()
+    assert idle["prns"][0]["state"] == "lost"
+    assert "tracking_monitor_prn" not in idle["prns"][0]
+    assert runtime._tracking_source_satellites(idle)[0] is None
+
+
 def test_bridge_tracking_monitor_prn_moves_channel_assignment(tmp_path: Path) -> None:
     bridge = _make_tracking_bridge(tmp_path)
     bridge._handle_runtime_line(
@@ -1779,6 +1828,7 @@ def test_bridge_tracking_monitor_prn_moves_channel_assignment(tmp_path: Path) ->
     assert prns[9]["tracking_monitor_prn"] == 9
     assert prns[9]["cno_db_hz"] == pytest.approx(38.0)
     assert prns[9]["cno_sample_count"] == PRN_CNO_STABILITY_WINDOW
+    assert [entry["prn"] for entry in snapshot["tracking_monitor"]] == [9]
 
 
 def test_bridge_pvt_output_seen_requires_pvt_monitor_udp(tmp_path: Path) -> None:

@@ -261,11 +261,20 @@ class ReceiverStateMixin:
                     self._tracking_cn0_by_channel.pop(channel, None)
                     self._tracking_prn_by_channel.pop(channel, None)
                     self._tracking_carrier_lock_by_channel.pop(channel, None)
+                    self._latest_tracking_monitor_by_prn.pop(previous_key, None)
             if channel >= 0:
                 self._channel_prn[channel] = sat_key
                 if state != "tracking" or previous_key != sat_key or previous_state != "tracking":
                     self._clear_cno_history(channel, sat_key)
                     self._tracking_cn0_by_channel.pop(channel, None)
+                if state != "tracking":
+                    # A loss/assigned/acquired state ends the current tracking
+                    # monitor epoch. Leaving the old PRN here makes a later
+                    # same-PRN console transition appear confirmed before any
+                    # fresh UDP tracking sample has arrived.
+                    self._tracking_prn_by_channel.pop(channel, None)
+                    self._tracking_carrier_lock_by_channel.pop(channel, None)
+                    self._latest_tracking_monitor_by_prn.pop(sat_key, None)
             entry = dict(self._prn_states.get(sat_key, {}))
             if state != "tracking":
                 entry.pop("telemetry_confirmed", None)
@@ -317,8 +326,16 @@ class ReceiverStateMixin:
             entry = self._prn_states.get(sat_key)
             if entry is not None and entry.get("state") == "assigned":
                 self._prn_states.pop(sat_key, None)
+            elif entry is not None and int(entry.get("channel", -1)) == channel:
+                entry = dict(entry)
+                entry.pop("telemetry_confirmed", None)
+                entry["state"] = "lost"
+                self._prn_states[sat_key] = entry
             self._clear_cno_history(channel, sat_key)
             self._tracking_cn0_by_channel.pop(channel, None)
+            self._tracking_prn_by_channel.pop(channel, None)
+            self._tracking_carrier_lock_by_channel.pop(channel, None)
+            self._latest_tracking_monitor_by_prn.pop(sat_key, None)
         self._handoff_log.info(
             "GNSS receiver state: channel=%d satellite=%s state=idle",
             channel,

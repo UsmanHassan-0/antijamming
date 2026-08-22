@@ -955,6 +955,173 @@ def test_per_prn_bank_adopts_a_new_prn_during_jamming() -> None:
     assert status["G04"]["independent_per_prn_lcmv"] is True
 
 
+def test_per_prn_bank_same_prn_reacquisition_requires_a_new_epoch_vector() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    shared = np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.complex128)
+    old_desired = np.asarray([1.0, 0.7j, -0.3, 0.4 - 0.2j])
+    new_desired = np.asarray([0.2j, 1.0, 0.5 - 0.3j, -0.6])
+    jammer = np.asarray([1.0, -0.5j, 0.2 + 0.7j, -0.8])
+    old_desired /= np.linalg.norm(old_desired)
+    new_desired /= np.linalg.norm(new_desired)
+    jammer /= np.linalg.norm(jammer)
+    covariance = 20.0 * np.outer(jammer, np.conj(jammer)) + np.eye(4)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(),
+        source_count=1,
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+    old_payload = {
+        "G03": {
+            "desired_spatial_vector": old_desired,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 100,
+        }
+    }
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors=old_payload,
+        source_satellites=(3,),
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors=old_payload,
+        source_satellites=(3,),
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=10.1,
+    )
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors={},
+        source_satellites=(None,),
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=11.0,
+    )
+
+    stale_rows, stale_status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": new_desired,
+                "updated_monotonic": 10.9,
+                "tracking_sample_counter": 200,
+            }
+        },
+        source_satellites=(3,),
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=11.1,
+    )
+    np.testing.assert_allclose(stale_rows[0], shared)
+    assert stale_status["G03"]["desired_vector_available"] is False
+    assert stale_status["G03"]["tracking_sample_counter"] is None
+
+    fresh_rows, fresh_status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=shared,
+        shared_measured_u1_available=True,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": new_desired,
+                "updated_monotonic": 11.2,
+                "tracking_sample_counter": 201,
+            }
+        },
+        source_satellites=(3,),
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=11.2,
+    )
+    assert fresh_status["G03"]["tracking_sample_counter"] == 201
+    assert fresh_status["G03"]["independent_per_prn_lcmv"] is True
+    assert abs(np.vdot(fresh_rows[0], jammer)) < 1e-10
+
+
+def test_per_prn_bank_reassignment_rejects_cached_vector_from_old_epoch() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    first = np.asarray([1.0, 0.7j, -0.3, 0.4 - 0.2j])
+    second = np.asarray([0.2j, 1.0, 0.5 - 0.3j, -0.6])
+    first /= np.linalg.norm(first)
+    second /= np.linalg.norm(second)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(),
+        source_count=1,
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors={
+            "G03": {
+                "desired_spatial_vector": first,
+                "updated_monotonic": 10.0,
+                "tracking_sample_counter": 100,
+            }
+        },
+        source_satellites=(3,),
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+
+    stale_rows, stale_status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors={
+            "G04": {
+                "desired_spatial_vector": second,
+                "updated_monotonic": 10.9,
+                "tracking_sample_counter": 200,
+            }
+        },
+        source_satellites=(4,),
+        enabled_now=False,
+        now_monotonic=11.0,
+    )
+    np.testing.assert_allclose(stale_rows[0], common)
+    assert stale_status["G04"]["desired_vector_available"] is False
+
+    _, fresh_status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors={
+            "G04": {
+                "desired_spatial_vector": second,
+                "updated_monotonic": 11.1,
+                "tracking_sample_counter": 201,
+            }
+        },
+        source_satellites=(4,),
+        enabled_now=False,
+        now_monotonic=11.1,
+    )
+    assert fresh_status["G04"]["tracking_sample_counter"] == 201
+    assert fresh_status["G04"]["independent_per_prn_beamforming"] is True
+
+
 def test_per_prn_bank_tracks_a_changed_desired_vector_without_response_jump() -> None:
     common = np.ones((4,), dtype=np.complex128)
     first = np.asarray([1.0, 0.7j, -0.3, 0.4 - 0.2j])
@@ -1152,6 +1319,89 @@ def test_per_prn_jammer_transition_is_not_restarted_by_context_updates() -> None
 
     assert progresses == pytest.approx([index / 10.0 for index in range(1, 11)])
     assert abs(np.vdot(rows[0], jammer)) < 1e-10
+
+
+def test_per_prn_bank_applies_latest_context_after_active_transition() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    desired = np.asarray([1.0, 0.7j, -0.3, 0.4 - 0.2j])
+    first_jammer = np.asarray([1.0, -0.5j, 0.2 + 0.7j, -0.8])
+    latest_jammer = np.asarray([0.3 + 0.4j, -0.7, 1.0j, 0.2])
+    desired /= np.linalg.norm(desired)
+    first_jammer /= np.linalg.norm(first_jammer)
+    latest_jammer /= np.linalg.norm(latest_jammer)
+    first_covariance = (
+        20.0 * np.outer(first_jammer, np.conj(first_jammer)) + np.eye(4)
+    )
+    latest_covariance = (
+        20.0 * np.outer(latest_jammer, np.conj(latest_jammer)) + np.eye(4)
+    )
+    vectors = {
+        "G03": {
+            "desired_spatial_vector": desired,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 100,
+        }
+    }
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(3,),
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=1.0,
+    )
+    baseline, _ = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        desired_vectors=vectors,
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    preserved_response = np.vdot(baseline[0], desired)
+
+    rows = baseline
+    shared = np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.complex128)
+    status = {}
+    for index in range(10):
+        rows, status = bank.advance(
+            shared_common_weights=common,
+            shared_measured_u1_weights=shared,
+            shared_measured_u1_available=True,
+            desired_vectors=vectors,
+            enabled_now=True,
+            covariance=first_covariance if index == 0 else latest_covariance,
+            jammer_vector=first_jammer if index == 0 else latest_jammer,
+            now_monotonic=10.1 + index / 10.0,
+        )
+        assert np.vdot(rows[0], desired) == pytest.approx(
+            preserved_response, abs=1e-10
+        )
+    assert abs(np.vdot(rows[0], first_jammer)) < 1e-10
+    assert abs(np.vdot(rows[0], latest_jammer)) > 1e-3
+    assert status["G03"]["lcmv_context_update_pending"] is True
+
+    second_progress = []
+    for index in range(10):
+        rows, status = bank.advance(
+            shared_common_weights=common,
+            shared_measured_u1_weights=shared,
+            shared_measured_u1_available=True,
+            desired_vectors=vectors,
+            enabled_now=True,
+            covariance=latest_covariance,
+            jammer_vector=latest_jammer,
+            now_monotonic=11.1 + index / 10.0,
+        )
+        second_progress.append(status["G03"]["transition_progress"])
+        assert np.vdot(rows[0], desired) == pytest.approx(
+            preserved_response, abs=1e-10
+        )
+
+    assert second_progress == pytest.approx(
+        [index / 10.0 for index in range(1, 11)]
+    )
+    assert status["G03"]["lcmv_context_update_pending"] is False
+    assert abs(np.vdot(rows[0], latest_jammer)) < 1e-10
 
 
 def test_per_prn_onset_bridge_preserves_full_complex_response() -> None:

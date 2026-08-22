@@ -290,6 +290,7 @@ class UdpMonitorMixin:
                 self._tracking_cn0_by_channel.pop(channel, None)
                 self._tracking_prn_by_channel.pop(channel, None)
                 self._tracking_carrier_lock_by_channel.pop(channel, None)
+                self._latest_tracking_monitor_by_prn.pop(previous_key, None)
             self._channel_prn[channel] = sat_key
             state_entry = self._prn_states.setdefault(
                 sat_key,

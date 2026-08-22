@@ -141,6 +141,91 @@ def test_dynamic_phase_source_mapping_ignores_stale_latest_by_prn_entry() -> Non
     assert runtime._tracking_source_satellites(snapshot) == (None, None, 14, None)
 
 
+def test_per_prn_protection_snapshot_copies_one_atomic_publication() -> None:
+    runtime = BackendRuntime(StreamConfig(), _build_loggers())
+    weights = np.asarray([1.0, -1.0j, 0.5, 0.25j], dtype=np.complex128)
+    covariance = np.diag([4.0, 3.0, 2.0, 1.0]).astype(np.complex128)
+    jammer = np.asarray([1.0, 0.5j, -0.25, 0.75j], dtype=np.complex128)
+    runtime._set_shared_measured_u1_protection_weights(
+        weights,
+        covariance=covariance,
+        null_vector=jammer,
+    )
+
+    actual_weights, available, actual_covariance, actual_jammer = (
+        runtime._get_per_prn_protection_snapshot()
+    )
+    runtime._set_shared_measured_u1_protection_weights(
+        np.ones((4,), dtype=np.complex128),
+        covariance=np.eye(4, dtype=np.complex128),
+        null_vector=np.ones((4,), dtype=np.complex128),
+    )
+
+    assert available is True
+    np.testing.assert_array_equal(actual_weights, weights)
+    np.testing.assert_array_equal(actual_covariance, covariance)
+    np.testing.assert_array_equal(actual_jammer, jammer)
+
+
+def test_dynamic_source_mapping_refresh_is_independent_of_status_cadence(
+    monkeypatch,
+) -> None:
+    cfg = StreamConfig(
+        gnss_shared_u1_phase_compensation_enabled=True,
+        gnss_shared_u1_phase_satellites=(),
+        gnss_1c_channel_count=1,
+        gnss_channels_in_acquisition=1,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    mappings = [3, 4]
+
+    class Bridge:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def snapshot(self) -> dict[str, object]:
+            prn = mappings[min(self.calls, len(mappings) - 1)]
+            self.calls += 1
+            return {
+                "prns": [
+                    {
+                        "channel": 0,
+                        "prn": prn,
+                        "tracking_monitor_prn": prn,
+                        "state": "tracking",
+                        "system": "G",
+                        "signal": "1C",
+                    }
+                ]
+            }
+
+    class Bank:
+        def __init__(self) -> None:
+            self.mappings: list[tuple[int | None, ...]] = []
+
+        def advance(self, **kwargs):
+            self.mappings.append(tuple(kwargs["source_satellites"]))
+            return np.ones((1, 4), dtype=np.complex128), {}
+
+    bridge = Bridge()
+    bank = Bank()
+    runtime._gnss_bridge = bridge  # type: ignore[assignment]
+    runtime._shared_u1_phase_bank = bank  # type: ignore[assignment]
+    times = iter((10.0, 10.02, 10.051))
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.time.monotonic",
+        lambda: next(times),
+    )
+    chunk = np.ones((4, 8), dtype=np.complex64)
+
+    runtime._gnss_shared_u1_phase_output_matrix(chunk)
+    runtime._gnss_shared_u1_phase_output_matrix(chunk)
+    runtime._gnss_shared_u1_phase_output_matrix(chunk)
+
+    assert bridge.calls == 2
+    assert bank.mappings == [(3,), (3,), (4,)]
+
+
 def test_display_bearing_to_internal_angle_convention_is_invertible() -> None:
     assert operator_bearing_to_internal_angle_deg(170.0) == pytest.approx(280.0)
     assert operator_bearing_to_internal_angle_deg(290.0) == pytest.approx(160.0)

@@ -221,6 +221,7 @@ class BackendRuntime:
         self._shared_u1_phase_monitor: SharedU1DesiredVectorMonitor | None = None
         self._shared_u1_phase_bank: PerPrnMeasuredVectorBeamformerBank | None = None
         self._last_shared_u1_phase_status_log_ts = 0.0
+        self._last_shared_u1_source_mapping_refresh_ts = float("-inf")
         self._shared_u1_desired_vectors_cache: dict[str, dict[str, object]] = {}
         self._shared_u1_source_satellites_cache: tuple[int | None, ...] = ()
         self._shared_u1_scalar_fanout_chunks = 0
@@ -622,6 +623,7 @@ class BackendRuntime:
                 else:
                     self._shared_u1_phase_bank = None
                 self._last_shared_u1_phase_status_log_ts = 0.0
+                self._last_shared_u1_source_mapping_refresh_ts = float("-inf")
                 self._shared_u1_desired_vectors_cache = {}
                 self._shared_u1_source_satellites_cache = tuple(
                     satellites
@@ -3191,6 +3193,28 @@ class BackendRuntime:
                 ),
             )
 
+    def _get_per_prn_protection_snapshot(
+        self,
+    ) -> tuple[np.ndarray, bool, np.ndarray, np.ndarray]:
+        """Return one atomic generation of shared and per-PRN protection state."""
+
+        with self._beamformer_lock:
+            return (
+                np.array(
+                    self._shared_measured_u1_protection_weights,
+                    copy=True,
+                ),
+                bool(self._shared_measured_u1_protection_available),
+                np.array(
+                    self._shared_measured_u1_protection_covariance,
+                    copy=True,
+                ),
+                np.array(
+                    self._shared_measured_u1_protection_null_vector,
+                    copy=True,
+                ),
+            )
+
     def _get_gnss_monitor_logical_weights_copy(self) -> np.ndarray:
         """Return the weights that produced the IQ streams GNSS-SDR received."""
 
@@ -3318,16 +3342,21 @@ class BackendRuntime:
         emit_status = bool(
             now - self._last_shared_u1_phase_status_log_ts >= 1.0
         )
+        refresh_source_mapping = bool(
+            now - self._last_shared_u1_source_mapping_refresh_ts >= 0.05
+        )
         monitor = self._shared_u1_phase_monitor
         if emit_status and monitor is not None:
             self._shared_u1_desired_vectors_cache = (
                 monitor.desired_vectors_snapshot()
             )
+        if refresh_source_mapping:
             bridge = self._gnss_bridge
             if bridge is not None:
                 self._shared_u1_source_satellites_cache = (
                     self._tracking_source_satellites(bridge.snapshot())
                 )
+            self._last_shared_u1_source_mapping_refresh_ts = now
         with self._results_lock:
             jammer_latched = bool(self._lcmv_jammer_detected_latched)
             jammer_active = bool(self._lcmv_jammer_protection_active)
@@ -3336,11 +3365,12 @@ class BackendRuntime:
         # sources use an independent measured-vector row before, during, and
         # after jamming.
         common = uniform_weights(len(self._config.channels))
-        protection = self._get_shared_measured_u1_protection_weights_copy()
-        protection_available = self._shared_measured_u1_protection_is_available()
-        protection_covariance, protection_null = (
-            self._get_per_prn_lcmv_context_copy()
-        )
+        (
+            protection,
+            protection_available,
+            protection_covariance,
+            protection_null,
+        ) = self._get_per_prn_protection_snapshot()
         logical, status = bank.advance(
             shared_common_weights=common,
             shared_measured_u1_weights=protection,

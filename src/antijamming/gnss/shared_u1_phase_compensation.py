@@ -211,6 +211,7 @@ class _PerPrnState:
     lcmv_null_residual_abs: float | None = None
     lcmv_condition_number: float | None = None
     lcmv_weight_norm: float | None = None
+    last_lcmv_context_generation: int | None = None
 
 
 class SharedU1PhaseCompensationBank:
@@ -719,8 +720,13 @@ class PerPrnMeasuredVectorBeamformerBank:
         )
         self._max_weight_norm = max(float(max_weight_norm), 1e-6)
         self._states: dict[int, _PerPrnState] = {}
+        self._source_assignments: dict[int, str | None] = {}
+        self._vector_not_before_monotonic: dict[int, float] = {}
         self._jammer_previous = False
         self._last_shared_protection: np.ndarray | None = None
+        self._last_lcmv_covariance: np.ndarray | None = None
+        self._last_lcmv_jammer_vector: np.ndarray | None = None
+        self._lcmv_context_generation = 0
 
     @staticmethod
     def _valid_vector(value: object, size: int) -> np.ndarray | None:
@@ -912,7 +918,7 @@ class PerPrnMeasuredVectorBeamformerBank:
         jammer_rising = jammer_active and not self._jammer_previous
         jammer_falling = not jammer_active and self._jammer_previous
         self._jammer_previous = jammer_active
-        context_changed = bool(
+        shared_context_changed = bool(
             shared_measured_u1_available
             and (
                 self._last_shared_protection is None
@@ -921,7 +927,7 @@ class PerPrnMeasuredVectorBeamformerBank:
                 )
             )
         )
-        if context_changed:
+        if shared_context_changed:
             self._last_shared_protection = np.array(shared, copy=True)
         cov = np.asarray(
             covariance if covariance is not None else [], dtype=np.complex128
@@ -933,6 +939,34 @@ class PerPrnMeasuredVectorBeamformerBank:
             and np.all(np.isfinite(cov))
             and null is not None
         )
+        lcmv_context_changed = bool(
+            lcmv_context_available
+            and (
+                self._last_lcmv_covariance is None
+                or self._last_lcmv_jammer_vector is None
+                or not np.allclose(
+                    self._last_lcmv_covariance,
+                    cov,
+                    rtol=1e-7,
+                    atol=1e-9,
+                )
+                or not np.allclose(
+                    self._last_lcmv_jammer_vector,
+                    null,
+                    rtol=1e-7,
+                    atol=1e-9,
+                )
+            )
+        )
+        if lcmv_context_changed:
+            self._lcmv_context_generation += 1
+            self._last_lcmv_covariance = np.array(cov, copy=True)
+            self._last_lcmv_jammer_vector = np.array(null, copy=True)
+        elif not lcmv_context_available:
+            # Do not let a later reappearance look identical to a context that
+            # was unavailable in between. Every row must reconsider it.
+            self._last_lcmv_covariance = None
+            self._last_lcmv_jammer_vector = None
 
         if self._satellites:
             active_satellites: tuple[int | None, ...] = tuple(self._satellites)
@@ -951,7 +985,23 @@ class PerPrnMeasuredVectorBeamformerBank:
         )
         status: dict[str, object] = {}
         for row_index, prn in enumerate(active_satellites):
+            satellite = f"G{int(prn):02d}" if prn is not None else None
+            assignment_known = row_index in self._source_assignments
+            previous_assignment = self._source_assignments.get(row_index)
+            assignment_changed = bool(
+                assignment_known and previous_assignment != satellite
+            )
+            if assignment_changed:
+                # A channel/FIFO slot has started a new assignment epoch. A
+                # vector published before this boundary belongs to the old
+                # tracking epoch even when the same PRN later returns.
+                self._vector_not_before_monotonic[row_index] = now
+            self._source_assignments[row_index] = satellite
             if prn is None:
+                # A gap is a real end of ownership, not a pause. Keeping this
+                # row's state would freeze old carrier response and LCMV
+                # context into a later same-PRN reacquisition.
+                self._states.pop(row_index, None)
                 row = shared if jammer_active and shared_measured_u1_available else common
                 rows[row_index] = row
                 if emit_status:
@@ -974,7 +1024,7 @@ class PerPrnMeasuredVectorBeamformerBank:
                     }
                 continue
 
-            satellite = f"G{int(prn):02d}"
+            assert satellite is not None
             state = self._states.get(row_index)
             reassigned = state is None or state.satellite != satellite
             if reassigned:
@@ -1002,7 +1052,15 @@ class PerPrnMeasuredVectorBeamformerBank:
             )
             updated = _finite_float(payload.get("updated_monotonic"))
             age = now - updated if updated is not None else math.inf
-            fresh = bool(0.0 <= age <= max(0.1, float(max_vector_age_s)))
+            epoch_floor = self._vector_not_before_monotonic.get(row_index)
+            from_current_assignment = bool(
+                updated is not None
+                and (epoch_floor is None or updated > epoch_floor)
+            )
+            fresh = bool(
+                0.0 <= age <= max(0.1, float(max_vector_age_s))
+                and from_current_assignment
+            )
             try:
                 quality_counter = int(payload.get("tracking_sample_counter"))
             except (TypeError, ValueError):
@@ -1050,6 +1108,12 @@ class PerPrnMeasuredVectorBeamformerBank:
                 state.total_chunks > 0
                 and state.completed_chunks < state.total_chunks
             )
+            pending_lcmv_context = bool(
+                jammer_active
+                and lcmv_context_available
+                and state.last_lcmv_context_generation
+                != self._lcmv_context_generation
+            )
 
             needs_target = bool(
                 state.desired is not None
@@ -1058,8 +1122,13 @@ class PerPrnMeasuredVectorBeamformerBank:
                     or jammer_rising
                     or jammer_falling
                     or (
+                        pending_lcmv_context
+                        and not transition_in_progress
+                    )
+                    or (
                         jammer_active
-                        and context_changed
+                        and not lcmv_context_available
+                        and shared_context_changed
                         and not transition_in_progress
                     )
                     or not state.source.startswith("per_prn_")
@@ -1088,12 +1157,18 @@ class PerPrnMeasuredVectorBeamformerBank:
                     else:
                         target = self._matched_target(state, state.desired)
                         source_label = "per_prn_measured_vector_matched"
-                    self._set_target(
+                    accepted = self._set_target(
                         state,
                         target,
                         source=source_label,
                         immediate=reassigned,
                     )
+                    if accepted:
+                        state.last_lcmv_context_generation = (
+                            self._lcmv_context_generation
+                            if source_label == "per_prn_measured_vector_lcmv"
+                            else None
+                        )
                 except (ValueError, np.linalg.LinAlgError) as exc:
                     state.guard_reason = str(exc)
 
@@ -1114,6 +1189,12 @@ class PerPrnMeasuredVectorBeamformerBank:
             transition_active = bool(
                 state.total_chunks > 0
                 and state.completed_chunks < state.total_chunks
+            )
+            context_update_pending = bool(
+                jammer_active
+                and lcmv_context_available
+                and state.last_lcmv_context_generation
+                != self._lcmv_context_generation
             )
             status_key = (
                 satellite
@@ -1142,6 +1223,15 @@ class PerPrnMeasuredVectorBeamformerBank:
                 "desired_vector_step_deg": state.desired_step_deg,
                 "tracking_sample_counter": state.last_quality_counter,
                 "jammer_context_available": lcmv_context_available,
+                "lcmv_context_generation": (
+                    self._lcmv_context_generation
+                    if lcmv_context_available
+                    else None
+                ),
+                "applied_lcmv_context_generation": (
+                    state.last_lcmv_context_generation
+                ),
+                "lcmv_context_update_pending": context_update_pending,
                 "phase_compensation_applied": state.desired is not None,
                 "phase_compensation_guard_reason": state.guard_reason,
                 "continuity_residual_abs": state.continuity_residual_abs,
