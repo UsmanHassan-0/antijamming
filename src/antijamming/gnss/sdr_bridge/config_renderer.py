@@ -231,10 +231,13 @@ class ConfigRendererMixin:
         source_count = self._shared_u1_phase_source_count()
         rows = [
             f"GNSS-SDR.num_sources={source_count}",
-            # GNSS-SDR normally derives its observables clock from conditioner
-            # zero only. Per-PRN FIFOs are independent scheduler branches, so
-            # that clock must consume every branch in lockstep.
-            "GNSS-SDR.synchronize_signal_sources=true",
+            # The producer writes identical sample counts to every FIFO.  Keep
+            # the GNSS-SDR receiver clock on conditioner zero, as in its normal
+            # multi-source flowgraph.  Making the sample-counter decimator
+            # consume all sources couples all ten scheduler branches: one
+            # temporarily unscheduled channel then blocks the clock, every FIFO
+            # reader, and finally the upstream raw queue.
+            "GNSS-SDR.synchronize_signal_sources=false",
         ]
         for idx, path in enumerate(self._fifo_paths):
             role = f"SignalSource{idx}"

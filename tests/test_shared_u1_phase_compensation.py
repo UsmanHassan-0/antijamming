@@ -93,7 +93,7 @@ def test_shared_u1_phase_rows_preserve_each_prn_response_and_one_null() -> None:
         assert status[satellite]["continuity_residual_abs"] < 1e-12
 
 
-def test_shared_u1_phase_renderer_pins_each_prn_to_one_synchronized_fifo(
+def test_shared_u1_phase_renderer_pins_each_prn_without_global_fifo_backpressure(
     tmp_path: Path,
 ) -> None:
     cfg = StreamConfig(
@@ -106,7 +106,8 @@ def test_shared_u1_phase_renderer_pins_each_prn_to_one_synchronized_fifo(
     rendered = bridge._render_config()
 
     assert "GNSS-SDR.num_sources=4" in rendered
-    assert "GNSS-SDR.synchronize_signal_sources=true" in rendered
+    assert "GNSS-SDR.synchronize_signal_sources=false" in rendered
+    assert "GNSS-SDR.synchronize_signal_sources=true" not in rendered
     for index, prn in enumerate((3, 4, 7, 8)):
         assert f"SignalSource{index}.filename=" in rendered
         assert f"gnss_iq_G{prn:02d}.fifo" in rendered
@@ -114,7 +115,7 @@ def test_shared_u1_phase_renderer_pins_each_prn_to_one_synchronized_fifo(
         assert f"Channel{index}.RF_channel_ID={index}" in rendered
 
 
-def test_shared_u1_phase_renderer_uses_dynamic_channel_slots_without_pinned_prns(
+def test_shared_u1_phase_renderer_uses_independent_dynamic_channel_slots(
     tmp_path: Path,
 ) -> None:
     cfg = StreamConfig(
@@ -129,7 +130,8 @@ def test_shared_u1_phase_renderer_uses_dynamic_channel_slots_without_pinned_prns
     rendered = bridge._render_config()
 
     assert "GNSS-SDR.num_sources=4" in rendered
-    assert "GNSS-SDR.synchronize_signal_sources=true" in rendered
+    assert "GNSS-SDR.synchronize_signal_sources=false" in rendered
+    assert "GNSS-SDR.synchronize_signal_sources=true" not in rendered
     assert ".satellite=" not in rendered
     for index in range(4):
         assert f"SignalSource{index}.filename=" in rendered
