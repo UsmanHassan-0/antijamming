@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import logging
@@ -17,6 +18,7 @@ import pytest
 from antijamming.config import StreamConfig
 from antijamming.gnss import GnssSdrBridge
 from antijamming.gnss.sdr_bridge.bridge import GnssFifoWriteStall
+from antijamming.gnss.sdr_bridge.fifo import PER_SOURCE_FIFO_STRIPE_SAMPLES
 from antijamming.gnss.gnss_sdr import (
     PRN_CARRIER_LOCK_THRESHOLD,
     PRN_CNO_MAX_PEAK_TO_PEAK_DB,
@@ -163,6 +165,222 @@ def test_fifo_fair_poll_identifies_one_stalled_reader_with_bounded_latency(
     finally:
         _close_pipe_fds(write_fds, read_fds)
         reader.join(timeout=1.0)
+
+
+def test_fifo_fair_poll_four_jittered_readers_preserves_every_byte(
+    tmp_path: Path,
+) -> None:
+    bridge, read_fds, write_fds = _pipe_backed_bridge(tmp_path, source_count=4)
+    bridge._fifo_write_stall_timeout_s = 1.0
+    for write_fd in write_fds:
+        fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+
+    sample_count = 65_536
+    base = np.arange(sample_count, dtype=np.float32)
+    samples = np.stack(
+        [
+            (base + source * 100_000 + 1j * (base[::-1] + source)).astype(
+                np.complex64
+            )
+            for source in range(4)
+        ]
+    )
+    expected = [array.tobytes() for array in samples]
+    received = [bytearray() for _ in range(4)]
+
+    def jittered_reader(source_index: int) -> None:
+        read_count = 0
+        target = len(expected[source_index])
+        while len(received[source_index]) < target:
+            request = min(
+                1024 * (source_index + 1),
+                target - len(received[source_index]),
+            )
+            chunk = os.read(read_fds[source_index], request)
+            if not chunk:
+                return
+            received[source_index].extend(chunk)
+            read_count += 1
+            if source_index == 3 and read_count % 4 == 0:
+                time.sleep(0.0005)
+
+    threads = [
+        threading.Thread(target=jittered_reader, args=(source_index,))
+        for source_index in range(4)
+    ]
+    started_at = time.monotonic()
+    try:
+        for thread in threads:
+            thread.start()
+        assert bridge.write(samples)
+        elapsed_s = time.monotonic() - started_at
+        for thread in threads:
+            thread.join(timeout=2.0)
+            assert not thread.is_alive()
+        assert elapsed_s < 2.0
+        assert [bytes(value) for value in received] == expected
+        stripe_bytes = PER_SOURCE_FIFO_STRIPE_SAMPLES * np.dtype(np.complex64).itemsize
+        assert bridge._fifo_max_source_lead_bytes <= stripe_bytes
+    finally:
+        _close_pipe_fds(write_fds, read_fds)
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+
+def test_fifo_fair_poll_reports_all_stalled_sources_with_one_deadline(
+    tmp_path: Path,
+) -> None:
+    bridge, read_fds, write_fds = _pipe_backed_bridge(tmp_path, source_count=4)
+    bridge._fifo_write_stall_timeout_s = 0.05
+    for write_fd in write_fds:
+        fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+    samples = np.ones((4, 8192), dtype=np.complex64)
+
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(GnssFifoWriteStall) as caught:
+            bridge.write(samples)
+        elapsed_s = time.monotonic() - started_at
+        assert elapsed_s < 0.5
+        assert caught.value.stalled_sources == (0, 1, 2, 3)
+        assert len(caught.value.pending_bytes) == 4
+        assert all(value > 0 for value in caught.value.pending_bytes)
+        assert bridge._drop_count == 1
+    finally:
+        _close_pipe_fds(write_fds, read_fds)
+
+
+def test_fifo_reader_disconnect_reports_exact_source_without_hanging(
+    tmp_path: Path,
+) -> None:
+    bridge, read_fds, write_fds = _pipe_backed_bridge(tmp_path, source_count=4)
+    bridge._fifo_write_stall_timeout_s = 0.25
+    os.close(read_fds[2])
+    read_fds[2] = -1
+    samples = np.ones((4, 1024), dtype=np.complex64)
+
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match=r"source=2 .*source_2\.fifo"):
+            bridge.write(samples)
+        assert (time.monotonic() - started_at) < 0.5
+    finally:
+        _close_pipe_fds(write_fds, read_fds)
+
+
+def test_fifo_stop_during_stall_has_bounded_join_and_no_deadlock(
+    tmp_path: Path,
+) -> None:
+    bridge, read_fds, write_fds = _pipe_backed_bridge(tmp_path, source_count=4)
+    bridge._fifo_write_stall_timeout_s = 0.05
+    for write_fd in write_fds:
+        fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+    samples = np.ones((4, 8192), dtype=np.complex64)
+    failures: list[BaseException] = []
+
+    def writer() -> None:
+        try:
+            bridge.write(samples)
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=writer)
+    started_at = time.monotonic()
+    try:
+        thread.start()
+        time.sleep(0.005)
+        bridge.stop("test stop during stalled FIFO")
+        thread.join(timeout=0.5)
+        assert not thread.is_alive()
+        assert (time.monotonic() - started_at) < 0.5
+        assert len(failures) == 1
+        assert isinstance(failures[0], GnssFifoWriteStall)
+        assert bridge._fifo_fds == []
+    finally:
+        _close_pipe_fds(write_fds, read_fds)
+        thread.join(timeout=1.0)
+
+
+def test_fifo_ten_source_production_chunk_stress_is_byte_exact(
+    tmp_path: Path,
+) -> None:
+    """Exercise the deployed 10-source, 32,768-sample handoff repeatedly."""
+
+    source_count = 10
+    chunk_count = 64
+    sample_count = 32_768
+    bridge, read_fds, write_fds = _pipe_backed_bridge(
+        tmp_path,
+        source_count=source_count,
+    )
+    bridge._fifo_write_stall_timeout_s = 0.25
+    for write_fd in write_fds:
+        fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+
+    base = np.arange(sample_count, dtype=np.float32)
+    samples = np.stack(
+        [
+            (base + source * 100_000 + 1j * (base[::-1] + source)).astype(
+                np.complex64
+            )
+            for source in range(source_count)
+        ]
+    )
+    expected_hashes = [hashlib.sha256() for _ in range(source_count)]
+    received_hashes = [hashlib.sha256() for _ in range(source_count)]
+    received_bytes = [0 for _ in range(source_count)]
+    expected_bytes = chunk_count * sample_count * np.dtype(np.complex64).itemsize
+    reader_failures: list[BaseException] = []
+
+    for _ in range(chunk_count):
+        for source in range(source_count):
+            expected_hashes[source].update(samples[source].tobytes())
+
+    def reader(source_index: int) -> None:
+        try:
+            while received_bytes[source_index] < expected_bytes:
+                chunk = os.read(read_fds[source_index], 65_536)
+                if not chunk:
+                    raise EOFError(
+                        f"source {source_index} ended at "
+                        f"{received_bytes[source_index]}/{expected_bytes} bytes"
+                    )
+                received_hashes[source_index].update(chunk)
+                received_bytes[source_index] += len(chunk)
+        except BaseException as exc:
+            reader_failures.append(exc)
+
+    threads = [
+        threading.Thread(target=reader, args=(source,), name=f"fifo_reader_{source}")
+        for source in range(source_count)
+    ]
+    write_latencies_s: list[float] = []
+    started_at = time.monotonic()
+    try:
+        for thread in threads:
+            thread.start()
+        for _ in range(chunk_count):
+            write_started_at = time.monotonic()
+            assert bridge.write(samples)
+            write_latencies_s.append(time.monotonic() - write_started_at)
+        for thread in threads:
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
+
+        assert not reader_failures
+        assert received_bytes == [expected_bytes for _ in range(source_count)]
+        assert [value.hexdigest() for value in received_hashes] == [
+            value.hexdigest() for value in expected_hashes
+        ]
+        assert max(write_latencies_s) < bridge._fifo_write_stall_timeout_s
+        # A generous bound catches deadlocks while remaining stable on loaded CI hosts.
+        assert (time.monotonic() - started_at) < 10.0
+        stripe_bytes = PER_SOURCE_FIFO_STRIPE_SAMPLES * np.dtype(np.complex64).itemsize
+        assert bridge._fifo_max_source_lead_bytes <= stripe_bytes
+    finally:
+        _close_pipe_fds(write_fds, read_fds)
+        for thread in threads:
+            thread.join(timeout=1.0)
 
 
 def _tracking_monitor_message(
@@ -2138,6 +2356,17 @@ class _FakeBridge:
         self.stop_reasons.append(reason)
 
 
+class _FailingWriteBridge(_FakeBridge):
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__()
+        self.failure = failure
+        self.write_calls = 0
+
+    def write(self, _samples: np.ndarray) -> bool:
+        self.write_calls += 1
+        raise self.failure
+
+
 class _FakeOverflowDevice:
     def __init__(self, channels: int) -> None:
         self.channels = channels
@@ -2338,6 +2567,44 @@ def test_backend_handles_concurrent_gnss_failure_only_once() -> None:
     assert failures == []
     assert runtime._running is True
     assert runtime._stop_reason == "not started"
+
+
+def test_backend_handoff_thread_exits_and_preserves_sdr_on_bounded_fifo_stall() -> None:
+    statuses: list[str] = []
+    runtime = BackendRuntime(
+        StreamConfig(gnss_shared_u1_phase_compensation_enabled=False),
+        _runtime_loggers(),
+        on_status=statuses.append,
+    )
+    stall = GnssFifoWriteStall(
+        stalled_sources=(3,),
+        stalled_paths=(Path("source_3.fifo"),),
+        pending_bytes=(4096,),
+        timeout_s=0.05,
+    )
+    bridge = _FailingWriteBridge(stall)
+    raw_q: queue.Queue = queue.Queue(maxsize=4)
+    raw_q.put(np.ones((len(runtime._config.channels), 1024), dtype=np.complex64))
+    runtime._gnss_bridge = bridge  # type: ignore[assignment]
+    runtime._gnss_raw_queue = raw_q
+    runtime._running = True
+    thread = threading.Thread(
+        target=runtime._gnss_beamform_loop,
+        name="gnss_ordered_handoff_test",
+    )
+    runtime._gnss_handoff_thread = thread
+
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert bridge.write_calls == 1
+    assert bridge.stop_reasons == [f"GNSS pipeline failed: {stall}"]
+    assert runtime._gnss_pipeline_failed is True
+    assert runtime._gnss_raw_queue is None
+    assert runtime._gnss_bridge is None
+    assert runtime._running is True
+    assert statuses == [f"GNSS-SDR handoff paused; SDR stream still running ({stall})"]
 
 
 def test_backend_overflow_stop_reason_is_recorded() -> None:
