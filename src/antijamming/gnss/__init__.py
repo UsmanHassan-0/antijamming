@@ -6,6 +6,7 @@ from .shared_u1_phase_compensation import (
     SharedU1DesiredVectorMonitor,
     SharedU1PhaseCompensationBank,
     apply_shared_phase_fanout,
+    jammer_nullspace_acquisition_rows,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "SharedU1DesiredVectorMonitor",
     "SharedU1PhaseCompensationBank",
     "apply_shared_phase_fanout",
+    "jammer_nullspace_acquisition_rows",
 ]

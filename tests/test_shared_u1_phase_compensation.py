@@ -14,6 +14,7 @@ from antijamming.gnss import (
     SharedU1DesiredVectorMonitor,
     SharedU1PhaseCompensationBank,
     apply_shared_phase_fanout,
+    jammer_nullspace_acquisition_rows,
 )
 from antijamming.gnss.shared_u1_phase_compensation import (
     gps_l1_ca_code,
@@ -72,6 +73,7 @@ def _monitor_snapshot(
                 "channel": channel,
                 "state": state,
                 "tracking_monitor_prn": prn,
+                "tracking_monitor_cno_db_hz": 45.0,
             }
         ],
     }
@@ -861,6 +863,165 @@ def test_noncollinear_transition_rows_use_general_matrix() -> None:
     np.testing.assert_array_equal(actual, expected)
 
 
+def test_jammer_nullspace_acquisition_rows_span_nullspace_without_noise_gain() -> None:
+    jammer = np.asarray([1.0, -0.4j, 0.3 + 0.2j, -0.7], dtype=np.complex128)
+    jammer /= np.linalg.norm(jammer)
+
+    rows = jammer_nullspace_acquisition_rows(jammer, source_count=10)
+
+    assert rows.shape == (10, 4)
+    assert np.linalg.matrix_rank(rows) == 3
+    np.testing.assert_allclose(
+        np.linalg.norm(rows, axis=1),
+        np.full((10,), 2.0),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(np.conj(rows) @ jammer, 0.0, atol=1e-12)
+
+
+def test_jammer_nullspace_acquisition_rows_null_two_mode_subspace() -> None:
+    rng = np.random.default_rng(20260823)
+    manifold = rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4))
+    null_vectors = np.asarray(np.linalg.qr(manifold)[0][:, :2], dtype=np.complex128)
+
+    rows = jammer_nullspace_acquisition_rows(null_vectors, source_count=10)
+
+    assert rows.shape == (10, 4)
+    assert np.linalg.matrix_rank(rows) == 2
+    np.testing.assert_allclose(
+        np.linalg.norm(rows, axis=1),
+        np.full((10,), 2.0),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        np.conj(rows) @ null_vectors,
+        np.zeros((10, 2), dtype=np.complex128),
+        atol=1e-12,
+    )
+
+
+def test_per_prn_bank_uses_distinct_nullspace_rows_until_tracking_vector_exists() -> None:
+    common = np.full((4,), 0.25, dtype=np.complex128)
+    jammer = np.asarray([1.0, -0.4j, 0.3 + 0.2j, -0.7], dtype=np.complex128)
+    jammer /= np.linalg.norm(jammer)
+    acquisition = jammer_nullspace_acquisition_rows(jammer, source_count=4)
+    acquisition[0] = common
+    acquisition_modes = (
+        "frequency_notch_only",
+        "jammer_nullspace",
+        "jammer_nullspace",
+        "jammer_nullspace",
+    )
+    covariance = 30.0 * np.outer(jammer, np.conj(jammer)) + np.eye(4)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(),
+        source_count=4,
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+
+    waiting, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=True,
+        acquisition_rows=acquisition,
+        acquisition_modes=acquisition_modes,
+        desired_vectors={},
+        source_satellites=(None, None, None, None),
+        enabled_now=True,
+        covariance=covariance,
+        jammer_vector=jammer,
+        now_monotonic=10.0,
+    )
+
+    np.testing.assert_allclose(waiting, acquisition, atol=1e-12)
+    assert status["source_00"]["frequency_notch_only_acquisition_beam"] is True
+    assert status["source_00"]["shared_spatial_solution"] is False
+    assert status["source_01"]["jammer_nullspace_acquisition_beam"] is True
+    assert status["source_01"]["acquisition_beam_mode"] == "jammer_nullspace"
+    assert status["source_03"]["acquisition_beam_index"] == 3
+
+
+def test_per_prn_bank_accepts_absent_cold_start_rows_before_detector_activation() -> None:
+    common = np.full((4,), 0.25, dtype=np.complex128)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(),
+        source_count=4,
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+
+    rows, status = bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=common,
+        shared_measured_u1_available=False,
+        acquisition_rows=None,
+        acquisition_modes=None,
+        desired_vectors={},
+        source_satellites=(None, None, None, None),
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+
+    np.testing.assert_allclose(rows, np.tile(common, (4, 1)))
+    assert status["source_00"]["source"] == "uniform_acquisition_waiting_for_prn"
+
+
+def test_per_prn_acquisition_row_rotates_only_at_candidate_boundary() -> None:
+    common = np.full((4,), 0.25, dtype=np.complex128)
+    jammer = np.asarray([1.0, -0.4j, 0.3 + 0.2j, -0.7], dtype=np.complex128)
+    jammer /= np.linalg.norm(jammer)
+    acquisition = jammer_nullspace_acquisition_rows(jammer, source_count=4)
+    covariance = 30.0 * np.outer(jammer, np.conj(jammer)) + np.eye(4)
+    bank = PerPrnMeasuredVectorBeamformerBank(
+        satellites=(),
+        source_count=4,
+        channel_count=4,
+        sample_rate_hz=100.0,
+        samples_per_chunk=10,
+        transition_s=0.0,
+    )
+    kwargs = {
+        "shared_common_weights": common,
+        "shared_measured_u1_weights": common,
+        "shared_measured_u1_available": True,
+        "acquisition_rows": acquisition,
+        "acquisition_modes": tuple("jammer_nullspace" for _ in range(4)),
+        "desired_vectors": {},
+        "enabled_now": True,
+        "covariance": covariance,
+        "jammer_vector": jammer,
+    }
+
+    first, first_status = bank.advance(
+        **kwargs,
+        source_satellites=(3, None, None, None),
+        now_monotonic=10.0,
+    )
+    same, same_status = bank.advance(
+        **kwargs,
+        source_satellites=(3, None, None, None),
+        now_monotonic=10.1,
+    )
+    second, second_status = bank.advance(
+        **kwargs,
+        source_satellites=(4, None, None, None),
+        now_monotonic=10.2,
+    )
+
+    np.testing.assert_allclose(first[0], acquisition[0], atol=1e-12)
+    np.testing.assert_allclose(same[0], first[0], atol=1e-12)
+    np.testing.assert_allclose(second[0], acquisition[1], atol=1e-12)
+    assert first_status["G03"]["acquisition_beam_index"] == 0
+    assert same_status["G03"]["acquisition_candidate_epoch"] == 0
+    assert second_status["G04"]["acquisition_beam_index"] == 1
+    assert second_status["G04"]["acquisition_candidate_epoch"] == 1
+
+
 def test_per_prn_bank_uses_distinct_measured_rows_without_jammer() -> None:
     common = np.ones((4,), dtype=np.complex128)
     desired_3 = np.asarray([1.0, 0.8j, -0.4, 0.2 - 0.1j])
@@ -906,6 +1067,10 @@ def test_per_prn_bank_uses_distinct_measured_rows_without_jammer() -> None:
     assert status["G03"]["independent_per_prn_beamforming"] is True
     assert status["G04"]["independent_per_prn_beamforming"] is True
     assert status["G03"]["desired_vector_frozen"] is False
+    assert status["G03"]["transition_completed_chunks"] == 1
+    assert status["G03"]["transition_total_chunks"] == 1
+    assert len(status["G03"]["transition_start_logical_weights"]["real"]) == 4
+    assert len(status["G03"]["transition_target_logical_weights"]["imag"]) == 4
 
 
 def test_per_prn_bank_lcmv_nulls_jammer_and_preserves_each_prn() -> None:
@@ -1238,7 +1403,7 @@ def test_per_prn_bank_tracks_a_changed_desired_vector_without_response_jump() ->
     assert status["G03"]["tracking_sample_counter"] == 200
 
 
-def test_per_prn_bank_freezes_pre_jammer_vector_until_release() -> None:
+def test_per_prn_bank_tracks_quality_gated_vector_during_jamming() -> None:
     common = np.ones((4,), dtype=np.complex128)
     before_vector = np.asarray([1.0, 0.7j, -0.3, 0.4 - 0.2j])
     contaminated_vector = np.asarray([0.2j, 1.0, 0.5 - 0.3j, -0.6])
@@ -1302,14 +1467,20 @@ def test_per_prn_bank_freezes_pre_jammer_vector_until_release() -> None:
         now_monotonic=11.0,
     )
 
-    frozen = np.asarray(
+    updated_vector = np.asarray(
         active_status["G03"]["desired_spatial_vector"]["real"]
     ) + 1j * np.asarray(
         active_status["G03"]["desired_spatial_vector"]["imag"]
     )
-    assert active_status["G03"]["desired_vector_frozen"] is True
-    assert active_status["G03"]["tracking_sample_counter"] == 100
-    assert phase_invariant_coherence(frozen, before_vector) > 1.0 - 1e-12
+    assert active_status["G03"]["desired_vector_frozen"] is False
+    assert active_status["G03"]["desired_vector_update_policy"] == (
+        "quality_gated_prn_despread_live_during_jamming"
+    )
+    assert active_status["G03"]["tracking_sample_counter"] == 200
+    assert (
+        phase_invariant_coherence(updated_vector, contaminated_vector)
+        > 1.0 - 1e-12
+    )
     assert abs(np.vdot(protected[0], jammer)) < 1e-10
 
     _, released_status = bank.advance(
@@ -1884,5 +2055,5 @@ def test_per_prn_module_contains_independent_covariance_solver() -> None:
     source = Path(
         "src/antijamming/gnss/shared_u1_phase_compensation.py"
     ).read_text(encoding="utf-8")
-    assert "covariance_lcmv_vector_null_weights" in source
+    assert "covariance_lcmv_subspace_null_weights" in source
     assert "class PerPrnMeasuredVectorBeamformerBank" in source

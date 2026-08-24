@@ -1,9 +1,9 @@
 """Measured-vector GNSS beamforming with per-PRN response continuity.
 
-Every GNSS-SDR source uses the same spatial LCMV weight vector.  A complex
-scalar is applied per tracked PRN so switching to that shared vector preserves
-the PRN's previous complex array response.  Scalar multiplication cannot move
-or weaken the shared spatial null.
+Before a PRN is tracked, GNSS-SDR source slots may use a bank of independent
+jammer-nullspace acquisition beams.  Once tracking supplies a measured desired
+vector, that source receives its own LCMV row and preserves its previous complex
+response across every spatial update.
 
 The legacy shared-row bank remains for regression comparison.  The runtime uses
 ``PerPrnMeasuredVectorBeamformerBank`` so every mapped PRN receives its own
@@ -28,7 +28,7 @@ from typing import Callable
 import numpy as np
 
 from antijamming.dsp.beamforming.lcmv import (
-    covariance_lcmv_vector_null_weights,
+    covariance_lcmv_subspace_null_weights,
 )
 
 
@@ -84,6 +84,74 @@ def phase_invariant_coherence(a: np.ndarray, b: np.ndarray) -> float:
     return float(
         np.clip(abs(np.vdot(left, right)) ** 2 / denominator**2, 0.0, 1.0)
     )
+
+
+def jammer_nullspace_acquisition_rows(
+    jammer_vector: np.ndarray,
+    *,
+    source_count: int,
+) -> np.ndarray:
+    """Return diverse acquisition rows orthogonal to measured interference.
+
+    A single blind preserve direction can suppress an unknown satellite before
+    it ever reaches tracking.  This codebook projects spatial Fourier probes
+    into the measured jammer's orthogonal complement instead.  Cycling those
+    probes across the GNSS-SDR source slots covers the remaining spatial
+    subspace while every row keeps an exact null on the same interferer.
+
+    Rows use the same norm as the runtime's uniform-sum combiner.  This keeps
+    white-noise gain and sample scale identical across notch-only and spatially
+    nulled acquisition slots.
+    """
+
+    jammer = np.asarray(jammer_vector, dtype=np.complex128)
+    if jammer.ndim == 1:
+        jammer = jammer[:, np.newaxis]
+    count = int(source_count)
+    if count <= 0:
+        raise ValueError("jammer-nullspace acquisition source count must be positive")
+    if (
+        jammer.ndim != 2
+        or jammer.shape[0] < 2
+        or jammer.shape[1] < 1
+        or jammer.shape[1] >= jammer.shape[0]
+        or not np.all(np.isfinite(jammer))
+        or float(np.linalg.norm(jammer)) <= np.finfo(np.float64).tiny
+    ):
+        raise ValueError("jammer-nullspace acquisition vectors are invalid")
+    singular_values = np.linalg.svd(jammer, compute_uv=False)
+    tolerance = (
+        max(jammer.shape) * np.finfo(np.float64).eps * singular_values[0]
+    )
+    rank = int(np.count_nonzero(singular_values > tolerance))
+    if rank != jammer.shape[1]:
+        raise ValueError("jammer-nullspace acquisition vectors are dependent")
+    basis = np.asarray(np.linalg.qr(jammer, mode="reduced")[0], dtype=np.complex128)
+    projector = np.eye(jammer.shape[0], dtype=np.complex128) - basis @ basis.conj().T
+    target_norm = math.sqrt(float(jammer.shape[0]))
+    sensor = np.arange(jammer.shape[0], dtype=np.float64)
+    rows = np.empty((count, jammer.shape[0]), dtype=np.complex128)
+    for source_index in range(count):
+        spatial_frequency = 2.0 * math.pi * source_index / float(count)
+        probe = np.exp(1j * spatial_frequency * sensor) / math.sqrt(
+            float(jammer.shape[0])
+        )
+        projected = projector @ probe
+        norm = float(np.linalg.norm(projected))
+        if norm <= 1e-10:
+            # A Fourier probe can coincide with the jammer vector.  A projected
+            # sensor basis vector provides a deterministic nonzero replacement.
+            for sensor_index in range(jammer.shape[0]):
+                sensor_basis = np.zeros((jammer.shape[0],), dtype=np.complex128)
+                sensor_basis[(source_index + sensor_index) % jammer.shape[0]] = 1.0
+                projected = projector @ sensor_basis
+                norm = float(np.linalg.norm(projected))
+                if norm > 1e-10:
+                    break
+        if norm <= 1e-10:
+            raise ValueError("jammer-nullspace acquisition basis is degenerate")
+        rows[source_index] = target_norm * projected / norm
+    return rows
 
 
 def apply_shared_phase_fanout(
@@ -721,11 +789,12 @@ class PerPrnMeasuredVectorBeamformerBank:
         self._max_weight_norm = max(float(max_weight_norm), 1e-6)
         self._states: dict[int, _PerPrnState] = {}
         self._source_assignments: dict[int, str | None] = {}
+        self._acquisition_epoch_by_source: dict[int, int] = {}
         self._vector_not_before_monotonic: dict[int, float] = {}
         self._jammer_previous = False
         self._last_shared_protection: np.ndarray | None = None
         self._last_lcmv_covariance: np.ndarray | None = None
-        self._last_lcmv_jammer_vector: np.ndarray | None = None
+        self._last_lcmv_jammer_vectors: np.ndarray | None = None
         self._lcmv_context_generation = 0
 
     @staticmethod
@@ -740,6 +809,29 @@ class PerPrnMeasuredVectorBeamformerBank:
         ):
             return None
         return vector / float(np.linalg.norm(vector))
+
+    @staticmethod
+    def _valid_vector_matrix(value: object, size: int) -> np.ndarray | None:
+        matrix = np.asarray(
+            value if value is not None else [], dtype=np.complex128
+        )
+        if matrix.ndim == 1:
+            matrix = matrix[:, np.newaxis]
+        if (
+            matrix.ndim != 2
+            or matrix.shape[0] != int(size)
+            or matrix.shape[1] < 1
+            or matrix.shape[1] >= int(size)
+            or not np.all(np.isfinite(matrix))
+        ):
+            return None
+        singular_values = np.linalg.svd(matrix, compute_uv=False)
+        if singular_values.size == 0 or singular_values[0] <= np.finfo(np.float64).tiny:
+            return None
+        tolerance = max(matrix.shape) * np.finfo(np.float64).eps * singular_values[0]
+        if int(np.count_nonzero(singular_values > tolerance)) != matrix.shape[1]:
+            return None
+        return np.asarray(np.linalg.qr(matrix, mode="reduced")[0], dtype=np.complex128)
 
     @staticmethod
     def _align_to_reference(
@@ -840,14 +932,14 @@ class PerPrnMeasuredVectorBeamformerBank:
         *,
         desired: np.ndarray,
         covariance: np.ndarray,
-        jammer_vector: np.ndarray,
+        jammer_vectors: np.ndarray,
         diagonal_loading_rel: float,
         diagonal_loading_abs: float,
         condition_number_limit: float,
     ) -> np.ndarray:
-        result = covariance_lcmv_vector_null_weights(
+        result = covariance_lcmv_subspace_null_weights(
             covariance=covariance,
-            null_vector=jammer_vector,
+            null_vectors=jammer_vectors,
             preserve_vector=desired,
             diagonal_loading_rel=diagonal_loading_rel,
             diagonal_loading_abs=diagonal_loading_abs,
@@ -860,7 +952,7 @@ class PerPrnMeasuredVectorBeamformerBank:
             desired=desired,
         )
         state.lcmv_null_residual_abs = float(
-            abs(np.vdot(target, result.null_vector))
+            np.max(np.abs(result.null_vectors.conj().T @ target))
         )
         state.lcmv_condition_number = float(result.condition_number)
         state.lcmv_weight_norm = float(np.linalg.norm(target))
@@ -895,11 +987,14 @@ class PerPrnMeasuredVectorBeamformerBank:
         shared_common_weights: np.ndarray,
         shared_measured_u1_weights: np.ndarray,
         shared_measured_u1_available: bool,
+        acquisition_rows: np.ndarray | None = None,
+        acquisition_modes: tuple[str, ...] | None = None,
         desired_vectors: dict[str, dict[str, object]],
         source_satellites: tuple[int | None, ...] | None = None,
         enabled_now: bool,
         covariance: np.ndarray | None = None,
         jammer_vector: np.ndarray | None = None,
+        jammer_vectors: np.ndarray | None = None,
         diagonal_loading_rel: float = 1e-3,
         diagonal_loading_abs: float = 0.0,
         condition_number_limit: float = 1e8,
@@ -913,6 +1008,21 @@ class PerPrnMeasuredVectorBeamformerBank:
         ).reshape(-1)
         if common.size != self._channel_count or shared.size != self._channel_count:
             raise ValueError("per-PRN beamformer weight length mismatch")
+        acquisition = np.asarray(
+            acquisition_rows if acquisition_rows is not None else [],
+            dtype=np.complex128,
+        )
+        acquisition_available = acquisition.shape == (
+            self._source_count,
+            self._channel_count,
+        ) and np.all(np.isfinite(acquisition))
+        if acquisition_rows is not None and not acquisition_available:
+            raise ValueError("per-PRN acquisition-row matrix shape or values are invalid")
+        modes = tuple(str(value) for value in (acquisition_modes or ()))
+        if acquisition_available and not modes:
+            modes = tuple("jammer_nullspace" for _ in range(self._source_count))
+        if acquisition_modes is not None and len(modes) != self._source_count:
+            raise ValueError("per-PRN acquisition-mode count is invalid")
         now = time.monotonic() if now_monotonic is None else float(now_monotonic)
         jammer_active = bool(enabled_now)
         jammer_rising = jammer_active and not self._jammer_previous
@@ -932,18 +1042,21 @@ class PerPrnMeasuredVectorBeamformerBank:
         cov = np.asarray(
             covariance if covariance is not None else [], dtype=np.complex128
         )
-        null = self._valid_vector(jammer_vector, self._channel_count)
+        supplied_nulls = (
+            jammer_vectors if jammer_vectors is not None else jammer_vector
+        )
+        nulls = self._valid_vector_matrix(supplied_nulls, self._channel_count)
         lcmv_context_available = bool(
             shared_measured_u1_available
             and cov.shape == (self._channel_count, self._channel_count)
             and np.all(np.isfinite(cov))
-            and null is not None
+            and nulls is not None
         )
         lcmv_context_changed = bool(
             lcmv_context_available
             and (
                 self._last_lcmv_covariance is None
-                or self._last_lcmv_jammer_vector is None
+                or self._last_lcmv_jammer_vectors is None
                 or not np.allclose(
                     self._last_lcmv_covariance,
                     cov,
@@ -951,8 +1064,8 @@ class PerPrnMeasuredVectorBeamformerBank:
                     atol=1e-9,
                 )
                 or not np.allclose(
-                    self._last_lcmv_jammer_vector,
-                    null,
+                    self._last_lcmv_jammer_vectors,
+                    nulls,
                     rtol=1e-7,
                     atol=1e-9,
                 )
@@ -961,12 +1074,12 @@ class PerPrnMeasuredVectorBeamformerBank:
         if lcmv_context_changed:
             self._lcmv_context_generation += 1
             self._last_lcmv_covariance = np.array(cov, copy=True)
-            self._last_lcmv_jammer_vector = np.array(null, copy=True)
+            self._last_lcmv_jammer_vectors = np.array(nulls, copy=True)
         elif not lcmv_context_available:
             # Do not let a later reappearance look identical to a context that
             # was unavailable in between. Every row must reconsider it.
             self._last_lcmv_covariance = None
-            self._last_lcmv_jammer_vector = None
+            self._last_lcmv_jammer_vectors = None
 
         if self._satellites:
             active_satellites: tuple[int | None, ...] = tuple(self._satellites)
@@ -991,6 +1104,43 @@ class PerPrnMeasuredVectorBeamformerBank:
             assignment_changed = bool(
                 assignment_known and previous_assignment != satellite
             )
+            new_candidate_epoch = bool(
+                satellite is not None and previous_assignment != satellite
+            )
+            if new_candidate_epoch:
+                self._acquisition_epoch_by_source[row_index] = (
+                    self._acquisition_epoch_by_source.get(row_index, -1) + 1
+                )
+            acquisition_epoch = self._acquisition_epoch_by_source.get(
+                row_index,
+                0,
+            )
+            acquisition_row_index = (
+                (row_index + acquisition_epoch) % self._source_count
+            )
+            protected_acquisition_row = (
+                acquisition[acquisition_row_index]
+                if jammer_active
+                and shared_measured_u1_available
+                and acquisition_available
+                else (
+                    shared
+                    if jammer_active and shared_measured_u1_available
+                    else common
+                )
+            )
+            protected_acquisition_bank = bool(
+                jammer_active
+                and shared_measured_u1_available
+                and acquisition_available
+            )
+            acquisition_mode = (
+                modes[acquisition_row_index]
+                if protected_acquisition_bank
+                else None
+            )
+            nullspace_acquisition = acquisition_mode == "jammer_nullspace"
+            notch_only_acquisition = acquisition_mode == "frequency_notch_only"
             if assignment_changed:
                 # A channel/FIFO slot has started a new assignment epoch. A
                 # vector published before this boundary belongs to the old
@@ -1002,23 +1152,44 @@ class PerPrnMeasuredVectorBeamformerBank:
                 # row's state would freeze old carrier response and LCMV
                 # context into a later same-PRN reacquisition.
                 self._states.pop(row_index, None)
-                row = shared if jammer_active and shared_measured_u1_available else common
+                row = protected_acquisition_row
                 rows[row_index] = row
                 if emit_status:
                     status[f"source_{row_index:02d}"] = {
                         "source": (
-                            "shared_protected_acquisition_waiting_for_prn"
-                            if jammer_active and shared_measured_u1_available
-                            else "uniform_acquisition_waiting_for_prn"
+                            (
+                                "jammer_nullspace_acquisition_waiting_for_prn"
+                                if nullspace_acquisition
+                                else "frequency_notch_only_acquisition_waiting_for_prn"
+                            )
+                            if protected_acquisition_bank
+                            else (
+                                "shared_protected_acquisition_waiting_for_prn"
+                                if jammer_active and shared_measured_u1_available
+                                else "uniform_acquisition_waiting_for_prn"
+                            )
                         ),
                         "source_index": row_index,
                         "satellite": None,
                         "applied_to_gnss_sdr": True,
-                        "shared_spatial_solution": True,
+                        "shared_spatial_solution": not protected_acquisition_bank,
+                        "jammer_nullspace_acquisition_beam": nullspace_acquisition,
+                        "frequency_notch_only_acquisition_beam": notch_only_acquisition,
+                        "acquisition_beam_mode": acquisition_mode,
+                        "acquisition_beam_index": (
+                            acquisition_row_index
+                            if protected_acquisition_bank
+                            else None
+                        ),
+                        "acquisition_candidate_epoch": acquisition_epoch,
                         "independent_per_prn_lcmv": False,
                         "independent_per_prn_beamforming": False,
                         "desired_vector_available": False,
                         "transition_active": False,
+                        "transition_completed_chunks": 0,
+                        "transition_total_chunks": 0,
+                        "transition_start_logical_weights": _complex_payload(row),
+                        "transition_target_logical_weights": _complex_payload(row),
                         "applied_logical_weights": _complex_payload(row),
                         "desired_spatial_vector": None,
                     }
@@ -1028,20 +1199,24 @@ class PerPrnMeasuredVectorBeamformerBank:
             state = self._states.get(row_index)
             reassigned = state is None or state.satellite != satellite
             if reassigned:
-                initial = (
-                    shared
-                    if jammer_active and shared_measured_u1_available
-                    else common
-                )
+                initial = protected_acquisition_row
                 state = _PerPrnState(
                     satellite=satellite,
                     current=np.array(initial, copy=True),
                     start=np.array(initial, copy=True),
                     target=np.array(initial, copy=True),
                     source=(
-                        "shared_protected_new_prn_waiting_for_vector"
-                        if jammer_active and shared_measured_u1_available
-                        else "uniform_new_prn_waiting_for_vector"
+                        (
+                            "jammer_nullspace_new_prn_waiting_for_vector"
+                            if nullspace_acquisition
+                            else "frequency_notch_only_new_prn_waiting_for_vector"
+                        )
+                        if protected_acquisition_bank
+                        else (
+                            "shared_protected_new_prn_waiting_for_vector"
+                            if jammer_active and shared_measured_u1_available
+                            else "uniform_new_prn_waiting_for_vector"
+                        )
                     ),
                 )
                 self._states[row_index] = state
@@ -1053,9 +1228,17 @@ class PerPrnMeasuredVectorBeamformerBank:
             updated = _finite_float(payload.get("updated_monotonic"))
             age = now - updated if updated is not None else math.inf
             epoch_floor = self._vector_not_before_monotonic.get(row_index)
+            vector_source = str(payload.get("vector_source", "tracking_prompt"))
+            acquisition_stage_vector = (
+                vector_source == "cold_start_spatial_pcps"
+            )
             from_current_assignment = bool(
                 updated is not None
-                and (epoch_floor is None or updated > epoch_floor)
+                and (
+                    acquisition_stage_vector
+                    or epoch_floor is None
+                    or updated > epoch_floor
+                )
             )
             fresh = bool(
                 0.0 <= age <= max(0.1, float(max_vector_age_s))
@@ -1071,14 +1254,16 @@ class PerPrnMeasuredVectorBeamformerBank:
                 and quality_counter is not None
                 and quality_counter != state.last_quality_counter
             )
-            # Keep every established pre-jammer desired vector fixed for the
-            # full protection interval.  Otherwise jammer-contaminated or
-            # low-C/N0 measurements can redefine what the LCMV row preserves.
-            # A source acquired during jamming may still adopt its first valid
-            # vector; it is frozen immediately after that first adoption.
-            adopt_vector = bool(
-                vector_changed and (not jammer_active or state.desired is None)
-            )
+            # ``SharedU1DesiredVectorMonitor`` publishes only a PRN-despread
+            # vector that passed its C/N0, correct-code separation,
+            # within-window weight-stability, and rolling-projector gates.
+            # Do not impose a second blanket freeze while a jammer is active:
+            # satellite geometry, RF-chain phase, platform orientation, and
+            # multipath can all move the effective spatial vector during a
+            # long protection interval.  Every accepted update is still
+            # aligned to the previous vector and applied through the
+            # complex-response-continuous target below.
+            adopt_vector = bool(vector_changed)
             if adopt_vector:
                 aligned = self._align_to_reference(vector, state.desired)
                 state.desired_step_deg = (
@@ -1141,7 +1326,7 @@ class PerPrnMeasuredVectorBeamformerBank:
                             state,
                             desired=state.desired,
                             covariance=cov,
-                            jammer_vector=null,
+                            jammer_vectors=nulls,
                             diagonal_loading_rel=diagonal_loading_rel,
                             diagonal_loading_abs=diagonal_loading_abs,
                             condition_number_limit=condition_number_limit,
@@ -1214,9 +1399,19 @@ class PerPrnMeasuredVectorBeamformerBank:
                     "per_prn_"
                 ),
                 "desired_vector_available": state.desired is not None,
-                "desired_vector_frozen": bool(
-                    jammer_active and state.desired is not None
+                "acquisition_beam_index": (
+                    acquisition_row_index if protected_acquisition_bank else None
                 ),
+                "acquisition_candidate_epoch": acquisition_epoch,
+                "desired_vector_frozen": False,
+                "desired_vector_update_policy": (
+                    (
+                        "physically_consistent_spatial_pcps_until_tracking"
+                        if acquisition_stage_vector
+                        else "quality_gated_prn_despread_live_during_jamming"
+                    )
+                ),
+                "desired_vector_source": vector_source,
                 "desired_vector_age_s": (
                     desired_age if math.isfinite(desired_age) else None
                 ),
@@ -1249,6 +1444,10 @@ class PerPrnMeasuredVectorBeamformerBank:
                     if transition_active
                     else 1.0
                 ),
+                "transition_completed_chunks": int(state.completed_chunks),
+                "transition_total_chunks": int(state.total_chunks),
+                "transition_start_logical_weights": _complex_payload(state.start),
+                "transition_target_logical_weights": _complex_payload(state.target),
                 "applied_logical_weights": _complex_payload(state.current),
                 "desired_spatial_vector": (
                     _complex_payload(state.desired)

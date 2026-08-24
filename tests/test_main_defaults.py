@@ -94,6 +94,21 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_realtime_preserve_max_reference_age_s == 2.0
     assert cfg.lcmv_jammer_activation_min_input_power_jump_db == 3.0
     assert cfg.lcmv_jammer_activation_min_generalized_gain_db == 6.0
+    assert cfg.lcmv_cold_start_rescue_enabled is True
+    assert cfg.lcmv_cold_start_min_dominant_fraction == 0.9
+    assert cfg.lcmv_cold_start_min_eigen_gap_db == 10.0
+    assert cfg.lcmv_cold_start_spectral_top_fraction == 0.01
+    assert cfg.lcmv_cold_start_min_spectral_concentration == 0.6
+    assert cfg.lcmv_cold_start_min_peak_over_median_db == 20.0
+    assert cfg.lcmv_cold_start_persistence_updates == 3
+    assert cfg.lcmv_cold_start_release_updates == 30
+    assert cfg.lcmv_cold_start_weight_update_interval_s == 1.0
+    assert cfg.lcmv_cold_start_retarget_min_vector_coherence == 0.98
+    assert cfg.lcmv_cold_start_retarget_persistence_updates == 10
+    assert cfg.lcmv_cold_start_min_output_reduction_db == 3.0
+    assert cfg.lcmv_cold_start_frequency_notch_enabled is True
+    assert cfg.lcmv_cold_start_frequency_notch_bandwidth_hz == 600000.0
+    assert cfg.lcmv_cold_start_frequency_notch_fir_taps == 257
     assert cfg.lcmv_jammer_release_hold_s == 2.0
     assert cfg.lcmv_weight_transition_s == 1.0
     assert VALID_LCMV_METHODS == {

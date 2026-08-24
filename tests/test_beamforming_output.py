@@ -11,6 +11,7 @@ from antijamming.config import StreamConfig
 from antijamming.dsp.beamforming import (
     apply_beamformer,
     covariance_lcmv_ideal_null_weights,
+    covariance_lcmv_subspace_null_weights,
     covariance_lcmv_vector_null_weights,
     uniform_weights,
 )
@@ -123,6 +124,7 @@ def test_dynamic_phase_source_mapping_ignores_stale_latest_by_prn_entry() -> Non
                 "channel": 2,
                 "prn": 14,
                 "tracking_monitor_prn": 14,
+                "tracking_monitor_cno_db_hz": 42.0,
                 "state": "tracking",
                 "system": "G",
                 "signal": "1C",
@@ -139,6 +141,67 @@ def test_dynamic_phase_source_mapping_ignores_stale_latest_by_prn_entry() -> Non
     }
 
     assert runtime._tracking_source_satellites(snapshot) == (None, None, 14, None)
+
+
+def test_zero_cno_monitor_candidate_is_not_routed_as_a_tracked_prn() -> None:
+    cfg = StreamConfig(
+        gnss_shared_u1_phase_compensation_enabled=True,
+        gnss_shared_u1_phase_satellites=(),
+        gnss_1c_channel_count=4,
+        gnss_channels_in_acquisition=4,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    snapshot = {
+        "prns": [
+            {
+                "channel": 2,
+                "prn": 14,
+                "tracking_monitor_prn": 14,
+                "tracking_monitor_cno_db_hz": 0.0,
+                "state": "tracking",
+                "system": "G",
+                "signal": "1C",
+            }
+        ]
+    }
+
+    assert runtime._tracking_source_satellites(snapshot) == (None, None, None, None)
+    assert runtime._acquisition_source_satellites(snapshot) == (
+        None,
+        None,
+        14,
+        None,
+    )
+
+
+def test_lost_zero_cno_candidate_is_not_routed_for_acquisition() -> None:
+    cfg = StreamConfig(
+        gnss_shared_u1_phase_compensation_enabled=True,
+        gnss_shared_u1_phase_satellites=(),
+        gnss_1c_channel_count=4,
+        gnss_channels_in_acquisition=4,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    snapshot = {
+        "prns": [
+            {
+                "channel": 2,
+                "prn": 14,
+                "tracking_monitor_prn": 14,
+                "tracking_monitor_cno_db_hz": 0.0,
+                "state": "lost",
+                "system": "G",
+                "signal": "1C",
+            }
+        ]
+    }
+
+    assert runtime._acquisition_source_satellites(snapshot) == (
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 def test_per_prn_protection_snapshot_copies_one_atomic_publication() -> None:
@@ -190,9 +253,10 @@ def test_dynamic_source_mapping_refresh_is_independent_of_status_cadence(
                 "prns": [
                     {
                         "channel": 0,
-                        "prn": prn,
-                        "tracking_monitor_prn": prn,
-                        "state": "tracking",
+                            "prn": prn,
+                            "tracking_monitor_prn": prn,
+                            "tracking_monitor_cno_db_hz": 42.0,
+                            "state": "tracking",
                         "system": "G",
                         "signal": "1C",
                     }
@@ -312,6 +376,43 @@ def test_covariance_lcmv_measured_vector_weights_satisfy_constraints() -> None:
         abs=1e-9,
     )
     assert abs(np.vdot(null_norm, result.weights)) < 1e-8
+
+
+def test_covariance_lcmv_measured_subspace_nulls_two_independent_modes() -> None:
+    rng = np.random.default_rng(20260823)
+    manifold = rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4))
+    basis = np.asarray(np.linalg.qr(manifold)[0], dtype=np.complex128)
+    null_vectors = basis[:, :2]
+    preserve = basis[:, 2]
+    covariance = (
+        20.0 * np.outer(null_vectors[:, 0], null_vectors[:, 0].conj())
+        + 3.0 * np.outer(null_vectors[:, 1], null_vectors[:, 1].conj())
+        + 0.02 * np.eye(4, dtype=np.complex128)
+    )
+
+    result = covariance_lcmv_subspace_null_weights(
+        covariance=covariance,
+        null_vectors=null_vectors,
+        preserve_vector=preserve,
+    )
+
+    assert result.null_vectors.shape == (4, 2)
+    assert result.null_responses.shape == (2,)
+    assert result.preserve_response == pytest.approx(result.preserve_target, abs=1e-9)
+    np.testing.assert_allclose(
+        result.null_vectors.conj().T @ result.weights,
+        np.zeros((2,), dtype=np.complex128),
+        atol=1e-9,
+    )
+
+
+def test_covariance_lcmv_subspace_rejects_dependent_null_vectors() -> None:
+    null = np.asarray([1.0, 0.2j, -0.4, 0.6 - 0.2j], dtype=np.complex128)
+    with pytest.raises(ValueError, match="linearly dependent"):
+        covariance_lcmv_subspace_null_weights(
+            covariance=np.eye(4, dtype=np.complex128),
+            null_vectors=np.column_stack((null, 2.0 * null)),
+        )
 
 
 def test_lcmv_test_combiner_outputs_complex64_single_stream() -> None:
@@ -1277,6 +1378,336 @@ def test_fast_realtime_measured_u1_protection_publishes_before_music() -> None:
     assert after_hold["lcmv_jammer_activation_evidence_now"] is False
     assert after_hold["lcmv_jammer_detected_latched"] is True
     assert after_hold["lcmv_jammer_protection_active"] is False
+
+
+def test_cold_start_rank_spectral_detector_publishes_pre_pvt_rescue_null() -> None:
+    rng = np.random.default_rng(647)
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_cold_start_rescue_enabled=True,
+        lcmv_cold_start_evaluation_interval_s=0.0,
+        lcmv_cold_start_persistence_updates=2,
+        lcmv_cold_start_weight_update_interval_s=0.0,
+        lcmv_cold_start_min_output_reduction_db=3.0,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        gnss_shared_u1_phase_compensation_enabled=True,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    sample_count = 32768
+    index = np.arange(sample_count, dtype=np.float64)
+    jammer_samples = np.exp(2j * np.pi * 0.173 * index)
+    jammer_vector = np.asarray(
+        [1.0 + 0.0j, 0.7 + 0.5j, -0.2 + 0.8j, -0.6 - 0.3j],
+        dtype=np.complex128,
+    )
+    jammer_vector /= np.linalg.norm(jammer_vector)
+    noise = 0.03 * (
+        rng.standard_normal((4, sample_count))
+        + 1j * rng.standard_normal((4, sample_count))
+    )
+    chunk = 3.0 * jammer_vector[:, None] * jammer_samples[None, :] + noise
+
+    first = runtime._update_cold_start_jammer_rescue(corrected_chunk=chunk)
+    second = runtime._update_cold_start_jammer_rescue(corrected_chunk=chunk)
+
+    assert first["cold_start_rescue_active"] is False
+    assert first["cold_start_detect_streak"] == 1
+    assert second["cold_start_rescue_active"] is True
+    assert second["cold_start_weights_published"] is True
+    assert runtime._cold_start_rescue_active is True
+    assert runtime._lcmv_jammer_protection_active is True
+    assert runtime._shared_measured_u1_protection_is_available() is True
+    weights = runtime._get_shared_measured_u1_protection_weights_copy()
+    _, _, _, measured_jammer = runtime._get_per_prn_protection_snapshot()
+    assert abs(np.vdot(weights, measured_jammer)) < 1e-8
+    assert abs(np.vdot(weights, jammer_vector)) < 1e-3
+    status = runtime._lcmv_status_copy()
+    assert status["mode"] == "on"
+    assert np.asarray(status["lcmv_response_db"]).size > 1
+    assert status["null_bearing_deg"] is not None
+    assert (
+        status["output_metrics"]["measured_output_reduction_vs_uniform_db"]
+        > 3.0
+    )
+    published_at = runtime._cold_start_last_publish_monotonic_s
+    retained = runtime._update_cold_start_jammer_rescue(corrected_chunk=chunk)
+    assert retained["cold_start_weights_published"] is False
+    assert "coherent" in retained["cold_start_publish_reason"]
+    assert retained["cold_start_vector_coherence_to_active_null"] > 0.995
+    assert runtime._cold_start_last_publish_monotonic_s == published_at
+
+
+def test_cold_start_rescue_retargets_only_after_persistent_vector_change() -> None:
+    rng = np.random.default_rng(650)
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_cold_start_rescue_enabled=True,
+        lcmv_cold_start_evaluation_interval_s=0.0,
+        lcmv_cold_start_persistence_updates=1,
+        lcmv_cold_start_weight_update_interval_s=0.0,
+        lcmv_cold_start_retarget_min_vector_coherence=0.995,
+        lcmv_cold_start_retarget_persistence_updates=2,
+        lcmv_cold_start_min_output_reduction_db=3.0,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        gnss_shared_u1_phase_compensation_enabled=True,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    sample_count = 32768
+    index = np.arange(sample_count, dtype=np.float64)
+    tone = np.exp(2j * np.pi * 0.173 * index)
+    first_vector = np.asarray(
+        [1.0 + 0.0j, 0.7 + 0.5j, -0.2 + 0.8j, -0.6 - 0.3j],
+        dtype=np.complex128,
+    )
+    second_vector = np.asarray(
+        [0.2 + 0.8j, -0.7 + 0.1j, 0.6 - 0.4j, -0.1 - 0.9j],
+        dtype=np.complex128,
+    )
+    first_vector /= np.linalg.norm(first_vector)
+    second_vector /= np.linalg.norm(second_vector)
+
+    def _chunk(vector: np.ndarray) -> np.ndarray:
+        noise = 0.03 * (
+            rng.standard_normal((4, sample_count))
+            + 1j * rng.standard_normal((4, sample_count))
+        )
+        return 3.0 * vector[:, None] * tone[None, :] + noise
+
+    activated = runtime._update_cold_start_jammer_rescue(
+        corrected_chunk=_chunk(first_vector)
+    )
+    first_change = runtime._update_cold_start_jammer_rescue(
+        corrected_chunk=_chunk(second_vector)
+    )
+    second_change = runtime._update_cold_start_jammer_rescue(
+        corrected_chunk=_chunk(second_vector)
+    )
+
+    assert activated["cold_start_weights_published"] is True
+    assert first_change["cold_start_weights_published"] is False
+    assert first_change["cold_start_retarget_streak"] == 1
+    assert second_change["cold_start_weights_published"] is True
+    _, retargeted_null = runtime._get_per_prn_lcmv_context_copy()
+    retargeted_null /= np.linalg.norm(retargeted_null)
+    assert abs(np.vdot(retargeted_null, second_vector)) > 0.99
+
+
+def test_cold_start_detector_rejects_wideband_bladerf_like_source() -> None:
+    rng = np.random.default_rng(648)
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_cold_start_rescue_enabled=True,
+        lcmv_cold_start_evaluation_interval_s=0.0,
+        lcmv_cold_start_persistence_updates=2,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        gnss_shared_u1_phase_compensation_enabled=True,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    desired_vector = np.asarray(
+        [1.0 + 0.0j, 0.7 + 0.5j, -0.2 + 0.8j, -0.6 - 0.3j],
+        dtype=np.complex128,
+    )
+    desired_vector /= np.linalg.norm(desired_vector)
+    desired_samples = (
+        rng.standard_normal(32768) + 1j * rng.standard_normal(32768)
+    )
+    noise = 0.03 * (
+        rng.standard_normal((4, 32768))
+        + 1j * rng.standard_normal((4, 32768))
+    )
+    chunk = 3.0 * desired_vector[:, None] * desired_samples[None, :] + noise
+
+    payload = runtime._update_cold_start_jammer_rescue(corrected_chunk=chunk)
+    payload = runtime._update_cold_start_jammer_rescue(corrected_chunk=chunk)
+
+    assert payload["cold_start_rescue_evidence_now"] is False
+    assert runtime._cold_start_rescue_active is False
+    assert runtime._shared_measured_u1_protection_is_available() is False
+
+
+def test_broadband_candidate_is_vetoed_by_physically_consistent_gnss() -> None:
+    rng = np.random.default_rng(6481)
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_cold_start_rescue_enabled=True,
+        lcmv_cold_start_wideband_rescue_enabled=True,
+        lcmv_cold_start_noise_reference_power_linear=0.01,
+        lcmv_cold_start_wideband_min_excess_power_db=20.0,
+        lcmv_cold_start_evaluation_interval_s=0.0,
+        lcmv_cold_start_persistence_updates=1,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        gnss_shared_u1_phase_compensation_enabled=True,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    runtime._cold_start_spatial_acquisition_monitor = SimpleNamespace(
+        classification_snapshot=lambda: {
+            "context_mode": "classify",
+            "evaluation_count": 4,
+            "required_evaluations": 4,
+            "sufficient_observations": True,
+            "accepted_prns": [3],
+            "gnss_consistency_veto": True,
+        }
+    )
+    vector = np.asarray(
+        [1.0 + 0.0j, 0.7 + 0.5j, -0.2 + 0.8j, -0.6 - 0.3j],
+        dtype=np.complex128,
+    )
+    vector /= np.linalg.norm(vector)
+    wideband = rng.standard_normal(32768) + 1j * rng.standard_normal(32768)
+    chunk = 3.0 * vector[:, None] * wideband[None, :]
+
+    payload = runtime._update_cold_start_jammer_rescue(corrected_chunk=chunk)
+
+    assert payload["cold_start_wideband_candidate_now"] is True
+    assert payload["cold_start_wideband_confirmed_now"] is False
+    assert payload["cold_start_rescue_active"] is False
+    assert runtime._shared_measured_u1_protection_is_available() is False
+
+
+def test_broadband_candidate_activates_only_after_no_gnss_confirmation() -> None:
+    rng = np.random.default_rng(6482)
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_cold_start_rescue_enabled=True,
+        lcmv_cold_start_wideband_rescue_enabled=True,
+        lcmv_cold_start_noise_reference_power_linear=0.01,
+        lcmv_cold_start_wideband_min_excess_power_db=20.0,
+        lcmv_cold_start_evaluation_interval_s=0.0,
+        lcmv_cold_start_persistence_updates=1,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        gnss_shared_u1_phase_compensation_enabled=True,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    runtime._cold_start_spatial_acquisition_monitor = SimpleNamespace(
+        classification_snapshot=lambda: {
+            "context_mode": "classify",
+            "evaluation_count": 4,
+            "required_evaluations": 4,
+            "sufficient_observations": True,
+            "accepted_prns": [],
+            "gnss_consistency_veto": False,
+        }
+    )
+    vector = np.asarray(
+        [1.0 + 0.0j, 0.7 + 0.5j, -0.2 + 0.8j, -0.6 - 0.3j],
+        dtype=np.complex128,
+    )
+    vector /= np.linalg.norm(vector)
+    wideband = rng.standard_normal(32768) + 1j * rng.standard_normal(32768)
+    chunk = 3.0 * vector[:, None] * wideband[None, :]
+
+    payload = runtime._update_cold_start_jammer_rescue(corrected_chunk=chunk)
+
+    assert payload["cold_start_wideband_confirmed_now"] is True
+    assert payload["cold_start_rescue_active"] is True
+    assert payload["cold_start_rescue_mode"] == "broadband"
+    assert runtime._cold_start_notch_frequency_offset_hz is None
+    assert runtime._shared_measured_u1_protection_is_available() is True
+
+
+def test_cold_start_rescue_releases_after_persistent_clear_evidence() -> None:
+    rng = np.random.default_rng(649)
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_cold_start_rescue_enabled=True,
+        lcmv_cold_start_evaluation_interval_s=0.0,
+        lcmv_cold_start_persistence_updates=1,
+        lcmv_cold_start_release_updates=2,
+        lcmv_cold_start_weight_update_interval_s=0.0,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        gnss_shared_u1_phase_compensation_enabled=True,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    index = np.arange(32768, dtype=np.float64)
+    vector = np.asarray(
+        [1.0 + 0.0j, 0.7 + 0.5j, -0.2 + 0.8j, -0.6 - 0.3j],
+        dtype=np.complex128,
+    )
+    vector /= np.linalg.norm(vector)
+    tone = np.exp(2j * np.pi * 0.173 * index)
+    narrowband = vector[:, None] * tone[None, :] + 0.01 * (
+        rng.standard_normal((4, 32768)) + 1j * rng.standard_normal((4, 32768))
+    )
+    wideband = (
+        rng.standard_normal((4, 32768)) + 1j * rng.standard_normal((4, 32768))
+    )
+
+    activated = runtime._update_cold_start_jammer_rescue(
+        corrected_chunk=narrowband
+    )
+    runtime._update_cold_start_jammer_rescue(corrected_chunk=wideband)
+    released = runtime._update_cold_start_jammer_rescue(corrected_chunk=wideband)
+
+    assert activated["cold_start_rescue_active"] is True
+    assert released["cold_start_rescue_released"] is True
+    assert runtime._cold_start_rescue_active is False
+    assert runtime._lcmv_jammer_protection_active is False
+    assert runtime._shared_measured_u1_protection_is_available() is False
+
+
+def test_cold_start_rescue_holds_through_ambiguous_threshold_flicker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(651)
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_cold_start_rescue_enabled=True,
+        lcmv_cold_start_evaluation_interval_s=0.0,
+        lcmv_cold_start_persistence_updates=1,
+        lcmv_cold_start_release_updates=2,
+        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
+        gnss_shared_u1_phase_compensation_enabled=True,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    index = np.arange(32768, dtype=np.float64)
+    vector = np.asarray(
+        [1.0 + 0.0j, 0.7 + 0.5j, -0.2 + 0.8j, -0.6 - 0.3j],
+        dtype=np.complex128,
+    )
+    vector /= np.linalg.norm(vector)
+    tone = np.exp(2j * np.pi * 0.173 * index)
+    narrowband = vector[:, None] * tone[None, :] + 0.01 * (
+        rng.standard_normal((4, 32768)) + 1j * rng.standard_normal((4, 32768))
+    )
+    activated = runtime._update_cold_start_jammer_rescue(
+        corrected_chunk=narrowband
+    )
+    assert activated["cold_start_rescue_active"] is True
+
+    ambiguous = SimpleNamespace(
+        detected=False,
+        dominant_fraction=0.89,
+        dominant_over_second_db=9.5,
+        strongest_bin_fraction=0.85,
+        peak_over_median_db=50.0,
+        covariance=np.eye(4, dtype=np.complex128),
+        eigenvalues=np.asarray([3.56, 0.15, 0.15, 0.14]),
+        dominant_vector=vector,
+    )
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.cold_start_jammer_evidence",
+        lambda *_args, **_kwargs: ambiguous,
+    )
+
+    first = runtime._update_cold_start_jammer_rescue(
+        corrected_chunk=narrowband
+    )
+    second = runtime._update_cold_start_jammer_rescue(
+        corrected_chunk=narrowband
+    )
+
+    assert first["cold_start_rescue_evidence_now"] is False
+    assert first["cold_start_clear_evidence_now"] is False
+    assert second["cold_start_clear_streak"] == 0
+    assert runtime._cold_start_rescue_active is True
 
 
 @pytest.mark.parametrize(

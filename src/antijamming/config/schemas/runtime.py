@@ -266,6 +266,38 @@ class StreamConfig:
     lcmv_realtime_preserve_max_reference_age_s: float
     lcmv_jammer_activation_min_input_power_jump_db: float
     lcmv_jammer_activation_min_generalized_gain_db: float
+    # Pre-PVT rescue for an interferer already present when the receiver starts.
+    # Rank evidence alone is insufficient because the desired bladeRF waveform
+    # is also spatially coherent; spectral concentration is required as well.
+    lcmv_cold_start_rescue_enabled: bool
+    lcmv_cold_start_evaluation_interval_s: float
+    lcmv_cold_start_min_dominant_fraction: float
+    lcmv_cold_start_min_eigen_gap_db: float
+    # A four-element array retains two spatial degrees of freedom while
+    # suppressing at most two independently measured interference modes.
+    lcmv_cold_start_max_interference_rank: int
+    lcmv_cold_start_secondary_eigen_gap_db: float
+    lcmv_cold_start_spectral_top_fraction: float
+    lcmv_cold_start_min_spectral_concentration: float
+    lcmv_cold_start_min_peak_over_median_db: float
+    # Broadband rescue is a two-stage decision: calibrated high-power spatial
+    # evidence creates a candidate, then repeated physical GNSS acquisition
+    # either vetoes it or confirms that automatic nulling may start.
+    lcmv_cold_start_wideband_rescue_enabled: bool
+    lcmv_cold_start_noise_reference_power_linear: float
+    lcmv_cold_start_wideband_min_excess_power_db: float
+    lcmv_cold_start_persistence_updates: int
+    lcmv_cold_start_release_updates: int
+    lcmv_cold_start_weight_update_interval_s: float
+    lcmv_cold_start_retarget_min_vector_coherence: float
+    lcmv_cold_start_retarget_persistence_updates: int
+    lcmv_cold_start_min_output_reduction_db: float
+    # After the spatial null, remove the residual narrowband line at the
+    # detector's measured signed baseband frequency. The stateful filter is
+    # applied independently to every GNSS output row.
+    lcmv_cold_start_frequency_notch_enabled: bool
+    lcmv_cold_start_frequency_notch_bandwidth_hz: float
+    lcmv_cold_start_frequency_notch_fir_taps: int
     # Keep protection active briefly across a missed evidence update, then
     # return the receiver to the safe uniform acquisition beam.
     lcmv_jammer_release_hold_s: float

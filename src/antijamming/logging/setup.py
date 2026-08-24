@@ -39,6 +39,10 @@ LOGGER_DEFS: dict[str, tuple[str, str]] = {
         "antijamming.runtime_evidence",
         "runtime_evidence.jsonl",
     ),
+    "per_prn_weights": (
+        "antijamming.per_prn_weights",
+        "per_prn_weights.jsonl",
+    ),
     "gnss": ("antijamming.gnss_sdr", "gnss_sdr.log"),
     "health": ("antijamming.stream_health", "stream_health.log"),
     "ui": ("antijamming.ui", "ui_health.log"),
@@ -339,6 +343,39 @@ def _copy_session_artifacts(log_dir: Path, session_dir: Path) -> list[str]:
     return copied
 
 
+def _session_artifact_inventory(session_dir: Path) -> list[dict[str, object]]:
+    """Fingerprint every archived artifact after writers have been flushed.
+
+    The manifest cannot fingerprint itself because finalizing the manifest
+    changes its own bytes.  Everything else in the PID-scoped run directory is
+    recorded with a relative path, byte count, and SHA-256 digest so later
+    audits can prove exactly which evidence files they inspected.
+    """
+
+    inventory: list[dict[str, object]] = []
+    for path in sorted(session_dir.rglob("*")):
+        if path == session_dir / "session_manifest.json":
+            continue
+        if not path.is_file():
+            continue
+        try:
+            inventory.append(
+                {
+                    "path": str(path.relative_to(session_dir)),
+                    "bytes": path.stat().st_size,
+                    "sha256": _sha256_file(path),
+                }
+            )
+        except OSError as exc:
+            inventory.append(
+                {
+                    "path": str(path.relative_to(session_dir)),
+                    "error": str(exc),
+                }
+            )
+    return inventory
+
+
 def finalize_session_logs(
     log_dir: Path,
     session: RuntimeLogSession | None,
@@ -358,6 +395,7 @@ def finalize_session_logs(
             except Exception:
                 pass
     copied = _copy_session_artifacts(log_dir, session.session_dir)
+    artifact_inventory = _session_artifact_inventory(session.session_dir)
     stopped_utc, stopped_local, stopped_wall_time_ns = _timestamp_pair()
     session.finalized = True
     _write_manifest(
@@ -369,6 +407,7 @@ def finalize_session_logs(
         stop_reason=str(stop_reason),
         outcome=str(outcome),
         copied_artifacts=sorted(copied),
+        artifact_inventory=artifact_inventory,
         finalized=True,
     )
     (log_dir / LATEST_SESSION_FILE).write_text(

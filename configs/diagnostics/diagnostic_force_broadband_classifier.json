@@ -1,0 +1,7 @@
+{
+  "lcmv_cold_start_wideband_rescue_enabled": true,
+  "lcmv_cold_start_noise_reference_power_linear": 1.832120761682323e-05,
+  "lcmv_cold_start_wideband_min_excess_power_db": 20.0,
+  "lcmv_cold_start_min_spectral_concentration": 0.99,
+  "lcmv_cold_start_min_peak_over_median_db": 60.0
+}

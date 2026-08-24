@@ -1673,6 +1673,15 @@ class MainWindow(QMainWindow):
         status = metrics.get("lcmv_test", {}) if isinstance(metrics, dict) else {}
         if not isinstance(status, dict):
             status = {}
+        active_method = str(status.get("active_lcmv_method", "") or "")
+        if active_method.startswith("cold_start_"):
+            self._lcmv_response_plot.setTitle(
+                "Active measured-U1 LCMV response (ideal-array model)"
+            )
+        else:
+            self._lcmv_response_plot.setTitle(
+                "Active LCMV ideal steering-vector model response"
+            )
         response = self._finite_vector(status.get("lcmv_response_db"))
         if response.size > 1:
             scan = self._scan_angles_for_size(response.size)
@@ -2108,18 +2117,45 @@ class MainWindow(QMainWindow):
             getattr(self._cfg, "lcmv_preserve_constraint_mode", "uniform")
         ).strip().lower()
         bladeRF_preserve = preserve_mode == "realtime_bladerf_measured_u1"
+        measured_reference_available = bool(
+            spatial.get("realtime_bladerf_angle_frozen", False)
+        )
+        output_metrics = status.get("output_metrics", {})
+        if not isinstance(output_metrics, dict):
+            output_metrics = {}
+        measured_reduction_db = valid_float(
+            output_metrics.get("measured_output_reduction_vs_uniform_db")
+        )
 
         if not enabled or mode == "off":
             value = "uniform beamformer"
             color = INFO
         elif mode == "on":
-            value = "bladeRF preserved" if bladeRF_preserve else "on"
+            reduction_text = (
+                f"; measured output reduction {measured_reduction_db:.1f} dB"
+                if measured_reduction_db is not None
+                else ""
+            )
+            preserve_text = (
+                "; measured desired reference preserved"
+                if bladeRF_preserve and measured_reference_available
+                else (
+                    "; desired reference not yet acquired"
+                    if bladeRF_preserve
+                    else ""
+                )
+            )
+            value = f"ON - jammer null active{reduction_text}{preserve_text}"
             color = WARNING
         elif mode == "fallback":
             # In fallback we are still on uniform-output weights; the only
-            # meaningful operator-state is whether bladeRF preservation has
+            # meaningful operator-state is whether a measured desired reference has
             # already passed the post-PVT arm gate.
-            value = "bladeRF preserved" if (armed and bladeRF_preserve) else "uniform beamformer"
+            value = (
+                "ARMED - measured desired reference ready"
+                if (armed and bladeRF_preserve and measured_reference_available)
+                else "uniform beamformer"
+            )
             color = INFO if armed else WARNING
         else:
             value = str(status.get("description", "--") or "--")

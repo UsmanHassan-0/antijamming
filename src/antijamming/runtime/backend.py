@@ -21,6 +21,10 @@ from antijamming.gnss import (
     PerPrnMeasuredVectorBeamformerBank,
     SharedU1DesiredVectorMonitor,
     apply_shared_phase_fanout,
+    jammer_nullspace_acquisition_rows,
+)
+from antijamming.gnss.cold_start_acquisition_monitor import (
+    ColdStartSpatialAcquisitionMonitor,
 )
 from antijamming.gnss.sdr_bridge.constants import (
     PVT_DEGRADED_PDOP_THRESHOLD,
@@ -42,6 +46,7 @@ from antijamming.radio.usrp import UsrpRxDevice
 from antijamming.dsp.beamforming import (
     apply_beamformer,
     covariance_lcmv_ideal_null_weights,
+    covariance_lcmv_subspace_null_weights,
     covariance_lcmv_vector_null_weights,
     lcmv_model_response,
     uniform_weights,
@@ -60,6 +65,11 @@ from antijamming.dsp.diagnostics import (
     signal_power_metrics,
     spatial_vector_coherence_metrics,
 )
+from antijamming.dsp.jammer_detection import (
+    cold_start_jammer_evidence,
+    selected_interference_subspace,
+)
+from antijamming.dsp.frequency_notch import StatefulComplexBandstop
 from antijamming.dsp.doa import (
     covariance_eigendecomposition_from_matrix,
     music_spectrum,
@@ -159,6 +169,9 @@ class BackendRuntime:
         self._lcmv_pattern_log = loggers.get("lcmv_pattern", self._analysis_log)
         self._spatial_vector_log = loggers.get("spatial_vector", self._analysis_log)
         self._runtime_evidence_log = loggers.get("runtime_evidence", self._analysis_log)
+        self._per_prn_weights_log = loggers.get(
+            "per_prn_weights", self._handoff_log
+        )
         self._experiment_manifest = manifest_from_config(config)
         self._rf_budget = compute_rf_budget(self._experiment_manifest)
         self._phase_calibration_metadata = self._load_phase_calibration_metadata()
@@ -219,6 +232,9 @@ class BackendRuntime:
         self._gnss_raw_queue: queue.Queue | None = None
         self._gnss_output_queue: queue.Queue | None = None
         self._shared_u1_phase_monitor: SharedU1DesiredVectorMonitor | None = None
+        self._cold_start_spatial_acquisition_monitor: (
+            ColdStartSpatialAcquisitionMonitor | None
+        ) = None
         self._shared_u1_phase_bank: PerPrnMeasuredVectorBeamformerBank | None = None
         self._last_shared_u1_phase_status_log_ts = 0.0
         self._last_shared_u1_source_mapping_refresh_ts = float("-inf")
@@ -319,6 +335,24 @@ class BackendRuntime:
         self._lcmv_jammer_detected_latched: bool = False
         self._lcmv_jammer_protection_active: bool = False
         self._lcmv_jammer_last_evidence_monotonic_s: float | None = None
+        self._cold_start_rescue_active: bool = False
+        self._cold_start_rescue_mode: str | None = None
+        self._cold_start_wideband_candidate_active: bool = False
+        self._cold_start_detect_streak: int = 0
+        self._cold_start_clear_streak: int = 0
+        self._cold_start_retarget_streak: int = 0
+        self._cold_start_last_evaluation_monotonic_s: float = float("-inf")
+        self._cold_start_last_publish_monotonic_s: float = float("-inf")
+        self._cold_start_notch_frequency_offset_hz: float | None = None
+        self._cold_start_acquisition_rows: np.ndarray | None = None
+        self._cold_start_acquisition_modes: tuple[str, ...] = ()
+        self._cold_start_notch_last_log_monotonic_s: float = float("-inf")
+        self._cold_start_last_evidence: dict[str, object] = {
+            "cold_start_rescue_enabled": bool(
+                getattr(config, "lcmv_cold_start_rescue_enabled", False)
+            ),
+            "cold_start_rescue_active": False,
+        }
         self._latest_source_count_diagnostics: dict[str, object] = {
             "n_sources": max(int(self._expected_sources), 1),
         }
@@ -326,6 +360,24 @@ class BackendRuntime:
 
         self._results_lock = threading.Lock()
         self._beamformer_lock = threading.Lock()
+        self._cold_start_notch_lock = threading.Lock()
+        self._cold_start_notch = StatefulComplexBandstop(
+            sample_rate_hz=float(config.sample_rate),
+            bandwidth_hz=float(
+                getattr(
+                    config,
+                    "lcmv_cold_start_frequency_notch_bandwidth_hz",
+                    100000.0,
+                )
+            ),
+            num_taps=int(
+                getattr(
+                    config,
+                    "lcmv_cold_start_frequency_notch_fir_taps",
+                    257,
+                )
+            ),
+        )
         # Latest-result fields are copied into RuntimeUiMetrics. The locks keep
         # UI emission consistent while worker stages update independently.
         initial_weights = uniform_weights(len(config.channels))
@@ -341,6 +393,9 @@ class BackendRuntime:
         )
         self._shared_measured_u1_protection_null_vector = np.empty(
             (0,), dtype=np.complex128
+        )
+        self._shared_measured_u1_protection_null_vectors = np.empty(
+            (len(config.channels), 0), dtype=np.complex128
         )
         self._latest_shared_u1_phase_logical_weights = np.empty(
             (0, len(config.channels)), dtype=np.complex128
@@ -657,8 +712,52 @@ class BackendRuntime:
                         source_count=shared_phase_source_count,
                     )
                     self._shared_u1_phase_monitor.start()
+                    self._cold_start_spatial_acquisition_monitor = (
+                        ColdStartSpatialAcquisitionMonitor(
+                            sample_rate_hz=float(self._config.sample_rate),
+                            channel_count=len(self._config.channels),
+                            phase_correction_vector=(
+                                self._config.phase_correction_vector
+                            ),
+                            context_snapshot=(
+                                self._cold_start_spatial_acquisition_context
+                            ),
+                            session_dir=self._log_session.session_dir,
+                            session_id=self._log_session.session_id,
+                            logger=self._handoff_log,
+                            measurement_interval_s=float(
+                                getattr(
+                                    self._config,
+                                    "gnss_cold_start_spatial_acquisition_interval_s",
+                                    2.0,
+                                )
+                            ),
+                            dwell_count=int(
+                                getattr(
+                                    self._config,
+                                    "gnss_cold_start_spatial_acquisition_dwells",
+                                    5,
+                                )
+                            ),
+                            min_observations=int(
+                                getattr(
+                                    self._config,
+                                    "gnss_cold_start_spatial_acquisition_observations",
+                                    4,
+                                )
+                            ),
+                            notch_bandwidth_hz=float(
+                                self._config.lcmv_cold_start_frequency_notch_bandwidth_hz
+                            ),
+                            notch_fir_taps=int(
+                                self._config.lcmv_cold_start_frequency_notch_fir_taps
+                            ),
+                        )
+                    )
+                    self._cold_start_spatial_acquisition_monitor.start()
                 else:
                     self._shared_u1_phase_monitor = None
+                    self._cold_start_spatial_acquisition_monitor = None
                 self._gnss_output_queue = queue.Queue(
                     maxsize=_GNSS_OUTPUT_QUEUE_MAXSIZE
                 )
@@ -792,6 +891,9 @@ class BackendRuntime:
                 self._gnss_fifo_thread = None
             self._gnss_raw_queue = None
             self._gnss_output_queue = None
+            if self._cold_start_spatial_acquisition_monitor is not None:
+                self._cold_start_spatial_acquisition_monitor.stop()
+                self._cold_start_spatial_acquisition_monitor = None
             if self._shared_u1_phase_monitor is not None:
                 self._shared_u1_phase_monitor.stop()
                 self._shared_u1_phase_monitor = None
@@ -1730,6 +1832,25 @@ class BackendRuntime:
         self._lcmv_jammer_detected_latched = False
         self._lcmv_jammer_protection_active = False
         self._lcmv_jammer_last_evidence_monotonic_s = None
+        self._cold_start_rescue_active = False
+        self._cold_start_rescue_mode = None
+        self._cold_start_wideband_candidate_active = False
+        self._cold_start_detect_streak = 0
+        self._cold_start_clear_streak = 0
+        self._cold_start_retarget_streak = 0
+        self._cold_start_last_evaluation_monotonic_s = float("-inf")
+        self._cold_start_last_publish_monotonic_s = float("-inf")
+        self._cold_start_notch_frequency_offset_hz = None
+        self._cold_start_acquisition_rows = None
+        self._cold_start_acquisition_modes = ()
+        self._cold_start_notch_last_log_monotonic_s = float("-inf")
+        self._cold_start_last_evidence = {
+            "cold_start_rescue_enabled": bool(
+                getattr(self._config, "lcmv_cold_start_rescue_enabled", False)
+            ),
+            "cold_start_rescue_active": False,
+            "cold_start_rescue_reason": str(reason),
+        }
 
     def _realtime_preserve_tracker_payload_locked(self) -> dict[str, object]:
         return {
@@ -1918,6 +2039,10 @@ class BackendRuntime:
         normalized_source = str(source).strip().lower() or "operator"
         if normalized_source == "operator":
             self._lcmv_auto_arm_suppressed_by_operator = not active
+            if not active and self._cold_start_rescue_active:
+                self._deactivate_cold_start_jammer_rescue(
+                    "operator disabled anti-jamming"
+                )
         self._set_shared_measured_u1_protection_weights(
             uniform_weights(len(self._config.channels)), available=False
         )
@@ -3126,6 +3251,7 @@ class BackendRuntime:
         available: bool = True,
         covariance: np.ndarray | None = None,
         null_vector: np.ndarray | None = None,
+        null_vectors: np.ndarray | None = None,
     ) -> None:
         """Publish fallback weights and the covariance context for per-PRN LCMV."""
 
@@ -3146,12 +3272,26 @@ class BackendRuntime:
                 candidate_null = np.asarray(
                     null_vector, dtype=np.complex128
                 ).reshape(-1)
+                candidate_nulls = np.asarray(
+                    (
+                        null_vectors
+                        if null_vectors is not None
+                        else candidate_null[:, np.newaxis]
+                    ),
+                    dtype=np.complex128,
+                )
+                if candidate_nulls.ndim == 1:
+                    candidate_nulls = candidate_nulls[:, np.newaxis]
                 if (
                     candidate_covariance.shape
                     == (len(self._config.channels), len(self._config.channels))
                     and candidate_null.size == len(self._config.channels)
+                    and candidate_nulls.ndim == 2
+                    and candidate_nulls.shape[0] == len(self._config.channels)
+                    and 1 <= candidate_nulls.shape[1] < len(self._config.channels)
                     and np.all(np.isfinite(candidate_covariance))
                     and np.all(np.isfinite(candidate_null))
+                    and np.all(np.isfinite(candidate_nulls))
                 ):
                     self._shared_measured_u1_protection_covariance = np.array(
                         candidate_covariance, copy=True
@@ -3159,12 +3299,18 @@ class BackendRuntime:
                     self._shared_measured_u1_protection_null_vector = np.array(
                         candidate_null, copy=True
                     )
+                    self._shared_measured_u1_protection_null_vectors = np.array(
+                        candidate_nulls, copy=True
+                    )
             elif not available:
                 self._shared_measured_u1_protection_covariance = np.empty(
                     (0, 0), dtype=np.complex128
                 )
                 self._shared_measured_u1_protection_null_vector = np.empty(
                     (0,), dtype=np.complex128
+                )
+                self._shared_measured_u1_protection_null_vectors = np.empty(
+                    (len(self._config.channels), 0), dtype=np.complex128
                 )
 
     def _get_shared_measured_u1_protection_weights_copy(self) -> np.ndarray:
@@ -3193,9 +3339,54 @@ class BackendRuntime:
                 ),
             )
 
+    def _get_per_prn_lcmv_null_vectors_copy(self) -> np.ndarray:
+        with self._beamformer_lock:
+            return np.array(
+                self._shared_measured_u1_protection_null_vectors,
+                copy=True,
+            )
+
+    def _cold_start_spatial_acquisition_context(self) -> dict[str, object]:
+        """Return one atomic-enough snapshot for the off-hot-path PCPS worker."""
+
+        with self._results_lock:
+            rescue_active = bool(
+                self._cold_start_rescue_active
+                and self._lcmv_jammer_protection_active
+            )
+            classify_active = bool(
+                not rescue_active
+                and self._cold_start_wideband_candidate_active
+            )
+            active = bool(rescue_active or classify_active)
+            mode = "rescue" if rescue_active else "classify"
+            notch_offset_hz = self._cold_start_notch_frequency_offset_hz
+        return {
+            "active": active,
+            "mode": mode,
+            "notch_frequency_offset_hz": notch_offset_hz,
+            "jammer_vectors": (
+                self._get_per_prn_lcmv_null_vectors_copy()
+                if rescue_active
+                else np.zeros(
+                    (len(self._config.channels), 0), dtype=np.complex128
+                )
+            ),
+        }
+
     def _get_per_prn_protection_snapshot(
         self,
     ) -> tuple[np.ndarray, bool, np.ndarray, np.ndarray]:
+        """Return the backward-compatible one-null protection publication."""
+
+        weights, available, covariance, primary, _ = (
+            self._get_per_prn_protection_subspace_snapshot()
+        )
+        return weights, available, covariance, primary
+
+    def _get_per_prn_protection_subspace_snapshot(
+        self,
+    ) -> tuple[np.ndarray, bool, np.ndarray, np.ndarray, np.ndarray]:
         """Return one atomic generation of shared and per-PRN protection state."""
 
         with self._beamformer_lock:
@@ -3211,6 +3402,10 @@ class BackendRuntime:
                 ),
                 np.array(
                     self._shared_measured_u1_protection_null_vector,
+                    copy=True,
+                ),
+                np.array(
+                    self._shared_measured_u1_protection_null_vectors,
                     copy=True,
                 ),
             )
@@ -3255,12 +3450,104 @@ class BackendRuntime:
         # The fanout bank is created only after the GNSS bridge has started.
         # Keep the ordinary beamformer usable during construction, teardown,
         # and failed/partial startup instead of raising from the realtime path.
+        # The same temporal notch is linear and identical on all array rows, so
+        # it commutes with the spatial matrix. Applying it to the four array
+        # channels before ten-way PRN fanout preserves the result while cutting
+        # the realtime filter workload by 60 percent.
+        gnss_chunk = self._apply_cold_start_frequency_notch(chunk)
         if (
             self._shared_phase_fanout_enabled()
             and self._shared_u1_phase_bank is not None
         ):
-            return self._gnss_shared_u1_phase_output_matrix(chunk)
-        return self._gnss_beamformed_output_vector(chunk)
+            return self._gnss_shared_u1_phase_output_matrix(gnss_chunk)
+        return self._gnss_beamformed_output_vector(gnss_chunk)
+
+    def _apply_cold_start_frequency_notch(
+        self,
+        output: np.ndarray,
+    ) -> np.ndarray:
+        """Remove the detected residual tone before spatial PRN fanout."""
+
+        source = np.asarray(output, dtype=np.complex64)
+        with self._results_lock:
+            enabled = bool(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_frequency_notch_enabled",
+                    False,
+                )
+                and self._cold_start_rescue_active
+                and self._cold_start_notch_frequency_offset_hz is not None
+            )
+            offset_hz = self._cold_start_notch_frequency_offset_hz
+        with self._cold_start_notch_lock:
+            if not enabled or offset_hz is None:
+                if self._cold_start_notch.active:
+                    self._cold_start_notch.reset()
+                return source
+            self._cold_start_notch.tune(float(offset_hz))
+            filtered = self._cold_start_notch.process(source)
+
+        now = time.monotonic()
+        if now - self._cold_start_notch_last_log_monotonic_s >= 1.0:
+            sample_count = min(int(source.shape[-1]), 4096)
+            if sample_count > 0:
+                index = np.arange(sample_count, dtype=np.float64)
+                mixer = np.exp(
+                    -2j
+                    * np.pi
+                    * float(offset_hz)
+                    / float(self._config.sample_rate)
+                    * index
+                )
+                before_view = np.asarray(source[..., -sample_count:], dtype=np.complex128)
+                after_view = np.asarray(filtered[..., -sample_count:], dtype=np.complex128)
+                before_line = np.mean(before_view * mixer, axis=-1)
+                after_line = np.mean(after_view * mixer, axis=-1)
+                before_power = float(np.mean(np.abs(before_line) ** 2))
+                after_power = float(np.mean(np.abs(after_line) ** 2))
+                reduction_db = ratio_db(before_power, after_power)
+            else:
+                reduction_db = None
+            metrics = {
+                "frequency_notch_active": True,
+                "frequency_notch_offset_hz": self._json_float(offset_hz),
+                "frequency_notch_absolute_hz": self._json_float(
+                    float(self._config.center_freq_hz) + float(offset_hz)
+                ),
+                "frequency_notch_bandwidth_hz": self._json_float(
+                    self._cold_start_notch.bandwidth_hz
+                ),
+                "frequency_notch_fir_taps": int(self._cold_start_notch.num_taps),
+                "frequency_notch_group_delay_samples": int(
+                    self._cold_start_notch.group_delay_samples
+                ),
+                "frequency_notch_measured_line_reduction_db": self._json_float(
+                    reduction_db
+                ),
+            }
+            with self._results_lock:
+                status = dict(self._latest_lcmv_test)
+                status["output_metrics"] = {
+                    **dict(status.get("output_metrics", {})),
+                    **metrics,
+                }
+                self._latest_lcmv_test = status
+                self._cold_start_last_evidence = {
+                    **dict(self._cold_start_last_evidence),
+                    **metrics,
+                }
+            self._cold_start_notch_last_log_monotonic_s = now
+            self._lcmv_log.info(
+                "cold-start frequency notch active: offset_hz=%.3f absolute_hz=%.3f "
+                "bandwidth_hz=%.1f fir_taps=%d measured_line_reduction_db=%s",
+                float(offset_hz),
+                float(self._config.center_freq_hz) + float(offset_hz),
+                self._cold_start_notch.bandwidth_hz,
+                self._cold_start_notch.num_taps,
+                self._format_optional_float(reduction_db),
+            )
+        return filtered
 
     def _shared_phase_fanout_enabled(self) -> bool:
         return bool(
@@ -3313,6 +3600,9 @@ class BackendRuntime:
                 tracking_monitor_prn = int(
                     entry.get("tracking_monitor_prn", 0) or 0
                 )
+                tracking_monitor_cno_db_hz = float(
+                    entry.get("tracking_monitor_cno_db_hz", 0.0) or 0.0
+                )
             except (TypeError, ValueError):
                 continue
             system = str(entry.get("system", "G")).upper()
@@ -3321,6 +3611,54 @@ class BackendRuntime:
                 0 <= channel < source_count
                 and 1 <= prn <= 32
                 and tracking_monitor_prn == prn
+                and tracking_monitor_cno_db_hz > 0.0
+                and str(entry.get("state", "")).lower() == "tracking"
+                and system in {"G", "GPS"}
+                and signal == "1C"
+            ):
+                mapped[channel] = prn
+        return tuple(mapped)
+
+    def _acquisition_source_satellites(
+        self,
+        snapshot: dict[str, object],
+    ) -> tuple[int | None, ...]:
+        """Return current GPS L1 candidate ownership, including C/N0 == 0.
+
+        GNSS-SDR publishes the PRN currently assigned to each acquisition
+        channel before acquisition becomes valid.  That candidate identity is
+        required to hold one spatial acquisition row stable for the whole
+        attempt and rotate the row only at an assignment boundary.  This is
+        deliberately separate from ``_tracking_source_satellites``: exposing
+        a candidate to the beamformer must not claim that it is tracked.
+        """
+
+        pinned = tuple(
+            int(value)
+            for value in self._config.gnss_shared_u1_phase_satellites
+        )
+        if pinned:
+            return tuple(pinned)
+        source_count = self._shared_phase_source_count()
+        mapped: list[int | None] = [None] * source_count
+        entries = snapshot.get("prns", [])
+        if not isinstance(entries, list):
+            return tuple(mapped)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                channel = int(entry.get("channel", -1))
+                prn = int(entry.get("prn", 0) or 0)
+                monitor_prn = int(entry.get("tracking_monitor_prn", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            system = str(entry.get("system", "G")).upper()
+            signal = str(entry.get("signal", ""))
+            if (
+                0 <= channel < source_count
+                and 1 <= prn <= 32
+                and monitor_prn == prn
                 and str(entry.get("state", "")).lower() == "tracking"
                 and system in {"G", "GPS"}
                 and signal == "1C"
@@ -3346,21 +3684,51 @@ class BackendRuntime:
             now - self._last_shared_u1_source_mapping_refresh_ts >= 0.05
         )
         monitor = self._shared_u1_phase_monitor
-        if emit_status and monitor is not None:
-            self._shared_u1_desired_vectors_cache = (
-                monitor.desired_vectors_snapshot()
+        acquisition_monitor = self._cold_start_spatial_acquisition_monitor
+        if emit_status:
+            acquisition_vectors = (
+                acquisition_monitor.desired_vectors_snapshot()
+                if acquisition_monitor is not None
+                else {}
             )
+            tracking_vectors = (
+                monitor.desired_vectors_snapshot()
+                if monitor is not None
+                else {}
+            )
+            # A tracked, quality-gated prompt is newer and more precise than
+            # its acquisition-stage estimate.  Until tracking exists, the
+            # physically consistent cold-start vector supplies the missing
+            # per-PRN preserve constraint.
+            self._shared_u1_desired_vectors_cache = {
+                **acquisition_vectors,
+                **tracking_vectors,
+            }
         if refresh_source_mapping:
             bridge = self._gnss_bridge
             if bridge is not None:
                 self._shared_u1_source_satellites_cache = (
-                    self._tracking_source_satellites(bridge.snapshot())
+                    self._acquisition_source_satellites(bridge.snapshot())
                 )
             self._last_shared_u1_source_mapping_refresh_ts = now
         with self._results_lock:
             jammer_latched = bool(self._lcmv_jammer_detected_latched)
             jammer_active = bool(self._lcmv_jammer_protection_active)
-        enabled_now = bool(self._lcmv_test_enabled and jammer_active)
+            cold_start_rescue_active = bool(self._cold_start_rescue_active)
+            acquisition_rows = (
+                np.array(self._cold_start_acquisition_rows, copy=True)
+                if self._cold_start_acquisition_rows is not None
+                else None
+            )
+            acquisition_modes = (
+                tuple(self._cold_start_acquisition_modes)
+                if acquisition_rows is not None
+                else None
+            )
+        enabled_now = bool(
+            jammer_active
+            and (self._lcmv_test_enabled or cold_start_rescue_active)
+        )
         # Unmapped acquisition sources use the common/shared fallback. Mapped
         # sources use an independent measured-vector row before, during, and
         # after jamming.
@@ -3370,11 +3738,14 @@ class BackendRuntime:
             protection_available,
             protection_covariance,
             protection_null,
-        ) = self._get_per_prn_protection_snapshot()
+            protection_nulls,
+        ) = self._get_per_prn_protection_subspace_snapshot()
         logical, status = bank.advance(
             shared_common_weights=common,
             shared_measured_u1_weights=protection,
             shared_measured_u1_available=protection_available,
+            acquisition_rows=acquisition_rows,
+            acquisition_modes=acquisition_modes,
             # The monitor itself updates at 1 Hz. Re-reading and normalizing
             # the same ten vectors on every 8.2 ms IQ chunk is pure overhead.
             desired_vectors=(
@@ -3384,6 +3755,7 @@ class BackendRuntime:
             enabled_now=enabled_now,
             covariance=protection_covariance,
             jammer_vector=protection_null,
+            jammer_vectors=protection_nulls,
             diagonal_loading_rel=float(
                 getattr(
                     self._config,
@@ -3450,43 +3822,81 @@ class BackendRuntime:
                 for payload in status.values()
                 if bool(payload.get("independent_per_prn_lcmv", False))
             )
+            wall_time_ns = time.time_ns()
+            session = self._log_session
+            status_payload = {
+                "schema_version": 1,
+                "timestamp_utc": datetime.fromtimestamp(
+                    wall_time_ns / 1e9,
+                    timezone.utc,
+                ).isoformat(),
+                "timestamp_local": datetime.fromtimestamp(
+                    wall_time_ns / 1e9,
+                ).astimezone().isoformat(),
+                "wall_time_unix_ns": wall_time_ns,
+                "monotonic_ns": time.monotonic_ns(),
+                "session_id": session.session_id if session is not None else None,
+                "session_elapsed_s": (
+                    session.elapsed_s() if session is not None else None
+                ),
+                "event": "shared_u1_phase_compensation_status",
+                "applied_to_gnss_sdr": True,
+                "common_pvt_solver": True,
+                "jammer_latched": jammer_latched,
+                "jammer_protection_active": jammer_active,
+                "cold_start_rescue_active": cold_start_rescue_active,
+                "cold_start_acquisition_beam_count": (
+                    int(acquisition_rows.shape[0])
+                    if acquisition_rows is not None
+                    else 0
+                ),
+                "cold_start_acquisition_beam_modes": list(acquisition_modes or ()),
+                "enabled_now": enabled_now,
+                "independent_per_prn_lcmv": True,
+                "active_per_prn_source_count": per_prn_count,
+                "active_per_prn_lcmv_source_count": per_prn_lcmv_count,
+                "phase_compensated_shared_protection_count": bridge_count,
+                "transitioning_source_count": transitioning_count,
+                "phase_compensation": "constraint_on_each_per_prn_spatial_update",
+                "scalar_fanout_chunks": self._shared_u1_scalar_fanout_chunks,
+                "matrix_fallback_chunks": self._shared_u1_matrix_fallback_chunks,
+                "latest_output_path": (
+                    "collinear_rows_optimized"
+                    if scalar_fast_path
+                    else "independent_per_prn_spatial_matrix"
+                ),
+                "dynamic_source_satellites": [
+                    (f"G{value:02d}" if value is not None else None)
+                    for value in self._shared_u1_source_satellites_cache
+                ],
+                "shared_protection_available": protection_available,
+                "shared_protection_logical_weights": (
+                    complex_vector_payload(protection)
+                    if protection_available
+                    else None
+                ),
+                "jammer_spatial_vector": (
+                    complex_vector_payload(protection_null)
+                    if protection_null is not None
+                    else None
+                ),
+                "loaded_spatial_covariance": (
+                    self._json_complex_matrix(protection_covariance)
+                    if protection_covariance is not None
+                    else None
+                ),
+                "sources": status,
+            }
+            encoded_status = json.dumps(
+                status_payload,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
             self._handoff_log.info(
                 "shared_u1_phase_compensation_status %s",
-                json.dumps(
-                    {
-                        "event": "shared_u1_phase_compensation_status",
-                        "applied_to_gnss_sdr": True,
-                        "common_pvt_solver": True,
-                        "jammer_latched": jammer_latched,
-                        "jammer_protection_active": jammer_active,
-                        "enabled_now": enabled_now,
-                        "independent_per_prn_lcmv": True,
-                        "active_per_prn_source_count": per_prn_count,
-                        "active_per_prn_lcmv_source_count": per_prn_lcmv_count,
-                        "phase_compensated_shared_protection_count": bridge_count,
-                        "transitioning_source_count": transitioning_count,
-                        "phase_compensation": (
-                            "constraint_on_each_per_prn_spatial_update"
-                        ),
-                        "scalar_fanout_chunks": self._shared_u1_scalar_fanout_chunks,
-                        "matrix_fallback_chunks": (
-                            self._shared_u1_matrix_fallback_chunks
-                        ),
-                        "latest_output_path": (
-                            "collinear_rows_optimized"
-                            if scalar_fast_path
-                            else "independent_per_prn_spatial_matrix"
-                        ),
-                        "dynamic_source_satellites": [
-                            (f"G{value:02d}" if value is not None else None)
-                            for value in self._shared_u1_source_satellites_cache
-                        ],
-                        "sources": status,
-                    },
-                    allow_nan=False,
-                    separators=(",", ":"),
-                ),
+                encoded_status,
             )
+            self._per_prn_weights_log.info("%s", encoded_status)
         return outputs
 
     def _gnss_beamformed_output_vector(self, chunk: np.ndarray) -> np.ndarray:
@@ -4624,6 +5034,951 @@ class BackendRuntime:
             "lcmv_jammer_activation_angle_only_forbidden": True,
         }
 
+    def _deactivate_cold_start_jammer_rescue(self, reason: str) -> None:
+        """Return acquisition fanout to its ordinary uniform/per-PRN rows."""
+
+        with self._results_lock:
+            was_active = bool(self._cold_start_rescue_active)
+            self._cold_start_rescue_active = False
+            self._cold_start_rescue_mode = None
+            self._cold_start_wideband_candidate_active = False
+            self._cold_start_notch_frequency_offset_hz = None
+            self._cold_start_acquisition_rows = None
+            self._cold_start_acquisition_modes = ()
+            self._cold_start_detect_streak = 0
+            self._cold_start_clear_streak = 0
+            self._cold_start_retarget_streak = 0
+            self._lcmv_jammer_protection_active = False
+            self._lcmv_jammer_last_evidence_monotonic_s = None
+            payload = {
+                **dict(self._cold_start_last_evidence),
+                "cold_start_rescue_active": False,
+                "cold_start_rescue_reason": str(reason),
+            }
+            self._cold_start_last_evidence = payload
+            self._latest_spatial_vector_diagnostics = dict(payload)
+        with self._cold_start_notch_lock:
+            self._cold_start_notch.reset()
+        self._set_shared_measured_u1_protection_weights(
+            uniform_weights(len(self._config.channels)),
+            available=False,
+        )
+        if not self._lcmv_test_enabled:
+            self._set_lcmv_status(
+                enabled=False,
+                mode="off",
+                reason=str(reason),
+                run_state_label="cold_start_rescue_released",
+                spatial_vector_diagnostics=payload,
+            )
+        if was_active:
+            self._lcmv_log.warning(
+                "cold-start jammer rescue released: %s; output returns to acquisition rows",
+                reason,
+            )
+            self._record_runtime_event(
+                "lcmv_off",
+                source="automatic_rank_spectral_detector",
+                notes=str(reason),
+            )
+
+    def _update_cold_start_jammer_rescue(
+        self,
+        *,
+        corrected_chunk: np.ndarray,
+    ) -> dict[str, object]:
+        """Detect and null persistent interference before PVT exists.
+
+        The ordinary onset detector compares jammer-on data with a previously
+        frozen healthy bladeRF/PVT covariance. Narrowband rescue uses strict
+        rank plus spectral-line evidence. Broadband rescue first creates a
+        calibrated high-power spatial candidate, then waits for repeated PCPS
+        observations: physically consistent GNSS vetoes nulling; only a
+        candidate with no such GNSS evidence may activate protection.
+        """
+
+        enabled = bool(
+            getattr(self._config, "lcmv_cold_start_rescue_enabled", False)
+        )
+        preserve_mode = str(
+            getattr(self._config, "lcmv_preserve_constraint_mode", "uniform")
+        ).strip().lower()
+        eligible = bool(
+            enabled
+            and self._shared_phase_fanout_enabled()
+            and preserve_mode == "realtime_bladerf_measured_u1"
+            and not self._lcmv_test_enabled
+            and not self._lcmv_auto_arm_suppressed_by_operator
+        )
+        if not eligible:
+            if self._cold_start_rescue_active:
+                self._deactivate_cold_start_jammer_rescue(
+                    "cold-start rescue became ineligible"
+                )
+            return {
+                "cold_start_rescue_attempted": False,
+                "cold_start_rescue_enabled": enabled,
+                "cold_start_rescue_active": False,
+            }
+
+        now = time.monotonic()
+        evaluation_interval_s = max(
+            0.0,
+            float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_evaluation_interval_s",
+                    0.1,
+                )
+            ),
+        )
+        if (
+            now - self._cold_start_last_evaluation_monotonic_s
+            < evaluation_interval_s
+        ):
+            return dict(self._cold_start_last_evidence)
+        self._cold_start_last_evaluation_monotonic_s = now
+
+        evidence = cold_start_jammer_evidence(
+            corrected_chunk,
+            min_dominant_fraction=float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_dominant_fraction",
+                    0.90,
+                )
+            ),
+            min_eigen_gap_db=float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_eigen_gap_db",
+                    10.0,
+                )
+            ),
+            min_strongest_bin_fraction=float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_spectral_concentration",
+                    0.60,
+                )
+            ),
+            min_peak_over_median_db=float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_peak_over_median_db",
+                    20.0,
+                )
+            ),
+            strongest_bin_fraction=float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_spectral_top_fraction",
+                    0.01,
+                )
+            ),
+            reference_power_linear=(
+                float(
+                    getattr(
+                        self._config,
+                        "lcmv_cold_start_noise_reference_power_linear",
+                        0.0,
+                    )
+                )
+                or None
+            ),
+            min_wideband_excess_power_db=float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_wideband_min_excess_power_db",
+                    20.0,
+                )
+            ),
+        )
+        wideband_enabled = bool(
+            getattr(
+                self._config,
+                "lcmv_cold_start_wideband_rescue_enabled",
+                False,
+            )
+        )
+        wideband_candidate = bool(
+            wideband_enabled
+            and bool(
+                getattr(evidence, "wideband_high_power_candidate", False)
+            )
+        )
+        acquisition_monitor = self._cold_start_spatial_acquisition_monitor
+        classification = (
+            acquisition_monitor.classification_snapshot()
+            if acquisition_monitor is not None
+            else {
+                "context_mode": None,
+                "evaluation_count": 0,
+                "required_evaluations": 0,
+                "sufficient_observations": False,
+                "accepted_prns": [],
+                "gnss_consistency_veto": False,
+            }
+        )
+        with self._results_lock:
+            active_mode_before = self._cold_start_rescue_mode
+            active_before_for_classifier = bool(self._cold_start_rescue_active)
+            self._cold_start_wideband_candidate_active = bool(
+                wideband_candidate and not active_before_for_classifier
+            )
+        broadband_confirmed = bool(
+            wideband_candidate
+            and (
+                (
+                    active_before_for_classifier
+                    and active_mode_before == "broadband"
+                )
+                or (
+                    bool(classification.get("sufficient_observations", False))
+                    and not bool(
+                        classification.get("gnss_consistency_veto", False)
+                    )
+                )
+            )
+        )
+        rescue_evidence_now = bool(evidence.detected or broadband_confirmed)
+        activation_mode = "narrowband" if evidence.detected else "broadband"
+        max_interference_rank = int(
+            getattr(
+                self._config,
+                "lcmv_cold_start_max_interference_rank",
+                2,
+            )
+        )
+        secondary_eigen_gap_db = float(
+            getattr(
+                self._config,
+                "lcmv_cold_start_secondary_eigen_gap_db",
+                6.0,
+            )
+        )
+        interference_vectors, secondary_gaps_db = selected_interference_subspace(
+            evidence,
+            max_rank=max_interference_rank,
+            min_secondary_eigen_gap_db=secondary_eigen_gap_db,
+            min_secondary_spectral_concentration=float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_spectral_concentration",
+                    0.60,
+                )
+            ),
+            min_secondary_peak_over_median_db=float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_peak_over_median_db",
+                    20.0,
+                )
+            ),
+        )
+        positive_eigenvalues = np.maximum(
+            np.asarray(evidence.eigenvalues, dtype=np.float64), 1e-30
+        )
+        eigenvalue_total = float(np.sum(positive_eigenvalues))
+        eigenvalue_fractions = (
+            positive_eigenvalues / eigenvalue_total
+            if eigenvalue_total > 0.0
+            else np.zeros_like(positive_eigenvalues)
+        )
+        prior_peak_offset_hz = self._cold_start_notch_frequency_offset_hz
+        peak_normalized_frequency = float(
+            getattr(
+                evidence,
+                "peak_normalized_frequency",
+                (
+                    float(prior_peak_offset_hz) / float(self._config.sample_rate)
+                    if prior_peak_offset_hz is not None
+                    else 0.0
+                ),
+            )
+        )
+        peak_offset_hz = float(
+            peak_normalized_frequency * float(self._config.sample_rate)
+        )
+        peak_absolute_hz = float(self._config.center_freq_hz) + peak_offset_hz
+        persistence_updates = max(
+            1,
+            int(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_persistence_updates",
+                    3,
+                )
+            ),
+        )
+        release_updates = max(
+            1,
+            int(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_release_updates",
+                    30,
+                )
+            ),
+        )
+        # Detection thresholds are intentionally strict.  Do not use the same
+        # boundary for release: a value fluctuating from 0.901 to 0.899 is
+        # ambiguous, not evidence that the jammer vanished.  Release only when
+        # the spatial mode is clearly gone, or when the remaining coherent
+        # source is plainly wideband (for example, the desired bladeRF signal).
+        release_rank_threshold = max(
+            0.0,
+            float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_dominant_fraction",
+                    0.90,
+                )
+            )
+            - 0.10,
+        )
+        release_gap_threshold_db = max(
+            0.0,
+            float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_eigen_gap_db",
+                    10.0,
+                )
+            )
+            - 3.0,
+        )
+        release_spectral_threshold = max(
+            0.0,
+            0.5
+            * float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_spectral_concentration",
+                    0.60,
+                )
+            ),
+        )
+        release_peak_threshold_db = max(
+            0.0,
+            float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_peak_over_median_db",
+                    20.0,
+                )
+            )
+            - 8.0,
+        )
+        spatial_mode_cleared = bool(
+            evidence.dominant_fraction < release_rank_threshold
+            and evidence.dominant_over_second_db < release_gap_threshold_db
+        )
+        narrowband_mode_cleared = bool(
+            evidence.strongest_bin_fraction < release_spectral_threshold
+            or evidence.peak_over_median_db < release_peak_threshold_db
+        )
+        broadband_mode_cleared = bool(not wideband_candidate)
+        clear_evidence_now = bool(
+            broadband_mode_cleared
+            if active_mode_before == "broadband"
+            else (spatial_mode_cleared or narrowband_mode_cleared)
+        )
+        with self._results_lock:
+            if rescue_evidence_now:
+                self._cold_start_detect_streak += 1
+                self._cold_start_clear_streak = 0
+            else:
+                self._cold_start_detect_streak = 0
+                if self._cold_start_rescue_active and clear_evidence_now:
+                    self._cold_start_clear_streak += 1
+                else:
+                    self._cold_start_clear_streak = 0
+            active_before = bool(self._cold_start_rescue_active)
+            detect_streak = int(self._cold_start_detect_streak)
+            clear_streak = int(self._cold_start_clear_streak)
+
+        payload: dict[str, object] = {
+            "cold_start_rescue_attempted": True,
+            "cold_start_rescue_enabled": True,
+            "cold_start_rescue_evidence_now": rescue_evidence_now,
+            "cold_start_detection_mode": activation_mode,
+            "cold_start_narrowband_evidence_now": bool(evidence.detected),
+            "cold_start_wideband_rescue_enabled": wideband_enabled,
+            "cold_start_wideband_candidate_now": wideband_candidate,
+            "cold_start_wideband_confirmed_now": broadband_confirmed,
+            "cold_start_input_power_linear": self._json_float(
+                getattr(evidence, "input_power_linear", None)
+            ),
+            "cold_start_noise_reference_power_linear": self._json_float(
+                getattr(evidence, "reference_power_linear", None)
+            ),
+            "cold_start_input_power_over_reference_db": self._json_float(
+                getattr(evidence, "input_power_over_reference_db", None)
+            ),
+            "cold_start_wideband_min_excess_power_db": self._json_float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_wideband_min_excess_power_db",
+                    20.0,
+                )
+            ),
+            "cold_start_broadband_classifier": dict(classification),
+            "cold_start_clear_evidence_now": clear_evidence_now,
+            "cold_start_spatial_mode_cleared": spatial_mode_cleared,
+            "cold_start_narrowband_mode_cleared": narrowband_mode_cleared,
+            "cold_start_broadband_mode_cleared": broadband_mode_cleared,
+            "cold_start_rescue_active": active_before,
+            "cold_start_detect_streak": detect_streak,
+            "cold_start_required_streak": persistence_updates,
+            "cold_start_clear_streak": clear_streak,
+            "cold_start_release_streak": release_updates,
+            "cold_start_dominant_fraction": self._json_float(
+                evidence.dominant_fraction
+            ),
+            "cold_start_dominant_over_second_db": self._json_float(
+                evidence.dominant_over_second_db
+            ),
+            "cold_start_covariance_eigenvalues": [
+                self._json_float(value) for value in positive_eigenvalues
+            ],
+            "cold_start_covariance_eigenvalue_fractions": [
+                self._json_float(value) for value in eigenvalue_fractions
+            ],
+            "cold_start_selected_interference_rank": int(
+                interference_vectors.shape[1]
+            ),
+            "cold_start_max_interference_rank": max_interference_rank,
+            "cold_start_secondary_eigen_gaps_db": [
+                self._json_float(value) for value in secondary_gaps_db
+            ],
+            "cold_start_secondary_eigen_gap_threshold_db": self._json_float(
+                secondary_eigen_gap_db
+            ),
+            "cold_start_secondary_spectral_concentration": self._json_float(
+                getattr(evidence, "secondary_strongest_bin_fraction", 0.0)
+            ),
+            "cold_start_secondary_peak_over_median_db": self._json_float(
+                getattr(evidence, "secondary_peak_over_median_db", 0.0)
+            ),
+            "cold_start_secondary_peak_frequency_offset_hz": self._json_float(
+                getattr(evidence, "secondary_peak_normalized_frequency", 0.0)
+                * float(self._config.sample_rate)
+            ),
+            "cold_start_secondary_excess_occupied_bandwidth_90_hz": self._json_float(
+                getattr(
+                    evidence,
+                    "secondary_excess_occupied_bandwidth_fraction_90",
+                    0.0,
+                )
+                * float(self._config.sample_rate)
+            ),
+            "cold_start_spectral_concentration": self._json_float(
+                evidence.strongest_bin_fraction
+            ),
+            "cold_start_peak_over_median_db": self._json_float(
+                evidence.peak_over_median_db
+            ),
+            "cold_start_peak_normalized_frequency": self._json_float(
+                peak_normalized_frequency
+            ),
+            "cold_start_peak_frequency_offset_hz": self._json_float(
+                peak_offset_hz
+            ),
+            "cold_start_peak_absolute_frequency_hz": self._json_float(
+                peak_absolute_hz
+            ),
+            "cold_start_excess_occupied_bandwidth_90_hz": self._json_float(
+                float(
+                    getattr(
+                        evidence,
+                        "excess_occupied_bandwidth_fraction_90",
+                        0.0,
+                    )
+                )
+                * float(self._config.sample_rate)
+            ),
+            "frequency_notch_configured": bool(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_frequency_notch_enabled",
+                    False,
+                )
+            ),
+            "cold_start_rank_threshold": self._json_float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_dominant_fraction",
+                    0.90,
+                )
+            ),
+            "cold_start_eigen_gap_threshold_db": self._json_float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_eigen_gap_db",
+                    10.0,
+                )
+            ),
+            "cold_start_spectral_concentration_threshold": self._json_float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_spectral_concentration",
+                    0.60,
+                )
+            ),
+            "cold_start_peak_over_median_threshold_db": self._json_float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_peak_over_median_db",
+                    20.0,
+                )
+            ),
+        }
+        if active_before and clear_streak >= release_updates:
+            self._deactivate_cold_start_jammer_rescue(
+                "rank/spectral jammer evidence cleared persistently"
+            )
+            return {
+                **payload,
+                "cold_start_rescue_active": False,
+                "cold_start_rescue_released": True,
+            }
+        if not rescue_evidence_now or (
+            not active_before and detect_streak < persistence_updates
+        ):
+            with self._results_lock:
+                self._cold_start_last_evidence = dict(payload)
+                self._latest_spatial_vector_diagnostics = dict(payload)
+            return payload
+
+        uniform = uniform_weights(len(self._config.channels))
+        current_weights = self._get_shared_measured_u1_protection_weights_copy()
+        _, current_null = self._get_per_prn_lcmv_context_copy()
+        current_nulls = self._get_per_prn_lcmv_null_vectors_copy()
+
+        def _retain_active_null(reason: str) -> dict[str, object]:
+            """Refresh evidence without changing the spatial weights/context."""
+
+            current_target_suppression_db = ratio_db(
+                self._vector_response_power(uniform, evidence.dominant_vector),
+                self._vector_response_power(
+                    current_weights,
+                    evidence.dominant_vector,
+                ),
+            )
+            current_output_reduction_db = ratio_db(
+                covariance_output_power(
+                    covariance=evidence.covariance,
+                    weights=uniform,
+                ),
+                covariance_output_power(
+                    covariance=evidence.covariance,
+                    weights=current_weights,
+                ),
+            )
+            payload.update(
+                {
+                    "cold_start_rescue_active": True,
+                    "cold_start_weights_published": False,
+                    "cold_start_publish_reason": str(reason),
+                    "cold_start_target_suppression_db": self._json_float(
+                        current_target_suppression_db
+                    ),
+                    "cold_start_measured_output_reduction_db": self._json_float(
+                        current_output_reduction_db
+                    ),
+                }
+            )
+            current_output_metrics = {
+                "measured_output_reduction_vs_uniform_db": self._json_float(
+                    current_output_reduction_db
+                ),
+                "cold_start_measured_output_reduction_db": self._json_float(
+                    current_output_reduction_db
+                ),
+                "cold_start_target_suppression_db": self._json_float(
+                    current_target_suppression_db
+                ),
+            }
+            with self._results_lock:
+                self._cold_start_last_evidence = dict(payload)
+                self._latest_spatial_vector_diagnostics = dict(payload)
+                status = dict(self._latest_lcmv_test)
+                status["output_metrics"] = {
+                    **dict(status.get("output_metrics", {})),
+                    **current_output_metrics,
+                }
+                status["spatial_vector_diagnostics"] = dict(payload)
+                self._latest_lcmv_test = status
+            return dict(payload)
+
+        if active_before:
+            if (
+                current_nulls.shape == interference_vectors.shape
+                and current_nulls.ndim == 2
+                and current_nulls.shape[1] > 0
+            ):
+                active_basis = np.asarray(
+                    np.linalg.qr(current_nulls, mode="reduced")[0],
+                    dtype=np.complex128,
+                )
+                observed_basis = np.asarray(
+                    np.linalg.qr(interference_vectors, mode="reduced")[0],
+                    dtype=np.complex128,
+                )
+                principal_cosines = np.linalg.svd(
+                    active_basis.conj().T @ observed_basis,
+                    compute_uv=False,
+                )
+                coherence = float(np.min(principal_cosines))
+            else:
+                active_null_norm = normalize_complex_vector(current_null)
+                observed_null_norm = normalize_complex_vector(
+                    evidence.dominant_vector
+                )
+                coherence = (
+                    float(abs(np.vdot(active_null_norm, observed_null_norm)))
+                    if active_null_norm.size == observed_null_norm.size
+                    and active_null_norm.size > 0
+                    else None
+                )
+            min_coherence = float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_retarget_min_vector_coherence",
+                    0.98,
+                )
+            )
+            retarget_updates = max(
+                1,
+                int(
+                    getattr(
+                        self._config,
+                        "lcmv_cold_start_retarget_persistence_updates",
+                        10,
+                    )
+                ),
+            )
+            with self._results_lock:
+                if coherence is not None and coherence >= min_coherence:
+                    self._cold_start_retarget_streak = 0
+                else:
+                    self._cold_start_retarget_streak += 1
+                retarget_streak = int(self._cold_start_retarget_streak)
+            payload.update(
+                {
+                    "cold_start_vector_coherence_to_active_null": (
+                        self._json_float(coherence)
+                    ),
+                    "cold_start_retarget_min_vector_coherence": self._json_float(
+                        min_coherence
+                    ),
+                    "cold_start_retarget_streak": retarget_streak,
+                    "cold_start_retarget_required_streak": retarget_updates,
+                }
+            )
+            if retarget_streak < retarget_updates:
+                if retarget_streak == 0:
+                    return _retain_active_null(
+                        "latched null retained; measured jammer vector is coherent"
+                    )
+                return _retain_active_null(
+                    "latched null retained; retarget evidence is not persistent"
+                )
+
+        publish_interval_s = max(
+            0.0,
+            float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_weight_update_interval_s",
+                    1.0,
+                )
+            ),
+        )
+        if (
+            active_before
+            and now - self._cold_start_last_publish_monotonic_s
+            < publish_interval_s
+        ):
+            return _retain_active_null(
+                "latched null retained; persistent retarget is waiting for minimum interval"
+            )
+
+        try:
+            result = covariance_lcmv_subspace_null_weights(
+                covariance=evidence.covariance,
+                null_vectors=interference_vectors,
+                preserve_vector=uniform,
+                diagonal_loading_rel=float(
+                    getattr(
+                        self._config,
+                        "lcmv_covariance_diagonal_loading_rel",
+                        0.001,
+                    )
+                ),
+                diagonal_loading_abs=float(
+                    getattr(
+                        self._config,
+                        "lcmv_covariance_diagonal_loading_abs",
+                        0.0,
+                    )
+                ),
+                condition_number_limit=float(
+                    self._config.lcmv_test_condition_number_limit
+                ),
+                max_weight_norm=self._lcmv_weight_norm_limit(),
+            )
+            weights = np.asarray(result.weights, dtype=np.complex128).reshape(-1)
+            u1 = normalize_complex_vector(evidence.dominant_vector)
+            acquisition_rows = jammer_nullspace_acquisition_rows(
+                interference_vectors,
+                source_count=self._shared_phase_source_count(),
+            )
+            acquisition_source_count = int(acquisition_rows.shape[0])
+            # Every cold-start source must remain inside the measured jammer
+            # nullspace.  The previous four notch-only/uniform rows leaked the
+            # strong interferer back into acquisition.  Desired-signal
+            # diversity is now recovered by common-hypothesis noncoherent
+            # spatial PCPS, not by unprotected passthrough rows.
+            passthrough_count = 0
+            acquisition_modes = tuple(
+                "jammer_nullspace" for _ in range(acquisition_source_count)
+            )
+            nullspace_rows = acquisition_rows
+            acquisition_null_residual = float(
+                np.max(
+                    np.abs(np.conj(nullspace_rows) @ interference_vectors)
+                )
+                if nullspace_rows.size
+                else 0.0
+            )
+            acquisition_rank = (
+                int(np.linalg.matrix_rank(nullspace_rows))
+                if nullspace_rows.size
+                else 0
+            )
+            expected_acquisition_rank = min(
+                len(self._config.channels) - interference_vectors.shape[1],
+                int(nullspace_rows.shape[0]),
+            )
+            if acquisition_rank != expected_acquisition_rank:
+                raise ValueError(
+                    "cold-start acquisition beam bank does not span the jammer "
+                    f"nullspace: rank={acquisition_rank} "
+                    f"expected={expected_acquisition_rank}"
+                )
+            if acquisition_null_residual > 1e-8:
+                raise ValueError(
+                    "cold-start acquisition beam bank misses the measured null: "
+                    f"residual={acquisition_null_residual:.6g}"
+                )
+            target_suppression_db = ratio_db(
+                self._vector_response_power(uniform, u1),
+                self._vector_response_power(weights, u1),
+            )
+            output_reduction_db = ratio_db(
+                covariance_output_power(
+                    covariance=evidence.covariance,
+                    weights=uniform,
+                ),
+                covariance_output_power(
+                    covariance=evidence.covariance,
+                    weights=weights,
+                ),
+            )
+            rejection = self._method_safety_rejection_reason(
+                result=result,
+                target_suppression_db=target_suppression_db,
+                enforce_white_noise_gain=True,
+            )
+            min_output_reduction_db = float(
+                getattr(
+                    self._config,
+                    "lcmv_cold_start_min_output_reduction_db",
+                    3.0,
+                )
+            )
+            if rejection:
+                raise ValueError(rejection)
+            if (
+                output_reduction_db is None
+                or output_reduction_db < min_output_reduction_db
+            ):
+                raise ValueError(
+                    "cold-start null does not improve measured covariance output: "
+                    f"reduction={output_reduction_db} dB required={min_output_reduction_db:.2f} dB"
+                )
+        except Exception as exc:
+            payload["cold_start_weights_published"] = False
+            payload["cold_start_publish_reason"] = str(exc)
+            with self._results_lock:
+                self._cold_start_last_evidence = dict(payload)
+                self._latest_spatial_vector_diagnostics = dict(payload)
+            self._lcmv_log.warning("cold-start jammer rescue rejected: %s", exc)
+            return payload
+
+        self._set_shared_measured_u1_protection_weights(
+            weights,
+            covariance=evidence.covariance,
+            null_vector=evidence.dominant_vector,
+            null_vectors=interference_vectors,
+        )
+        with self._results_lock:
+            first_activation = not self._cold_start_rescue_active
+            self._cold_start_rescue_active = True
+            self._cold_start_rescue_mode = activation_mode
+            self._cold_start_wideband_candidate_active = False
+            self._cold_start_notch_frequency_offset_hz = (
+                peak_offset_hz if activation_mode == "narrowband" else None
+            )
+            self._cold_start_acquisition_rows = np.array(
+                acquisition_rows,
+                copy=True,
+            )
+            self._cold_start_acquisition_modes = acquisition_modes
+            self._lcmv_jammer_detected_latched = True
+            self._lcmv_jammer_protection_active = True
+            self._lcmv_jammer_last_evidence_monotonic_s = now
+            self._cold_start_last_publish_monotonic_s = now
+            self._cold_start_retarget_streak = 0
+        payload.update(
+            {
+                "cold_start_rescue_active": True,
+                "cold_start_rescue_mode": activation_mode,
+                "cold_start_weights_published": True,
+                "cold_start_publish_reason": (
+                    "persistent pre-PVT measured interference subspace "
+                    f"confirmed by {activation_mode} evidence"
+                ),
+                "cold_start_target_suppression_db": self._json_float(
+                    target_suppression_db
+                ),
+                "cold_start_measured_output_reduction_db": self._json_float(
+                    output_reduction_db
+                ),
+                "cold_start_weight_norm": self._json_float(result.weight_norm),
+                "cold_start_condition_number": self._json_float(
+                    result.condition_number
+                ),
+                "cold_start_null_residual_abs": self._json_float(
+                    np.max(np.abs(result.null_residuals))
+                ),
+                "cold_start_acquisition_beam_count": int(
+                    acquisition_rows.shape[0]
+                ),
+                "cold_start_acquisition_beam_rank": acquisition_rank,
+                "cold_start_frequency_notch_only_beam_count": passthrough_count,
+                "cold_start_jammer_nullspace_beam_count": int(
+                    nullspace_rows.shape[0]
+                ),
+                "cold_start_acquisition_beam_modes": list(acquisition_modes),
+                "cold_start_acquisition_max_null_residual_abs": self._json_float(
+                    acquisition_null_residual
+                ),
+            }
+        )
+        with self._results_lock:
+            self._cold_start_last_evidence = dict(payload)
+            self._latest_spatial_vector_diagnostics = dict(payload)
+        # The cold-start path uses a measured spatial vector rather than an
+        # ideal steering angle, but the operator still needs to see the
+        # response of the weights that are actually being sent to GNSS-SDR.
+        # Plot those weights against the configured ideal array manifold and
+        # mark the deepest modeled notch.  Keep the separately calculated
+        # covariance reduction as the measured (rather than modeled) result.
+        model = lcmv_model_response(
+            weights=weights,
+            scan_angles_deg=self._scan_angles_deg,
+            rf_freq_hz=self._config.center_freq_hz,
+            array_spacing_m=self._config.array_spacing_m,
+        )
+        null_internal_deg: float | None = None
+        null_bearing_deg: float | None = None
+        if model.response_abs.size:
+            min_index = int(np.argmin(model.response_abs))
+            null_internal_deg = float(self._scan_angles_deg[min_index])
+            null_bearing_deg = float(
+                internal_angle_to_operator_bearing_deg(null_internal_deg)
+            )
+        cold_start_output_metrics = {
+            "measured_output_reduction_vs_uniform_db": self._json_float(
+                output_reduction_db
+            ),
+            "cold_start_measured_output_reduction_db": self._json_float(
+                output_reduction_db
+            ),
+            "cold_start_target_suppression_db": self._json_float(
+                target_suppression_db
+            ),
+        }
+        self._set_lcmv_status(
+            enabled=True,
+            mode="on",
+            reason="cold-start pre-PVT jammer rescue",
+            null_internal_deg=null_internal_deg,
+            null_bearing_deg=null_bearing_deg,
+            weight_norm=result.weight_norm,
+            max_weight_abs=result.max_weight_abs,
+            condition_number=result.condition_number,
+            preserve_residual_abs=abs(result.preserve_residual),
+            null_residual_abs=float(np.max(np.abs(result.null_residuals))),
+            lcmv_response_db=model.response_db,
+            lcmv_response_abs=model.response_abs,
+            lcmv_response_power=model.response_power,
+            lcmv_response_power_db=model.response_power_db,
+            lcmv_model_summary=self._lcmv_model_summary_payload(model),
+            output_metrics=cold_start_output_metrics,
+            active_lcmv_null_method="cold_start_measured_interference_subspace",
+            active_lcmv_method="cold_start_rank_spectral_subspace_lcmv",
+            active_lcmv_weights_source="cold_start_covariance_eigenvectors",
+            run_state_label="cold_start_jammer_rescue",
+            jammer_confidence_score=1.0,
+            spatial_vector_diagnostics=payload,
+        )
+        log_method = self._lcmv_log.warning if first_activation else self._lcmv_log.info
+        log_method(
+            "cold-start jammer rescue %s: dominant_fraction=%.4f "
+            "eigen_gap_db=%.2f spectral_concentration=%.4f "
+            "peak_over_median_db=%.2f excess_bw90_hz=%.1f "
+            "measured_output_reduction_db=%s acquisition_beams=%d "
+            "notch_only_beams=%d nullspace_beams=%d nullspace_rank=%d "
+            "interference_rank=%d eigenvalue_fractions=%s "
+            "secondary_eigen_gaps_db=%s secondary_spectral_concentration=%.4f "
+            "secondary_peak_over_median_db=%.2f "
+            "acquisition_max_null_residual=%.3e",
+            "activated" if first_activation else "updated",
+            evidence.dominant_fraction,
+            evidence.dominant_over_second_db,
+            evidence.strongest_bin_fraction,
+            evidence.peak_over_median_db,
+            float(
+                evidence.excess_occupied_bandwidth_fraction_90
+                * float(self._config.sample_rate)
+            ),
+            self._format_optional_float(output_reduction_db),
+            int(acquisition_rows.shape[0]),
+            passthrough_count,
+            int(nullspace_rows.shape[0]),
+            acquisition_rank,
+            int(interference_vectors.shape[1]),
+            [round(float(value), 6) for value in eigenvalue_fractions],
+            [round(float(value), 3) for value in secondary_gaps_db],
+            float(getattr(evidence, "secondary_strongest_bin_fraction", 0.0)),
+            float(getattr(evidence, "secondary_peak_over_median_db", 0.0)),
+            acquisition_null_residual,
+        )
+        if first_activation:
+            self._record_runtime_event(
+                "lcmv_on",
+                source="automatic_rank_spectral_detector",
+                notes=(
+                    "Persistent pre-PVT narrowband source; measured interference "
+                    "subspace acquisition nulls published"
+                ),
+            )
+        return payload
+
     def _fast_realtime_measured_u1_protection_update(
         self,
         *,
@@ -4767,7 +6122,7 @@ class BackendRuntime:
     ) -> dict[str, object]:
         """Track and log the healthy reference while the active combiner is uniform."""
 
-        if self._lcmv_test_enabled:
+        if self._lcmv_test_enabled or self._cold_start_rescue_active:
             return {}
         corrected = np.asarray(corrected_chunk, dtype=np.complex128)
         covariance = (
@@ -6511,13 +7866,28 @@ class BackendRuntime:
                         "gnss_monitor_submit",
                         time.monotonic() - monitor_t0,
                     )
+                acquisition_monitor = (
+                    self._cold_start_spatial_acquisition_monitor
+                )
+                if acquisition_monitor is not None:
+                    acquisition_t0 = time.monotonic()
+                    acquisition_monitor.submit(sample_start, item.raw_chunk)
+                    self._record_runtime_timing(
+                        "gnss_cold_start_acquisition_submit",
+                        time.monotonic() - acquisition_t0,
+                    )
             except Exception as exc:
                 self._handle_gnss_pipeline_error(exc)
                 break
 
     def _fifo_output_source_label(self) -> str:
         if self._shared_phase_fanout_enabled():
-            if self._lcmv_test_enabled and self._lcmv_jammer_protection_active:
+            if (
+                self._lcmv_jammer_protection_active
+                and (self._lcmv_test_enabled or self._cold_start_rescue_active)
+            ):
+                if self._cold_start_rescue_active:
+                    return "cold_start_measured_u1_rescue_fanout"
                 return "independent_per_prn_measured_vector_lcmv_fanout"
             return "independent_per_prn_measured_vector_fanout"
         if bool(self._beamformer_transition_payload().get("weight_transition_active")):
@@ -6718,6 +8088,9 @@ class BackendRuntime:
                     phase_metrics["complex_samples_calibrated"], dtype=np.complex64
                 )
                 self._last_phase_ts = time.monotonic()
+            self._update_cold_start_jammer_rescue(
+                corrected_chunk=calibrated_chunk,
+            )
             self._fast_realtime_measured_u1_protection_update(
                 corrected_chunk=calibrated_chunk,
                 raw_power_metrics={

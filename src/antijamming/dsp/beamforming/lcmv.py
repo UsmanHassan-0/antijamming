@@ -1,4 +1,4 @@
-"""One-null LCMV test weights for the realtime array combiner."""
+"""Full-covariance LCMV weights for the realtime array combiner."""
 
 from __future__ import annotations
 
@@ -15,11 +15,12 @@ RESPONSE_DB_EPS = 1e-300
 
 @dataclass(frozen=True, slots=True)
 class LcmvCovarianceNullResult:
-    """Weights and diagnostics for one full-covariance LCMV null."""
+    """Weights and diagnostics for one or more covariance LCMV nulls."""
 
     weights: np.ndarray
     preserve_vector: np.ndarray
     null_vector: np.ndarray
+    null_vectors: np.ndarray
     null_angle_deg: float | None
     diagonal_loading: float
     condition_number_R: float
@@ -29,8 +30,10 @@ class LcmvCovarianceNullResult:
     preserve_target: complex
     preserve_response: complex
     null_response: complex
+    null_responses: np.ndarray
     preserve_residual: complex
     null_residual: complex
+    null_residuals: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +96,7 @@ def covariance_lcmv_ideal_null_weights(
     result = _covariance_lcmv_constraint_weights(
         covariance=covariance,
         preserve_vector=preserve_vector,
-        null_vector=null_steering,
+        null_vectors=null_steering[:, np.newaxis],
         diagonal_loading_rel=diagonal_loading_rel,
         diagonal_loading_abs=diagonal_loading_abs,
         condition_number_limit=condition_number_limit,
@@ -126,7 +129,48 @@ def covariance_lcmv_vector_null_weights(
     result = _covariance_lcmv_constraint_weights(
         covariance=covariance,
         preserve_vector=preserve_vector,
-        null_vector=vector,
+        null_vectors=vector[:, np.newaxis],
+        diagonal_loading_rel=diagonal_loading_rel,
+        diagonal_loading_abs=diagonal_loading_abs,
+        condition_number_limit=condition_number_limit,
+        max_weight_norm=max_weight_norm,
+    )
+    return LcmvCovarianceNullResult(null_angle_deg=None, **result)
+
+
+def covariance_lcmv_subspace_null_weights(
+    *,
+    covariance: np.ndarray,
+    null_vectors: np.ndarray,
+    preserve_vector: np.ndarray | None = None,
+    diagonal_loading_rel: float = 1e-3,
+    diagonal_loading_abs: float = 0.0,
+    condition_number_limit: float = 1e8,
+    max_weight_norm: float = 8.0,
+) -> LcmvCovarianceNullResult:
+    """Return LCMV weights that null every independent vector in a subspace.
+
+    ``null_vectors`` uses shape ``(sensor_count, interference_rank)``.  The
+    columns are orthonormalized before constraints are formed, so repeated or
+    scaled descriptions of the same spatial mode cannot silently consume an
+    extra array degree of freedom.
+    """
+
+    vectors = np.asarray(null_vectors, dtype=np.complex128)
+    if vectors.ndim == 1:
+        vectors = vectors[:, np.newaxis]
+    if vectors.ndim != 2 or vectors.shape[1] < 1:
+        raise ValueError(
+            "covariance measured-subspace LCMV null vectors must be a nonempty matrix"
+        )
+    if not np.all(np.isfinite(vectors)):
+        raise ValueError(
+            "covariance measured-subspace LCMV null vectors contain NaN or Inf"
+        )
+    result = _covariance_lcmv_constraint_weights(
+        covariance=covariance,
+        preserve_vector=preserve_vector,
+        null_vectors=vectors,
         diagonal_loading_rel=diagonal_loading_rel,
         diagonal_loading_abs=diagonal_loading_abs,
         condition_number_limit=condition_number_limit,
@@ -139,20 +183,28 @@ def _covariance_lcmv_constraint_weights(
     *,
     covariance: np.ndarray,
     preserve_vector: np.ndarray | None,
-    null_vector: np.ndarray,
+    null_vectors: np.ndarray,
     diagonal_loading_rel: float,
     diagonal_loading_abs: float,
     condition_number_limit: float,
     max_weight_norm: float,
 ) -> dict[str, object]:
     cov = np.asarray(covariance, dtype=np.complex128)
-    null_vector = np.asarray(null_vector, dtype=np.complex128).reshape(-1)
+    null_matrix = np.asarray(null_vectors, dtype=np.complex128)
+    if null_matrix.ndim == 1:
+        null_matrix = null_matrix[:, np.newaxis]
     if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
         raise ValueError(f"covariance LCMV covariance must be square, got {cov.shape}")
     n = int(cov.shape[0])
-    if null_vector.size != n:
+    if null_matrix.ndim != 2 or null_matrix.shape[0] != n:
         raise ValueError(
-            f"covariance LCMV null vector size {null_vector.size} does not match {n}"
+            "covariance LCMV null-vector matrix shape "
+            f"{null_matrix.shape} does not match sensor count {n}"
+        )
+    if null_matrix.shape[1] < 1 or null_matrix.shape[1] >= n:
+        raise ValueError(
+            "covariance LCMV null-vector count must be between one and "
+            f"{n - 1}, got {null_matrix.shape[1]}"
         )
     preserve = (
         np.ones((n,), dtype=np.complex128)
@@ -165,20 +217,30 @@ def _covariance_lcmv_constraint_weights(
         )
     if not np.all(np.isfinite(cov)) or not np.all(np.isfinite(preserve)):
         raise ValueError("covariance LCMV inputs contain NaN or Inf")
-    if not np.all(np.isfinite(null_vector)):
-        raise ValueError("covariance LCMV null vector contains NaN or Inf")
+    if not np.all(np.isfinite(null_matrix)):
+        raise ValueError("covariance LCMV null vectors contain NaN or Inf")
     preserve_norm_value = float(np.linalg.norm(preserve))
-    null_norm_value = float(np.linalg.norm(null_vector))
     if not np.isfinite(preserve_norm_value) or preserve_norm_value <= 0.0:
         raise ValueError("covariance LCMV preserve vector has zero norm")
-    if not np.isfinite(null_norm_value) or null_norm_value <= 0.0:
-        raise ValueError("covariance LCMV null vector has zero norm")
     preserve_norm = preserve / preserve_norm_value
-    null_norm = null_vector / null_norm_value
-    constraints = np.column_stack((preserve_norm, null_norm))
+    singular_values = np.linalg.svd(null_matrix, compute_uv=False)
+    if singular_values.size == 0 or singular_values[0] <= np.finfo(np.float64).tiny:
+        raise ValueError("covariance LCMV null subspace has zero norm")
+    rank_tolerance = max(null_matrix.shape) * np.finfo(np.float64).eps * singular_values[0]
+    null_rank = int(np.count_nonzero(singular_values > rank_tolerance))
+    if null_rank != null_matrix.shape[1]:
+        raise ValueError(
+            "covariance LCMV null vectors are linearly dependent: "
+            f"rank={null_rank} columns={null_matrix.shape[1]}"
+        )
+    null_basis = np.asarray(
+        np.linalg.qr(null_matrix, mode="reduced")[0], dtype=np.complex128
+    )
+    constraints = np.column_stack((preserve_norm, null_basis))
     reference_weights = np.ones((n,), dtype=np.complex128)
     preserve_target = complex(np.vdot(preserve_norm, reference_weights))
-    targets = np.asarray([preserve_target, 0.0 + 0.0j], dtype=np.complex128)
+    targets = np.zeros((1 + null_basis.shape[1],), dtype=np.complex128)
+    targets[0] = preserve_target
     loading = _diagonal_loading_value(
         covariance=cov,
         diagonal_loading_rel=diagonal_loading_rel,
@@ -214,11 +276,13 @@ def _covariance_lcmv_constraint_weights(
         label="covariance LCMV",
     )
     preserve_response = complex(np.vdot(preserve_norm, weights))
-    null_response = complex(np.vdot(null_norm, weights))
+    null_responses = np.asarray(null_basis.conj().T @ weights, dtype=np.complex128)
+    null_response = complex(null_responses[0])
     return {
         "weights": weights,
         "preserve_vector": preserve_norm,
-        "null_vector": null_norm,
+        "null_vector": np.asarray(null_basis[:, 0], dtype=np.complex128),
+        "null_vectors": null_basis,
         "diagonal_loading": float(loading),
         "condition_number_R": cond_r,
         "condition_number": condition_number,
@@ -227,8 +291,10 @@ def _covariance_lcmv_constraint_weights(
         "preserve_target": preserve_target,
         "preserve_response": preserve_response,
         "null_response": null_response,
+        "null_responses": null_responses,
         "preserve_residual": preserve_response - preserve_target,
         "null_residual": null_response,
+        "null_residuals": np.array(null_responses, copy=True),
     }
 
 

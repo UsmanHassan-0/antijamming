@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -61,6 +62,16 @@ def test_session_finalization_retains_root_logs_and_dual_event_ledger(tmp_path) 
     manifest = json.loads((session.session_dir / "session_manifest.json").read_text())
     assert manifest["finalized"] is True
     assert manifest["stop_reason"] == "unit test"
+    inventory = {
+        item["path"]: item for item in manifest["artifact_inventory"]
+    }
+    archived_app = session.session_dir / "app.log"
+    assert inventory["app.log"]["bytes"] == archived_app.stat().st_size
+    assert inventory["app.log"]["sha256"] == hashlib.sha256(
+        archived_app.read_bytes()
+    ).hexdigest()
+    assert "session_manifest.json" not in inventory
+    assert (session.session_dir / "per_prn_weights.jsonl").is_file()
 
 
 def test_session_manifest_fingerprints_committed_dirty_and_untracked_source(

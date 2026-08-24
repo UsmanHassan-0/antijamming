@@ -800,11 +800,14 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
                 "spatial_vector_diagnostics": {
                     "lcmv_jammer_activation_armed": True,
                     "lcmv_jammer_detected_latched": False,
+                    "realtime_bladerf_angle_frozen": True,
                 },
             }
         }
     )
-    assert "bladeRF preserved" in _plain_text(window._lcmv_test_status_label)
+    armed_text = _plain_text(window._lcmv_test_status_label)
+    assert "ARMED" in armed_text
+    assert "measured desired reference ready" in armed_text
 
     window._refresh_lcmv_test_status(
         {
@@ -816,13 +819,15 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
                 "weight_transition_progress": 0.5,
                 "spatial_vector_diagnostics": {
                     "lcmv_jammer_detected_latched": True,
+                    "realtime_bladerf_angle_frozen": True,
                 },
             }
         }
     )
-    assert "bladeRF preserved" in _plain_text(
-        window._lcmv_test_status_label
-    )
+    active_text = _plain_text(window._lcmv_test_status_label)
+    assert "ON" in active_text
+    assert "jammer null active" in active_text
+    assert "measured desired reference preserved" in active_text
 
 
 def test_gui_labels_jammer_excess_suppression_separately_from_total_output(qtbot) -> None:
@@ -839,6 +844,7 @@ def test_gui_labels_jammer_excess_suppression_separately_from_total_output(qtbot
                 "weight_transition_active": True,
                 "spatial_vector_diagnostics": {
                     "lcmv_jammer_detected_latched": True,
+                    "realtime_bladerf_angle_frozen": True,
                     "jammer_only_suppression_estimate_available": True,
                     "jammer_only_suppression_db": 12.25,
                     "jammer_only_target_suppression_db": 31.75,
@@ -851,7 +857,11 @@ def test_gui_labels_jammer_excess_suppression_separately_from_total_output(qtbot
         }
     )
 
-    assert "bladeRF preserved" in _plain_text(window._lcmv_test_status_label)
+    active_text = _plain_text(window._lcmv_test_status_label)
+    assert "ON" in active_text
+    assert "jammer null active" in active_text
+    assert "measured output reduction 7.5 dB" in active_text
+    assert "measured desired reference preserved" in active_text
 
 
 def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:

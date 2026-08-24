@@ -4,17 +4,56 @@ This is a living evidence ledger. Add new test runs and code changes here rather
 
 ## Current conclusion
 
-Four independently proven results must not be mixed:
+Six independently proven results must not be mixed:
 
 1. Exact clean commit `3419536` preserved every established PRN's full complex response during synchronized jammer-on run `20260821T033327.934359Z_pid664706`; PVT and C/N0 survived the valid BIN interval.
 2. A later uncommitted shared-row family changed that operation to phase-only scaling. Raw surviving logs prove that the same pre-jammer PRN vectors were applied after activation with 3.91–24.41 dB less modeled response. Four runs then lost C/N0/PVT; one higher-margin run survived. Phase continuity alone was therefore not a preservation proof.
 3. The 2026-08-22 per-PRN monitor was correlating pre-filter raw IQ at a post-filter tracking counter. The 55-tap GNSS input FIR adds 27 samples of group delay. Correcting that offset raised live cross-PRN vector coherence from failed-run minimum/median `0.097/0.810` to `0.987/0.997` and projector concentration to `0.953–0.981`.
 4. The integrated TramiqSDR transport failure was downstream FIFO throughput. A 4,096-sample stripe required 80 FIFO writes per ten-source chunk and filled both queues. One full-chunk write per source reduced measured FIFO time from about 8.5 ms to 1.94 ms average and completed the same previously failing interval with raw/output high-waters of only `7/512` and `2/64`.
 5. A second full TramiqSDR run, `20260822T090357.700904Z_pid67524`, independently retained PVT through its complete 198 s run with 10 tracked and 7 used PRNs, C/N0 near `49.6–50.0 dB-Hz`, raw/output queue high-waters `14/512` and `4/64`, zero rejected chunks, zero RF overflows, and an empty error log. No jammer activation occurred, so this is baseline/transport evidence only.
+6. Three controlled 2026-08-23 runs prove that a persistent narrow interferer near `1575.047929688 MHz` was present independently of bladeRF playback. BladeRF-on and bladeRF-off input powers were nearly identical. Neither the cold-start rescue path nor the uniform path produced one valid acquisition, symbol, word, pseudorange, or PVT fix. Consequently those runs did not exercise independent per-PRN LCMV: its active source count remained zero because no usable desired PRN vector existed.
 
 The current tree restores full amplitude-and-phase response preservation, freezes each established clean PRN vector for the full jammer interval, allows a newly acquired PRN to adopt its first valid vector, prevents covariance updates from restarting an unfinished transition, and retains finite/norm/conditioning safety checks. Automated coverage is complete, but the corrected independent per-PRN path still requires one synchronized live jammer-on run.
 
 The stale bladeRF-gain manifest field remains a provenance defect. It records 50 dB even when authoritative bladeRF CLI readback proves 60 dB. Hardware settings in conclusions below therefore come from the bladeRF CLI, never the GUI manifest.
+
+## 2026-08-23 external-interferer A/B and deep evidence logging
+
+### Controlled RF A/B
+
+The following runs used exactly one NADS receiver process. The bladeRF-on cases used serial `a8df023479b1450ea8f9b8b28ef1039c`, `/home/u/Documents/Bins/static/l1_static_50_1584.bin`, `1584 MHz`, `50 MS/s`, `50 MHz`, and authoritative CLI gain `66 dB`. The final case used a runtime overlay that disabled only the uncommitted cold-start spatial rescue and frequency notch. All three receiver runs stopped normally with zero USRP overflows, zero timeouts, zero startup overflows/timeouts, zero suspected clipping intervals, and zero FIFO rejections.
+
+| Run | bladeRF | Cold-start rescue | Mean raw average-channel power | Mean FIFO-output power | Receiver result |
+|---|---|---|---:|---:|---|
+| `20260823T025956.350672Z_pid234692` | on, gain 66 | active | `0.0298915` | `0.00417978` | no usable tracking or PVT |
+| `20260823T030342.106567Z_pid240934` | physically stopped | active | `0.0302578` | `0.00441400` | no usable tracking or PVT |
+| `20260823T030800.347435Z_pid244780` | on, gain 66 | disabled | `0.0307890` | `0.100637` | no usable tracking or PVT |
+
+The bladeRF-on/rescue and bladeRF-off/rescue raw-power means differ by only `1.23%`. They selected the same spectral line at offset `-372070.312 Hz`, or absolute frequency `1575047929.688 Hz`, with an approximately `530273.4 Hz` excess-BW90. This proves that the dominant received interferer was not created by the tested bladeRF playback. It does not identify the physical transmitter that created it.
+
+Cold-start spatial protection plus the 600 kHz, 257-tap notch reduced the mean FIFO power by roughly `13.6–13.8 dB` relative to the uniform no-rescue case. The individual notch diagnostic reported about `60–80 dB` reduction at the selected narrow FFT line; that line-only number must not be confused with total 4 MHz output suppression. The residual output remained far above the previously observed clean input level and did not enable acquisition.
+
+Every archived tracking record in all three cases had `C/N0 = 0`, zero prompt I/Q, and false acquisition, symbol, word, and pseudorange validity. The runtime saw temporary channel labels, but no stable tracking bars or used-in-PVT satellites. Therefore:
+
+- the per-PRN branch was loaded and its ten-source FIFO fanout ran;
+- no PRN obtained a quality-passed measured desired vector;
+- `active_per_prn_source_count = 0` and `active_per_prn_lcmv_source_count = 0`;
+- every source remained on a common acquisition row;
+- these runs validate cold-start interference detection and transport behavior, not live per-PRN jammer nulling.
+
+### Deep evidence coverage
+
+Future runs now archive the following independently timestamped evidence:
+
+- `runtime_evidence.jsonl`: synchronized current, target, transition-start, and effective calibrated complex beamformer coefficients; raw/calibrated/FIFO power and IQ-health scalars; DoA/spatial state; jammer gates; PVT, C/N0, PRN, and queue context at the runtime evidence cadence.
+- `per_prn_weights.jsonl`: every source-slot-to-PRN mapping at the existing per-PRN status cadence, including each source's applied complex weights, desired spatial vector, frozen/vector age state, transition state/progress, continuity residual, null residual, condition number, weight norm, applied response, and jammer-context generation.
+- `tracking_observables.jsonl`: every received GNSS tracking-monitor record with prompt I/Q and derived magnitude/phase, C/N0, Doppler, carrier phase, code phase, tracking sample counter, TOW, acquisition/symbol/word/pseudorange validity, PLL state, and cycle-slip flag.
+- Native GNSS-SDR receiver/console/config/output artifacts plus phase-alignment, spatial-vector, LCMV, DoA, RF analysis, stream health, transport, UI health, operator-event, UHD, app, and error logs.
+- `session_manifest.json`: exact Git HEAD and dirty/untracked source fingerprints plus, after Stop, path, byte count, and SHA-256 for every archived artifact other than the self-changing manifest itself.
+
+The new logging additions passed `188` focused regression tests. Initial hardware proof run `20260823T031527.602794Z_pid250002` produced a 32,890-byte `per_prn_weights.jsonl` and finalized an inventory of 25 artifacts. Expanded hardware proof run `20260823T032046.043962Z_pid254299` then recorded all four complex protection weights, all four complex jammer-vector elements, the full 4-by-4 complex covariance, and transition start/target/applied weights for every source. Its 80,934-byte per-PRN ledger has recorded SHA-256 `c9d58f946e329cb2e51223551ce31efd487c5a15d969369f521d2df5a20ab750`; `errors.log` was empty.
+
+The live path deliberately does not synchronously render every 4 MS/s IQ sample as text. Four complex input streams are about 128 MB/s before formatting, and textual expansion would be much larger and would itself recreate scheduling/FIFO failures. The tracking monitor exposes symbol/word validity but not each decoded navigation-bit value in its protobuf. A future literal sample/bit replay therefore requires a separate bounded binary recorder or GNSS-SDR native dump, with storage throughput and realtime non-interference proven in its own A/B test.
 
 ## 2026-08-22 audit, fixes, and live evidence
 
@@ -378,6 +417,8 @@ Revision findings:
 - Installed 2026-08-22 full suite: `298 passed, 1 skipped in 14.02 s`
 - Installed 2026-08-22 full suite after source-provenance coverage:
   `299 passed, 1 skipped in 5.08 s`
+- Installed 2026-08-23 per-PRN/FIFO/phase/cold-start/deep-logging suite:
+  `188 passed in 1.43 s`
 - `git diff --check`: pass
 
 New regression coverage includes:
