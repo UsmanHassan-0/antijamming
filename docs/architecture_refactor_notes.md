@@ -22,8 +22,8 @@ come from the JSON profile, not Python defaults.
 - `src/antijamming/logging/` - logger names, file paths, and per-session reset
 
 The former monolithic `gnss/gnss_sdr.py` implementation has already been split
-under `gnss/sdr_bridge/`. The 64-line `gnss/gnss_sdr.py` file is now a
-compatibility export facade, not the old bridge implementation.
+under `gnss/sdr_bridge/`. The package exports the current bridge directly; the
+temporary compatibility facade has been removed.
 
 ## Refactor Direction
 
@@ -33,9 +33,7 @@ Deferred high-value steps:
    `ui/state/receiver_projection.py`.
 2. Split `runtime/backend.py` into RX loop, DSP stages, GNSS handoff, and UI
    metrics builder modules.
-3. Remove or narrow the GNSS compatibility facade only after all external and
-   internal imports have a migration/test plan.
-4. Split the single runtime config schema into subsystem schemas once call sites
+3. Split the single runtime config schema into subsystem schemas once call sites
    are cleaner.
 
 Each step should be covered by focused tests and should avoid changing RF,

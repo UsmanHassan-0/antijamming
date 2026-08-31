@@ -21,17 +21,75 @@ links it without rewriting historical observations.
 
 | Area | Current state | Next evidence gate |
 | --- | --- | --- |
-| Proven stale code/config | Bounded corrections and final software gates passed | Hardware/external integration remains separate |
+| Proven stale code/config | Semantic removal batch passed all hardware-free gates | Attached-runtime validation; future intent changes require a new audit |
 | Thread/resource ownership | Deterministic failure paths and repeated software gates passed | Unknown schedules and hardware timing remain unproven |
 | Concurrent transitions | Selected start/stop/connect/publish schedules regression-tested | Repeated stress; unknown schedules remain unproven |
-| Configuration/input boundaries | Focused regressions passed | Final broad gates and attached-runtime validation |
-| Numerical/DSP boundaries | Focused deterministic regressions passed | Final broad gates; OTA correctness remains separate |
+| Configuration/input boundaries | Focused and broad regressions passed | Attached-runtime validation |
+| Numerical/DSP boundaries | Focused and broad deterministic regressions passed | OTA correctness remains separate |
 | Documentation | One tracker, consecutive conceptual docs, retained audit index, and provenance map | Maintain these documents with future changes |
 | Hardware integration | Unverified: no attached USRP | Separate dated hardware run |
 
 ## Timestamped change log
 
-### 2026-08-31T15:25:57+05:00 — final hardware-free verification checkpoint
+### 2026-08-31T17:16:54+05:00 — semantic cleanup software verification
+
+- Full hardware-free suite: `333 passed, 1 skipped`; the skip remains the
+  explicit `RUN_USRP_TESTS=1` hardware smoke test.
+- Coverage-instrumented full suite: `333 passed, 1 skipped`, 77% aggregate
+  project-source statement coverage.
+- Warning-as-error/development-mode full suite: `333 passed, 1 skipped`.
+- Configured Ruff, Vulture at 90% confidence, `compileall`, both product shell
+  syntax checks, and `git diff --check` passed.
+- These gates verify only the exercised software paths and schedules. They do
+  not establish real GNSS-SDR tracking, X300/TwinRX resource timing, RF
+  correctness, OTA null depth, or absence of all races.
+
+### 2026-08-31T17:13:32+05:00 — semantic stale-interface removal batch
+
+- Removed the expected-bearing/RF-bench experiment configuration and runtime
+  calculations. Historical measured values remain in dated audit evidence; the
+  runtime no longer receives authored bladeRF/jammer angles or distances.
+- Removed the runtime-overlay loader, environment variable, checked-in overlay,
+  sidecar merge, rejection compatibility branch, and overlay-only tests. The
+  product has one checked-in runtime profile.
+- Removed the inactive in-process Qt `StreamWorker`, the temporary GNSS bridge
+  facade, legacy GNSS executable/path/state aliases, unread runtime/UI caches,
+  and test-only UI/theme constants. Current GUI execution remains
+  `RemoteStreamWorker` -> headless service -> `BackendRuntime`.
+- Removed the unread `auto_rate_backoff` and `cep_window_points` configuration
+  fields and normalized internal satellite keys to `(constellation, PRN)` while
+  retaining the GPS-compatible public snapshot shape.
+- The focused configuration, beamforming, GUI, and theme suite passed: `137
+  passed`. Ruff, `compileall`, shell syntax, and `git diff --check` passed for
+  this intermediate batch. Broad gates remain pending and no attached-hardware
+  claim is made.
+- Low-confidence dead-code review classified the remaining reports: protobuf
+  descriptor attributes are generated; UHD `stream_now` is an external command
+  property; GNSS PTY and backend thread attributes are reached through shared
+  mixin/dynamic ownership helpers; the pytest fixture is plugin-discovered.
+
+### 2026-08-31T16:17:17+05:00 — semantic cleanup completion claim retracted
+
+- The earlier checkpoint established the named lifecycle, input, numerical, and
+  static-analysis invariants, but it did not establish that every reachable
+  configuration mode still belonged in the intended product.
+- Follow-up inspection found that the manually authored expected-bearing path
+  remains callable through `expected_jammer_range_peak_or_center`, even though
+  the checked-in product profile uses live measured preservation and no current
+  profile supplies expected bearing ranges.
+- The optional bladeRF/jammer experiment overlay is not part of a normal launch.
+  When explicitly selected, its checked-in fields contribute experiment logs,
+  RF-budget estimates, and calibration-context warnings rather than controlling
+  the live transmitters or the current automatic DoA/LCMV target selection.
+- High-confidence Vulture and configured Ruff did not expose this issue because
+  reachable branches, compatibility exports, and test-referenced behavior are
+  not syntactically dead. Test reference is evidence of reachability, not
+  evidence of current product intent.
+- Status correction: the lifecycle/input/numerical batch remains verified under
+  its recorded conditions, but the broader stale-code cleanup is active again.
+  No hardware-free cleanup completion claim is currently in force.
+
+### 2026-08-31T15:25:57+05:00 — lifecycle/input batch verification checkpoint
 
 - Full suite passed twice after the last material code batch: `345 passed, 1
   skipped`. One run enabled `PYTHONFAULTHANDLER=1`, `PYTHONMALLOC=debug`,
@@ -51,8 +109,11 @@ links it without rewriting historical observations.
   appeared. See “Deliberately unchanged or deferred” for boundaries.
 - Documentation existence/numbering tests enforce consecutive conceptual files
   `00`–`08` plus the single tracker, provenance map, and audit index.
-- Status: hardware-free branch evidence complete; physical X300/TwinRX/UHD,
-  GNSS-SDR receiver, RF, antenna, and OTA verification remains outstanding.
+- Historical status at this checkpoint was recorded as hardware-free branch
+  completion. The 16:17 amendment above retracts that broad interpretation;
+  only the named lifecycle/input/numerical batch remains complete under its
+  recorded conditions. Physical X300/TwinRX/UHD, GNSS-SDR receiver, RF,
+  antenna, and OTA verification also remains outstanding.
 
 ### 2026-08-31T14:52:48+05:00 — documentation consolidation
 
@@ -87,9 +148,9 @@ possible thread schedules.
 | GUI subprocess | Partial GUI startup could leave marker/service child; normal exit did not guarantee escalation/reap | Idempotent cleanup performs wait, TERM, KILL, and final reap | Fake child escalation/reaping regression passed |
 | Logging | Reconfiguration detached file handlers without closing them | Replaced handlers are flushed and closed | Warning-as-error suite exposed the leak; focused and full suite then passed |
 | Qt teardown | Coverage run reproduced deferred graphics-item destruction abort | Timers are widget-owned and deferred deletes are drained in fixture | Five earlier repeated coverage runs passed; other Qt/platform schedules unproven |
-| Runtime profile | Unread accuracy-log interval and bench-only RF metadata appeared as product controls | Unread field removed; bench metadata moved to an explicit experiment overlay | Schema/search/config tests passed; RF meaning retained in overlay |
-| Runtime JSON | Duplicate keys and non-standard `NaN`/`Infinity` could be accepted; `NaN` bypassed the positive-rate comparison | Duplicate and non-finite values fail at parse/load boundary, including nested experiment data | Duplicate/non-finite/string-rate regressions passed |
-| Experiment overlay | Fields were mutated in iteration order before a later invalid key failed | All keys are checked/coerced before updates publish; sample-rate followers publish in the same batch | Partial-invalid and derived-follower regressions passed |
+| Runtime profile | Unread accuracy-log interval and bench-only RF metadata appeared as product controls | Unread field removed; bench metadata, expected bearing ranges, and the checked-in experiment overlay are absent from live configuration; historical values remain in audits | Schema/search/config tests passed; focused semantic-removal regressions passed; broad gates pending |
+| Runtime JSON | Duplicate keys and non-standard `NaN`/`Infinity` could be accepted; `NaN` bypassed the positive-rate comparison | Duplicate and non-finite values fail at the parse/load boundary | Duplicate/non-finite/string-rate regressions passed |
+| Removed runtime overlay | Fields were mutated in iteration order before a later invalid key failed | The loader, environment-variable branch, checked-in experiment overlay, and rejection compatibility path are removed; launchers use one fixed product profile | Fixed-profile regressions passed; broad gates pending |
 | DSP entry contracts | Empty/non-finite data could yield warnings, NaN payloads, or a meaningless first-grid DoA | Phase/DoA/steering/combiner/diagnostic paths reject named invalid shapes and non-finite inputs | Focused shape/empty/non-finite regressions passed |
 | LCMV covariance contract | Solver guarded conditioning/weight norm but did not reject non-Hermitian/non-PSD covariance or non-finite control limits explicitly | Covariance and control parameters now have explicit mathematical-domain checks | Invalid-domain tests plus 100 deterministic random PSD constraint cases passed |
 
@@ -125,9 +186,15 @@ Known diagnostic debt, not represented as clean:
 - `runtime/backend.py` and `ui/main_window.py` remain large. Splitting them is a
   separate architecture task because moving ownership boundaries during this
   lifecycle cleanup would make behavior comparison harder.
-- `runtime/worker.py` remains a legacy/test Qt adapter and public compatibility
-  export. It is not the active product GUI path, but repository tests and UI
-  type imports still reference it, so it was not deleted as “unused.”
+- The alternative `uniform`/`healthy_reference` preserve modes and
+  `strongest_music_peak` target mode remain explicit diagnostic algorithm
+  baselines. The fixed product profile selects measured-U1 preservation and a
+  peak outside its frozen guard; these alternatives do not encode bench
+  geometry or expected physical bearings.
+- Uniform output while measured-U1 activation evidence is unavailable remains
+  an active safety state, not a stale compatibility path. It prevents applying
+  unproven null weights until the live angle cluster, healthy receiver state,
+  frozen U1/covariance, freshness, and jammer-evidence gates are satisfied.
 - The per-user/PID Unix sockets remain under sticky `/tmp` with socket-type
   refusal and mode `0600`. Static security lint flags predictability; changing
   the operational path needs a compatibility/threat-model decision. No command

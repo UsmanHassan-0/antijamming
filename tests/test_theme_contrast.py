@@ -3,15 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
-from antijamming.ui.accessibility import (
-    WCAG_AA_TEXT_CONTRAST,
-    WCAG_NON_TEXT_CONTRAST,
-)
 from antijamming.ui import specs
 from antijamming.ui import theme
 from antijamming.ui.widgets.skyplot import _skyplot_style
 
 UI_DIR = Path(__file__).resolve().parents[1] / "src" / "antijamming" / "ui"
+WCAG_AA_TEXT_CONTRAST = 4.5
+WCAG_NON_TEXT_CONTRAST = 3.0
 
 
 def _rgb_from_hex(color: str) -> tuple[float, float, float]:
@@ -55,7 +53,6 @@ def test_theme_text_contrast_meets_wcag_aa() -> None:
 def test_theme_action_and_status_contrast() -> None:
     assert _contrast_ratio(theme.WHITE, theme.SUCCESS) >= WCAG_AA_TEXT_CONTRAST
     assert _contrast_ratio(theme.WHITE, theme.ALERT) >= WCAG_AA_TEXT_CONTRAST
-    assert _contrast_ratio(theme.ALERT, theme.ALERT_SOFT) >= WCAG_AA_TEXT_CONTRAST
     assert _contrast_ratio(theme.INFO, theme.INFO_SOFT) >= WCAG_AA_TEXT_CONTRAST
     assert _contrast_ratio(theme.DISABLED_TEXT, theme.DISABLED_BG) >= WCAG_AA_TEXT_CONTRAST
     assert _contrast_ratio(theme.FG_SOFT, theme.BG_APP) >= WCAG_AA_TEXT_CONTRAST
@@ -71,7 +68,6 @@ def test_non_text_ui_boundaries_meet_wcag_contrast() -> None:
 def test_plot_and_status_marks_meet_wcag_non_text_contrast() -> None:
     plot_marks = [
         theme.DOA_COLOR,
-        theme.GPS_ASSIGNED,
         theme.GPS_TRACKING_FIX,
         theme.BEIDOU_TRACKING_FIX,
         theme.GLONASS_TRACKING_FIX,
@@ -92,11 +88,9 @@ def test_gnss_state_colors_are_distinct_and_readable_with_intended_text() -> Non
     assert theme.BEIDOU_TRACKING_FIX == "#854D0E"
     assert theme.GLONASS_TRACKING == "#C7D2FE"
     assert theme.GLONASS_TRACKING_FIX == "#3730A3"
-    assert theme.GPS_ASSIGNED != theme.GPS_TRACKING
     assert len(
         {
             theme.GPS_ACQUIRED,
-            theme.GPS_ASSIGNED,
             theme.GPS_TRACKING,
             theme.GPS_TRACKING_FIX,
             theme.BEIDOU_TRACKING,
@@ -104,7 +98,7 @@ def test_gnss_state_colors_are_distinct_and_readable_with_intended_text() -> Non
             theme.GLONASS_TRACKING,
             theme.GLONASS_TRACKING_FIX,
         }
-    ) == 8
+    ) == 7
     assert _contrast_ratio(theme.FG_TEXT, theme.GPS_ACQUIRED) >= WCAG_AA_TEXT_CONTRAST
     assert _contrast_ratio(theme.FG_TEXT, theme.GPS_TRACKING) >= WCAG_AA_TEXT_CONTRAST
     assert _contrast_ratio(theme.WHITE, theme.GPS_TRACKING_FIX) >= WCAG_AA_TEXT_CONTRAST
@@ -174,7 +168,6 @@ def test_typography_uses_readable_operator_scale() -> None:
         < theme.FONT_SIZE_BODY
         < theme.FONT_SIZE_EMPHASIS
         < theme.FONT_SIZE_TITLE
-        < theme.FONT_SIZE_DISPLAY
     )
 
 
@@ -202,13 +195,9 @@ def test_ui_spacing_and_dimensions_follow_8_point_grid() -> None:
         "PLOT_AXIS_TICK_TEXT_OFFSET",
         "PLOT_LEGEND_SAMPLE_WIDTH",
         "PRN_PLOT_MIN_HEIGHT",
-        "SCROLLBAR_HANDLE_MIN_LENGTH",
-        "SCROLLBAR_THICKNESS",
         "SKYPLOT_MIN_SIZE",
         "SUMMARY_CARD_MAX_WIDTH",
         "SUMMARY_CARD_MIN_WIDTH",
-        "WINDOW_DEFAULT_HEIGHT",
-        "WINDOW_DEFAULT_WIDTH",
         "CARD_INNER_SPACING",
         "COMPACT_SPACING",
         "ROW_SPACING",

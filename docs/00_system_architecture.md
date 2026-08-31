@@ -13,10 +13,10 @@ The DSP path estimates DoA with MUSIC and keeps Bartlett diagnostics. Candidate 
 
 The repository contains a customized, vendored GNSS-SDR tree under
 `gnss-sdr/`; it is not an untouched external system package. The Python bridge
-implementation is split under `src/antijamming/gnss/sdr_bridge/`, with
-`gnss/gnss_sdr.py` retained as a compatibility facade. In the current dynamic
-Shared-U1 profile, the bridge renders and writes multiple complex64 FIFO source
-streams (ten configured `1C` channels), then reads GNSS-SDR feedback through
+implementation and public exports live directly under
+`src/antijamming/gnss/sdr_bridge/`. In the current dynamic Shared-U1 profile,
+the bridge renders and writes multiple complex64 FIFO source streams (ten
+configured `1C` channels), then reads GNSS-SDR feedback through
 PVT/NMEA/tracking monitor snapshots. Those health fields feed one-run
 segmentation and healthy-reference tracking.
 

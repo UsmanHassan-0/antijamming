@@ -12,18 +12,10 @@ GNSS_MATCH="${GNSS_MATCH:-${ROOT}/gnss-sdr/*/gnss-sdr --config_file=*fifo_gps_l1
 runtime_usrp_ip() {
   python3 - <<'PY'
 import json
-import os
 import re
 from pathlib import Path
 
-base = json.loads(Path("configs/antijamming/x300_realtime.json").read_text())
-overlay_path = os.environ.get("ANTIJAM_RUNTIME_OVERLAY", "").strip()
-if overlay_path:
-    overlay = Path(overlay_path).expanduser()
-    if not overlay.is_absolute():
-        overlay = Path.cwd() / overlay
-    base.update(json.loads(overlay.read_text()))
-cfg = base
+cfg = json.loads(Path("configs/antijamming/x300_realtime.json").read_text())
 match = re.search(r"addr=([\d.]+)", str(cfg.get("usrp_addr", "")))
 if match:
     print(match.group(1))

@@ -104,12 +104,10 @@ class GnssSdrBridge(
             Path(session_dir).expanduser().resolve() if session_dir is not None else None
         )
         self._tracking_state_log_path: Path | None = None
-        self._tracking_state_compat_path: Path | None = None
         self._tracking_state_handle = None
         self._tracking_state_sequence = 0
         self._tracking_state_started_monotonic_ns = 0
         self._proc: subprocess.Popen[bytes] | None = None
-        self._fifo_fd: int | None = None
         self._fifo_fds: list[int] = []
         self._stdout_thread: threading.Thread | None = None
         self._stdout_handle = None
@@ -177,10 +175,8 @@ class GnssSdrBridge(
         self._snapshot_perf_stats: dict[str, dict[str, float]] = {}
         self._last_snapshot_perf_log_ts = 0.0
 
-        # Accuracy display cache and log throttling.
+        # Accuracy display cache.
         self._truth_warning_logged = False
-        self._last_accuracy_log_ts = 0.0
-        self._last_accuracy_point_count = 0
         self._latest_accuracy: dict[str, object] = {}
         self._latest_accuracy_observed_monotonic_s: float | None = None
 
@@ -248,8 +244,7 @@ class GnssSdrBridge(
                 "Repo-local GNSS-SDR executable not found. Expected "
                 f"{self._cfg.gnss_sdr_install_dir / 'gnss-sdr'}, "
                 f"{self._cfg.gnss_sdr_install_dir / 'bin' / 'gnss-sdr'}, or "
-                f"{self._cfg.gnss_sdr_build_dir / 'src' / 'main' / 'gnss-sdr'} "
-                "(legacy build-usman is also checked for compatibility)."
+                f"{self._cfg.gnss_sdr_build_dir / 'src' / 'main' / 'gnss-sdr'}."
             )
             system_gnss = self._system_gnss_sdr_path()
             if system_gnss is not None:
@@ -322,8 +317,6 @@ class GnssSdrBridge(
             self._udp_parse_error_log_ts.clear()
             self._udp_monitor_logged.clear()
             self._pvt_udp_points.clear()
-            self._last_accuracy_log_ts = 0.0
-            self._last_accuracy_point_count = 0
             self._latest_accuracy.clear()
             self._latest_accuracy_observed_monotonic_s = None
         self._output_io_refresh_ts = 0.0
@@ -403,7 +396,6 @@ class GnssSdrBridge(
                     fifo_path=fifo_path,
                 )
             )
-        self._fifo_fd = self._fifo_fds[0]
         self._drop_count = 0
         self._write_count = 0
         self._write_bytes = 0
@@ -621,7 +613,6 @@ class GnssSdrBridge(
         with self._fifo_lock:
             fifo_fds = tuple(self._fifo_fds)
             self._fifo_fds = []
-            self._fifo_fd = None
             for fifo_fd in fifo_fds:
                 try:
                     os.close(fifo_fd)
@@ -773,43 +764,26 @@ class GnssSdrBridge(
             "%Y%m%dT%H%M%SZ",
             time.gmtime(self._session_epoch_s),
         )
-        compatibility_path = (
+        fallback_path = (
             self._tracking_state_archive_dir / f"tracking_{timestamp}_{os.getpid()}.jsonl"
         )
         path = (
             self._runtime_session_dir / "tracking_observables.jsonl"
             if self._runtime_session_dir is not None
-            else compatibility_path
+            else fallback_path
         )
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._tracking_state_handle = path.open("w", encoding="utf-8", buffering=1)
         except OSError as exc:
             self._tracking_state_log_path = None
-            self._tracking_state_compat_path = None
             self._tracking_state_handle = None
             self._err_log.error("Failed opening GNSS tracking-state archive %s: %s", path, exc)
             return
-        if path != compatibility_path:
-            try:
-                compatibility_path.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    compatibility_path.unlink()
-                except FileNotFoundError:
-                    pass
-                os.link(path, compatibility_path)
-            except OSError as exc:
-                self._err_log.warning(
-                    "Could not create tracking-state compatibility hardlink %s: %s",
-                    compatibility_path,
-                    exc,
-                )
         self._tracking_state_log_path = path
-        self._tracking_state_compat_path = compatibility_path
         self._handoff_log.info(
-            "GNSS tracking-state archive: %s compatibility_path=%s session_id=%s",
+            "GNSS tracking-state archive: %s session_id=%s",
             path,
-            compatibility_path,
             self._runtime_session_id or "--",
         )
 

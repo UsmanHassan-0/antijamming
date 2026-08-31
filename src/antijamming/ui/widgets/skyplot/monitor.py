@@ -83,8 +83,6 @@ class SkyplotMonitor(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(SKYPLOT_MIN_SIZE, SKYPLOT_MIN_SIZE)
         self._plotted_prns: list[int] = []
-        self._unplaced_tracking_prns: list[int] = []
-        self._static_label_positions: dict[str, tuple[float, float]] = {}
         self._static_label_items_by_text: dict[str, pg.TextItem] = {}
         self._ring_radii: tuple[float, ...] = _RING_RADII
         self._band_items: list[QGraphicsEllipseItem] = []
@@ -140,7 +138,6 @@ class SkyplotMonitor(QWidget):
     # -------------------------------------------------------------------------
 
     def _build_static_geometry(self) -> None:
-        self._static_label_positions = {}
         self._band_items = []
         self._ring_items = []
         self._spoke_items = []
@@ -181,7 +178,6 @@ class SkyplotMonitor(QWidget):
             self._spoke_items.append(spoke)
 
         labels = _skyplot_static_label_positions(self._current_plot_side())
-        self._static_label_positions = labels
         font = _skyplot_static_label_font()
         for text, (x, y) in labels.items():
             item = pg.TextItem(
@@ -205,10 +201,8 @@ class SkyplotMonitor(QWidget):
     def update_snapshot(
         self,
         sat_entries: list[dict[str, object]],
-        unplaced_tracking_prns: list[int] | None = None,
     ) -> None:
         self._plotted_prns = []
-        self._unplaced_tracking_prns = sorted(set(unplaced_tracking_prns or []))
         self._marker_items = []
         self._marker_label_items = []
         self._plot.clear()
@@ -284,7 +278,6 @@ class SkyplotMonitor(QWidget):
 
     def _update_static_label_positions(self, side_px: int) -> None:
         labels = _skyplot_static_label_positions(side_px)
-        self._static_label_positions = labels
         for text, position in labels.items():
             item = self._static_label_items_by_text.get(text)
             if item is not None:

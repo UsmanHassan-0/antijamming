@@ -1,13 +1,5 @@
-"""RF-level diagnostic helpers for lab test manifests and budgets."""
+"""Offline RF-level diagnostic helpers for retained lab measurements."""
 
-from .budget import (
-    EXPECTED_EXPERIMENT_FIELDS,
-    compute_rf_budget,
-    manifest_from_config,
-)
+from .budget import compute_rf_budget
 
-__all__ = [
-    "EXPECTED_EXPERIMENT_FIELDS",
-    "compute_rf_budget",
-    "manifest_from_config",
-]
+__all__ = ["compute_rf_budget"]

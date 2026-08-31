@@ -10,7 +10,7 @@ from antijamming.gnss.constellations import (
     satellite_sort_key,
 )
 
-_SatKey = int | tuple[str, int]
+_SatKey = tuple[str, int]
 
 def _constellation_from_token(token: object) -> str:
     """Normalize GNSS-SDR/NMEA constellation names to snapshot names."""
@@ -18,24 +18,15 @@ def _constellation_from_token(token: object) -> str:
     return normalize_constellation(token) or "gps"
 
 def _sat_key(constellation: object, prn: int) -> _SatKey:
-    """Return a backward-compatible satellite key.
+    """Return a constellation-qualified key without cross-system PRN collisions."""
 
-    GPS keeps the historical integer key so existing tests and diagnostics keep
-    working. Non-GPS constellations use a tuple to avoid collisions such as G12
-    and C12.
-    """
-
-    normalized = _constellation_from_token(constellation)
-    number = int(prn)
-    if normalized == "gps":
-        return number
-    return (normalized, number)
+    return (_constellation_from_token(constellation), int(prn))
 
 def _sat_constellation(key: _SatKey) -> str:
-    return "gps" if isinstance(key, int) else key[0]
+    return key[0]
 
 def _sat_prn(key: _SatKey) -> int:
-    return int(key if isinstance(key, int) else key[1])
+    return int(key[1])
 
 def _sat_label(key: _SatKey) -> str:
     return satellite_label(_sat_constellation(key), _sat_prn(key)) or f"G{_sat_prn(key):02d}"

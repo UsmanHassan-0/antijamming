@@ -17,10 +17,9 @@ from antijamming.dsp.beamforming import (
 from antijamming.dsp.doa.music import steering_vector
 from antijamming.dsp.models import (
     internal_angle_to_operator_bearing_deg,
-    operator_bearing_to_internal_angle_deg,
 )
 from antijamming.dsp.phase import apply_phase_calibration
-from antijamming.runtime import BackendRuntime, StreamWorker
+from antijamming.runtime import BackendRuntime
 
 
 def _build_loggers() -> dict[str, logging.Logger]:
@@ -141,19 +140,9 @@ def test_dynamic_phase_source_mapping_ignores_stale_latest_by_prn_entry() -> Non
     assert runtime._tracking_source_satellites(snapshot) == (None, None, 14, None)
 
 
-def test_display_bearing_to_internal_angle_convention_is_invertible() -> None:
-    assert operator_bearing_to_internal_angle_deg(170.0) == pytest.approx(280.0)
-    assert operator_bearing_to_internal_angle_deg(290.0) == pytest.approx(160.0)
-    for internal in (0.0, 88.75, 160.0, 280.0, 359.5):
-        display = internal_angle_to_operator_bearing_deg(internal)
-        assert operator_bearing_to_internal_angle_deg(display) == pytest.approx(
-            internal % 360.0
-        )
-
-
 def test_lcmv_steering_vector_uses_internal_angle_not_display_bearing() -> None:
     display_bearing = 170.0
-    internal_angle = operator_bearing_to_internal_angle_deg(display_bearing)
+    internal_angle = 280.0
     wrong_internal = display_bearing
     result = covariance_lcmv_ideal_null_weights(
         covariance=np.eye(4, dtype=np.complex128),
@@ -403,9 +392,9 @@ def test_covariance_target_update_does_not_restart_active_weight_ramp() -> None:
     assert np.allclose(runtime._target_beamformer_weights, newer_target)
 
 
-def test_worker_gnss_output_uses_uniform_combiner_by_default() -> None:
+def test_backend_gnss_output_uses_uniform_combiner_by_default() -> None:
     cfg = StreamConfig(phase_correction_vector=None)
-    worker = StreamWorker(cfg, _build_loggers())
+    runtime = BackendRuntime(cfg, _build_loggers())
     x = np.array(
         [
             [1 + 0j, 2 + 0j],
@@ -416,7 +405,7 @@ def test_worker_gnss_output_uses_uniform_combiner_by_default() -> None:
         dtype=np.complex64,
     )
 
-    y = worker._backend._gnss_output_vector(x)
+    y = runtime._gnss_output_vector(x)
     expected = apply_beamformer(
         apply_phase_calibration(x.astype(np.complex128)),
         uniform_weights(len(cfg.channels)),
@@ -426,13 +415,13 @@ def test_worker_gnss_output_uses_uniform_combiner_by_default() -> None:
     assert np.allclose(y, expected, atol=1e-5)
 
 
-def test_worker_gnss_output_static_calibration_uses_uniform_combiner() -> None:
+def test_backend_gnss_output_static_calibration_uses_uniform_combiner() -> None:
     correction = np.array([1 + 0j, 0 - 1j, -1 + 0j, 0 + 1j], dtype=np.complex128)
     weights = uniform_weights(4)
     cfg = StreamConfig(
         phase_correction_vector=tuple(correction),
     )
-    worker = StreamWorker(cfg, _build_loggers())
+    runtime = BackendRuntime(cfg, _build_loggers())
     x = np.array(
         [
             [1 + 0j, 2 + 0j],
@@ -443,7 +432,7 @@ def test_worker_gnss_output_static_calibration_uses_uniform_combiner() -> None:
         dtype=np.complex64,
     )
 
-    y = worker._backend._gnss_output_vector(x)
+    y = runtime._gnss_output_vector(x)
     expected = apply_beamformer(
         apply_phase_calibration(
             x.astype(np.complex128),
@@ -455,7 +444,7 @@ def test_worker_gnss_output_static_calibration_uses_uniform_combiner() -> None:
     assert y.dtype == np.complex64
     assert np.allclose(y, expected, atol=1e-5)
     assert np.allclose(
-        worker._backend._latest_gnss_effective_weights,
+        runtime._latest_gnss_effective_weights,
         np.asarray(np.conj(weights) * correction, dtype=np.complex64),
     )
 
@@ -612,114 +601,6 @@ def test_backend_lcmv_test_valid_music_bearing_updates_gnss_weights() -> None:
     assert y.shape == (512,)
     assert y.dtype == np.complex64
     assert np.all(np.isfinite(y))
-
-
-def test_backend_lcmv_protects_bladerf_bearing_from_nulling() -> None:
-    cfg = StreamConfig(
-        lcmv_test_enabled=True,
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
-        phase_correction_vector=None,
-        experiment={
-            "bladeRF_expected_bearing_deg_min": 280.0,
-            "bladeRF_expected_bearing_deg_max": 300.0,
-            "jammer_expected_bearing_deg_min": 160.0,
-            "jammer_expected_bearing_deg_max": 175.0,
-        },
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    internal_angle = 160.0
-    display_bearing = internal_angle_to_operator_bearing_deg(internal_angle)
-    x = np.ones((4, 256), dtype=np.complex128)
-
-    runtime._update_lcmv_test_from_music(x, internal_angle, display_bearing)
-
-    status = runtime._lcmv_status_copy()
-    assert status["mode"] == "fallback"
-    assert "inside protected bladeRF range" in status["fallback_reason"]
-    assert status["active_lcmv_fallback_reason"] == status["fallback_reason"]
-    assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
-
-
-def test_backend_lcmv_jammer_bearing_keeps_desired_loss_diagnostic_only() -> None:
-    rng = np.random.default_rng(241)
-    cfg = StreamConfig(
-        lcmv_test_enabled=True,
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
-        phase_correction_vector=None,
-        experiment={
-            "bladeRF_expected_bearing_deg_min": 280.0,
-            "bladeRF_expected_bearing_deg_max": 300.0,
-            "jammer_expected_bearing_deg_min": 160.0,
-            "jammer_expected_bearing_deg_max": 175.0,
-        },
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    internal_angle = 280.0
-    display_bearing = internal_angle_to_operator_bearing_deg(internal_angle)
-    jammer_vector = steering_vector(
-        np.asarray([internal_angle], dtype=np.float64),
-        cfg.center_freq_hz,
-        cfg.array_spacing_m,
-    ).reshape(-1)
-    runtime._healthy_reference_vector = jammer_vector / np.linalg.norm(jammer_vector)
-    source = rng.standard_normal(1024) + 1j * rng.standard_normal(1024)
-    noise = 0.002 * (
-        rng.standard_normal((4, 1024)) + 1j * rng.standard_normal((4, 1024))
-    )
-    x = jammer_vector[:, None] * source[None, :] + noise
-
-    runtime._update_lcmv_test_from_music(x, internal_angle, display_bearing)
-
-    status = runtime._lcmv_status_copy()
-    spatial = status["spatial_vector_diagnostics"]
-    assert status["mode"] == "on"
-    assert spatial["lcmv_target_classification"] == "expected_jammer"
-    assert spatial["lcmv_target_confirmed_jammer_bearing"] is True
-    assert spatial["candidate_covariance_lcmv_ideal_desired_loss_vs_reference_db"] > 6.0
-    assert "covariance_lcmv_ideal" in spatial["candidate_methods_valid"]
-
-
-def test_backend_lcmv_unclassified_bearing_does_not_gate_on_desired_loss() -> None:
-    rng = np.random.default_rng(242)
-    cfg = StreamConfig(
-        lcmv_test_enabled=True,
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
-        phase_correction_vector=None,
-        experiment={
-            "bladeRF_expected_bearing_deg_min": 280.0,
-            "bladeRF_expected_bearing_deg_max": 300.0,
-            "jammer_expected_bearing_deg_min": 160.0,
-            "jammer_expected_bearing_deg_max": 175.0,
-        },
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    internal_angle = 200.0
-    display_bearing = internal_angle_to_operator_bearing_deg(internal_angle)
-    source_vector = steering_vector(
-        np.asarray([internal_angle], dtype=np.float64),
-        cfg.center_freq_hz,
-        cfg.array_spacing_m,
-    ).reshape(-1)
-    runtime._healthy_reference_vector = source_vector / np.linalg.norm(source_vector)
-    source = rng.standard_normal(1024) + 1j * rng.standard_normal(1024)
-    noise = 0.002 * (
-        rng.standard_normal((4, 1024)) + 1j * rng.standard_normal((4, 1024))
-    )
-    x = source_vector[:, None] * source[None, :] + noise
-
-    runtime._update_lcmv_test_from_music(x, internal_angle, display_bearing)
-
-    status = runtime._lcmv_status_copy()
-    spatial = status["spatial_vector_diagnostics"]
-    assert status["mode"] == "on"
-    assert status["active_lcmv_fallback_used"] is False
-    assert status["active_lcmv_fallback_reason"] == ""
-    assert spatial["lcmv_target_classification"] == "unclassified"
-    assert spatial["active_desired_loss_vs_reference_db"] > 6.0
-    assert "covariance_lcmv_ideal" in spatial["candidate_methods_valid"]
 
 
 def test_backend_lcmv_keeps_covariance_active_when_wng_exceeds_limit() -> None:

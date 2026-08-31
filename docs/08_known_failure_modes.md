@@ -8,7 +8,7 @@
 - Abrupt or continually changing weights: one-chunk changes can disturb GNSS carrier/code tracking. The ordinary one-stream path uses a logged one-second complex ramp. The shared measured-U1 fanout instead permits an immediate spatial update only after applying an exact per-PRN complex-response continuity scalar; jammer-off recovery remains a ramp.
 - Noise gain due to large weights: high `||w||^2` can make the receiver noisier even if a null looks deep.
 - Total output reduction misleading: total output includes desired, jammer, sky GNSS, noise, multipath, and artifacts.
-- Stale RF metadata: J/S conclusions are only as good as the logged RF budget and attenuation basis.
+- Stale RF metadata: J/S conclusions are only as good as the explicit dated audit or operator-marked RF-budget inputs; runtime configuration does not supply physical bench truth.
 - Heavy logging stalls: diagnostics should remain throttled during long realtime runs.
 - Missing operator markers: inferred `jammer_like_event` labels do not prove that the physical jammer was switched on.
 - Complex gain not equal OTA calibration: splitter calibration corrects chains, not the full antenna manifold.

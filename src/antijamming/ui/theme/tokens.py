@@ -12,7 +12,6 @@ from __future__ import annotations
 GRID_UNIT = 8
 SPACE_8 = GRID_UNIT
 SPACE_16 = GRID_UNIT * 2
-SPACE_32 = GRID_UNIT * 4
 CONTROL_H = 40
 RADIUS_8 = 8
 WHITE = "#FFFFFF"
@@ -23,7 +22,6 @@ FONT_SIZE_BODY = 15
 FONT_SIZE_SECONDARY = 14
 FONT_SIZE_EMPHASIS = 17
 FONT_SIZE_TITLE = 24
-FONT_SIZE_DISPLAY = 28
 FONT_POINT_SIZE_PLOT = 11
 FONT_POINT_SIZE_PLOT_LABEL = 12
 FONT_POINT_SIZE_MARKER = 11
@@ -50,7 +48,6 @@ INFO_SOFT = "#DBEAFE"
 SUCCESS = "#14532D"
 WARNING = "#78350F"
 ALERT = "#7F1D1D"
-ALERT_SOFT = "#FEE2E2"
 DISABLED_BG = "#E5E7EB"
 DISABLED_TEXT = "#374151"
 DOA_COLOR = "#1D4ED8"
@@ -59,7 +56,6 @@ BUTTON_ALERT_HOVER = "#991B1B"
 # GNSS state colors are shared by PRN Monitor and Skyplot. Tracking colors are
 # intentionally light; PVT-used colors are darker in the same constellation hue.
 GPS_ACQUIRED = "#F59E0B"
-GPS_ASSIGNED = "#64748B"
 GPS_TRACKING = "#86EFAC"
 GPS_TRACKING_FIX = "#166534"
 BEIDOU_TRACKING = "#FDE68A"
@@ -245,17 +241,4 @@ def disabled_button_style() -> str:
         f"background:{DISABLED_BG}; color:{DISABLED_TEXT}; border:1px solid {DISABLED_BG}; "
         f"border-radius:{px(RADIUS_8)}; font-weight:800; padding:{control_padding()}; "
         f"font-family:'{FONT_FAMILY_UI}'; font-size:{FONT_SIZE_EMPHASIS}px;"
-    )
-
-
-# =============================================================================
-# Status and Navigation Styles
-# =============================================================================
-
-
-def status_row_style() -> str:
-    """Return the inline status row label style."""
-    return (
-        f"{transparent_style()} padding:{px(SPACE_8)} 0px; "
-        f"font-size:{FONT_SIZE_EMPHASIS}px;"
     )

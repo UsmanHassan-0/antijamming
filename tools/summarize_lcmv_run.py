@@ -59,8 +59,6 @@ class IntervalStats:
     observations: Counter[int] = field(default_factory=Counter)
     observation_values: list[float] = field(default_factory=list)
     used_prns: Counter[str] = field(default_factory=Counter)
-    null_in_jammer: Counter[str] = field(default_factory=Counter)
-    null_in_bladerf: Counter[str] = field(default_factory=Counter)
     music_in_jammer: Counter[str] = field(default_factory=Counter)
     music_in_bladerf: Counter[str] = field(default_factory=Counter)
     spatial_coherence_abs: list[float] = field(default_factory=list)
@@ -633,11 +631,6 @@ def numeric_or_none(value: object) -> float | None:
     if number != number or number in (float("inf"), float("-inf")):
         return None
     return number
-
-
-def first_number(text: str) -> float | None:
-    match = re.search(r"[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?", text, re.IGNORECASE)
-    return float(match.group(0)) if match else None
 
 
 def assign_regex(

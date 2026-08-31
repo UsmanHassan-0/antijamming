@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_PY="${ROOT_DIR}/.aj/bin/python"
 ORIGINAL_ARGS=("$@")
 SIDECAR_SCRIPT="${ROOT_DIR}/tools/run_realtime_sidecar.sh"
-RUNTIME_CONFIG="${ANTIJAM_RUNTIME_OVERLAY:-${ROOT_DIR}/configs/antijamming/x300_realtime.json}"
+RUNTIME_CONFIG="${ROOT_DIR}/configs/antijamming/x300_realtime.json"
 GNSS_CONFIG_PATH="${ROOT_DIR}/logs/gnss-sdr/runtime/fifo_gps_l1.conf"
 
 while (($# > 0)); do
@@ -39,18 +39,10 @@ mkdir -p logs logs/sidecar
 runtime_usrp_ip() {
   "${APP_PY}" - <<'PY'
 import json
-import os
 import re
 from pathlib import Path
 
-base = json.loads(Path("configs/antijamming/x300_realtime.json").read_text())
-overlay_path = os.environ.get("ANTIJAM_RUNTIME_OVERLAY", "").strip()
-if overlay_path:
-    overlay = Path(overlay_path).expanduser()
-    if not overlay.is_absolute():
-        overlay = Path.cwd() / overlay
-    base.update(json.loads(overlay.read_text()))
-cfg = base
+cfg = json.loads(Path("configs/antijamming/x300_realtime.json").read_text())
 match = re.search(r"addr=([\d.]+)", str(cfg.get("usrp_addr", "")))
 if match:
     print(match.group(1))

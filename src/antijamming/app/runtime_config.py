@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from antijamming.config import (
     REPO_ROOT,
     StreamConfig,
-    apply_stream_config_file,
     default_stream_config,
 )
 from antijamming.dsp.phase import load_calibration_correction_selection
@@ -23,12 +21,6 @@ def build_runtime_config() -> StreamConfig:
     """Build the fixed realtime product configuration without touching hardware."""
 
     cfg = default_stream_config()
-    overlay_text = os.environ.get("ANTIJAM_RUNTIME_OVERLAY", "").strip()
-    if overlay_text:
-        overlay_path = Path(overlay_text).expanduser()
-        if not overlay_path.is_absolute():
-            overlay_path = (REPO_ROOT / overlay_path).resolve()
-        cfg = apply_stream_config_file(cfg, overlay_path)
     cfg.usrp_addr = with_usrp_frame_sizes(
         cfg.usrp_addr,
         recv_frame_size=int(cfg.recv_frame_size),

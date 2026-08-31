@@ -106,7 +106,6 @@
   "gnss_tracking_1c_bit_synchronization_time_limit_s": 30,
   "gnss_accuracy_window_points": 1,
   "startup_grace_s": 1.5,
-  "auto_rate_backoff": false,
   "stop_on_overflow": true,
   "max_overflow_streak": 30,
   "max_total_overflow": 250,

@@ -64,16 +64,12 @@ from antijamming.dsp.doa import (
     spatial_covariance,
     steering_vector,
 )
-from antijamming.dsp.models import (
-    internal_angle_to_operator_bearing_deg,
-    operator_bearing_to_internal_angle_deg,
-)
+from antijamming.dsp.models import internal_angle_to_operator_bearing_deg
 from antijamming.dsp.pipeline import (
     compute_doa_metrics,
     compute_gnss_output_vector,
     compute_phase_metrics,
 )
-from antijamming.rf import compute_rf_budget, manifest_from_config
 
 _RUNTIME_POWER_AGGREGATE_KEYS = frozenset(
     {
@@ -146,8 +142,6 @@ class BackendRuntime:
         self._lcmv_pattern_log = loggers.get("lcmv_pattern", self._analysis_log)
         self._spatial_vector_log = loggers.get("spatial_vector", self._analysis_log)
         self._runtime_evidence_log = loggers.get("runtime_evidence", self._analysis_log)
-        self._experiment_manifest = manifest_from_config(config)
-        self._rf_budget = compute_rf_budget(self._experiment_manifest)
         self._phase_calibration_metadata = self._load_phase_calibration_metadata()
         self._log_session: RuntimeLogSession | None = None
         self._session_event_lock = threading.Lock()
@@ -229,7 +223,6 @@ class BackendRuntime:
             maxsize=self._dsp_stage_queue_maxsize
         )
         self._raw_chunk_count = 0
-        self._processed_emit_count = 0
         self._ui_metrics_seq = 0
         self._overflow_count = 0
         self._overflow_streak = 0
@@ -347,8 +340,6 @@ class BackendRuntime:
         )
         self._latest_doa_raw_spectrum = np.zeros((config.doa_points,), dtype=np.float64)
         self._latest_doa_deg = float(config.doa_min_deg)
-        self._last_phase_ts = 0.0
-        self._last_doa_ts = 0.0
         self._last_gnss_snapshot_log_ts = 0.0
         self._last_logged_pvt_current: bool | None = None
         self._last_logged_pvt_seen: bool | None = None
@@ -426,7 +417,6 @@ class BackendRuntime:
         with self._perf_lock:
             self._perf_stats.clear()
         self._raw_chunk_count = 0
-        self._processed_emit_count = 0
         self._ui_metrics_seq = 0
         self._rx_clipping_suspected_count = 0
         self._reset_rx_signal_health()
@@ -462,8 +452,6 @@ class BackendRuntime:
             )
             self._latest_doa_raw_spectrum = np.zeros((self._config.doa_points,), dtype=np.float64)
             self._latest_doa_deg = float(self._config.doa_min_deg)
-            self._last_phase_ts = 0.0
-            self._last_doa_ts = 0.0
         if self._lcmv_auto_arm_after_pvt:
             # Each run must begin with a genuinely uniform, learnable
             # baseline. The automatic transition is evaluated only after the
@@ -480,7 +468,7 @@ class BackendRuntime:
                 self._loggers,
             )
             self._stream_stop_event_recorded = False
-            self._log_experiment_startup_context()
+            self._log_runtime_startup_context()
             self._record_runtime_event(
                 "stream_start",
                 source="backend",
@@ -844,19 +832,13 @@ class BackendRuntime:
         finally:
             self._device = None
 
-    def _log_experiment_startup_context(self) -> None:
-        manifest = dict(self._experiment_manifest)
-        budget = dict(self._rf_budget)
-        manifest_payload = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
-        budget_payload = json.dumps(budget, sort_keys=True, separators=(",", ":"))
+    def _log_runtime_startup_context(self) -> None:
         for logger in (
             self._loggers["app"],
             self._lcmv_log,
             self._loggers["health"],
             self._analysis_log,
         ):
-            logger.info("experiment_manifest %s", manifest_payload)
-            logger.info("rf_budget %s", budget_payload)
             logger.info(
                 "array_geometry_manifest %s",
                 json.dumps(
@@ -908,18 +890,6 @@ class BackendRuntime:
             )
             self._loggers["app"].warning("%s", warning)
             self._analysis_log.warning("%s", warning)
-            self._loggers["health"].warning("%s", warning)
-
-        rx_chain = str(manifest.get("rx_chain") or "").lower()
-        bpf_index = rx_chain.find("bpf")
-        lna_index = rx_chain.find("lna")
-        if bpf_index < 0 or lna_index < 0 or bpf_index > lna_index:
-            warning = (
-                "experiment_manifest warning=rx_chain_not_bpf_before_lna "
-                f"rx_chain={manifest.get('rx_chain')!r}"
-            )
-            self._loggers["app"].warning("%s", warning)
-            self._lcmv_log.warning("%s", warning)
             self._loggers["health"].warning("%s", warning)
 
     def _array_geometry_manifest(self) -> dict[str, object]:
@@ -1244,10 +1214,7 @@ class BackendRuntime:
             number = self._finite_metric_float(value)
             if number is not None:
                 return number
-        number = self._finite_metric_float(
-            self._experiment_manifest.get("calibration_file_expected_gain_db")
-        )
-        return number
+        return None
 
     def _calibration_reference_channel(self) -> object:
         for key in ("reference_channel", "calibration_reference_channel", "ref_channel"):
@@ -5069,8 +5036,6 @@ class BackendRuntime:
             )
             target_angle_policy.update(
                 {
-                    "expected_bladeRF_bearing_min": None,
-                    "expected_bladeRF_bearing_max": None,
                     "lcmv_preserve_internal_angle_deg": self._json_float(
                         frozen_internal
                     ),
@@ -5095,22 +5060,10 @@ class BackendRuntime:
                 }
             )
         if bool(target_angle_policy.get("lcmv_target_protected_bladeRF_bearing", False)):
-            if preserve_mode == "realtime_bladerf_measured_u1":
-                self._activate_lcmv_test_fallback(
-                    (
-                        "MUSIC null target is inside the frozen realtime bladeRF "
-                        f"guard ({target_angle_policy.get('lcmv_realtime_preserve_guard_deg')} deg)"
-                    ),
-                    music_internal_deg=music_internal,
-                    music_bearing_deg=music_bearing,
-                )
-                return
-            blade_min = target_angle_policy.get("expected_bladeRF_bearing_min")
-            blade_max = target_angle_policy.get("expected_bladeRF_bearing_max")
             self._activate_lcmv_test_fallback(
                 (
-                    f"MUSIC target display bearing {music_bearing:.2f} is inside protected "
-                    f"bladeRF range {blade_min}-{blade_max} and outside expected jammer range"
+                    "MUSIC null target is inside the frozen realtime bladeRF "
+                    f"guard ({target_angle_policy.get('lcmv_realtime_preserve_guard_deg')} deg)"
                 ),
                 music_internal_deg=music_internal,
                 music_bearing_deg=music_bearing,
@@ -5920,45 +5873,6 @@ class BackendRuntime:
             ),
             **self._lcmv_model_summary_payload(model),
         }
-        payload.update(self._expected_mid_response_payload(scan_display, response_abs, response_db))
-        return payload
-
-    def _expected_mid_response_payload(
-        self,
-        display_bearings_deg: np.ndarray,
-        response_abs: np.ndarray,
-        response_db: np.ndarray,
-    ) -> dict[str, object]:
-        payload: dict[str, object] = {}
-        for label, min_key, max_key in (
-            (
-                "expected_jammer",
-                "jammer_expected_bearing_deg_min",
-                "jammer_expected_bearing_deg_max",
-            ),
-            (
-                "expected_bladeRF",
-                "bladeRF_expected_bearing_deg_min",
-                "bladeRF_expected_bearing_deg_max",
-            ),
-        ):
-            bearing_min = self._finite_metric_float(self._experiment_manifest.get(min_key))
-            bearing_max = self._finite_metric_float(self._experiment_manifest.get(max_key))
-            if (
-                bearing_min is None
-                or bearing_max is None
-                or display_bearings_deg.size == 0
-                or response_abs.size != display_bearings_deg.size
-                or response_db.size != display_bearings_deg.size
-            ):
-                payload[f"model_response_at_{label}_mid_abs"] = None
-                payload[f"model_response_at_{label}_mid_db"] = None
-                continue
-            midpoint = (bearing_min + self._angle_delta_clockwise(bearing_min, bearing_max) / 2.0) % 360.0
-            distance = np.abs((display_bearings_deg - midpoint + 180.0) % 360.0 - 180.0)
-            idx = int(np.argmin(distance))
-            payload[f"model_response_at_{label}_mid_abs"] = self._json_float(response_abs[idx])
-            payload[f"model_response_at_{label}_mid_db"] = self._json_float(response_db[idx])
         return payload
 
     # -------------------------------------------------------------------------
@@ -6215,7 +6129,6 @@ class BackendRuntime:
                 self._latest_ui_calibrated_preview = np.asarray(
                     phase_metrics["complex_samples_calibrated"], dtype=np.complex64
                 )
-                self._last_phase_ts = time.monotonic()
             now = time.monotonic()
             if (now - self._last_phase_log_ts) >= self._doa_log_interval_s:
                 self._loggers["phase"].info(
@@ -6305,42 +6218,11 @@ class BackendRuntime:
                 )
             internal, display = candidates[0]
             return internal, display, "strongest_music_peak_outside_frozen_bladerf_guard"
-        if mode != "expected_jammer_range_peak_or_center":
-            return (
-                float(primary_internal_deg),
-                float(primary_display_deg),
-                "strongest_music_peak",
-            )
-
-        jammer_start = self._finite_metric_float(
-            self._experiment_manifest.get("jammer_expected_bearing_deg_min")
+        return (
+            float(primary_internal_deg),
+            float(primary_display_deg),
+            "strongest_music_peak",
         )
-        jammer_stop = self._finite_metric_float(
-            self._experiment_manifest.get("jammer_expected_bearing_deg_max")
-        )
-        if jammer_start is None or jammer_stop is None:
-            return (
-                float(primary_internal_deg),
-                float(primary_display_deg),
-                "strongest_music_peak_missing_expected_jammer_range",
-            )
-
-        peaks = doa_metrics.get("doa_peaks", [])
-        if isinstance(peaks, list):
-            for peak in peaks:
-                if not isinstance(peak, dict):
-                    continue
-                internal = self._finite_metric_float(peak.get("angle_deg"))
-                if internal is None:
-                    continue
-                display = self._internal_angle_to_display(internal)
-                if self._bearing_in_range(display, jammer_start, jammer_stop):
-                    return internal, display, "music_peak_inside_expected_jammer_range"
-
-        span = (float(jammer_stop) - float(jammer_start)) % 360.0
-        center_display = (float(jammer_start) + span / 2.0) % 360.0
-        center_internal = operator_bearing_to_internal_angle_deg(center_display)
-        return center_internal, center_display, "expected_jammer_range_center"
 
     def _doa_loop(self) -> None:
         while self._running:
@@ -6364,7 +6246,6 @@ class BackendRuntime:
             with self._results_lock:
                 self._latest_doa_raw_spectrum = raw_spec
                 self._latest_doa_deg = doa_deg
-                self._last_doa_ts = time.monotonic()
                 self._latest_source_count_diagnostics = {
                     "n_sources": int(doa_metrics.get("n_sources", max(int(self._expected_sources), 1))),
                     "source_estimate_gap": doa_metrics.get("source_estimate_gap"),
@@ -6706,10 +6587,6 @@ class BackendRuntime:
             "effective_rank": self._json_float(
                 doa_metrics.get("source_effective_rank", 0.0)
             ),
-            "classification_hints": self._classification_hint_payload(
-                primary_bearing=doa_display_deg,
-                peak_display_bearings=peak_display,
-            ),
             "lcmv": {
                 "enabled": bool(status.get("enabled", False)),
                 "mode": str(status.get("mode", "off")),
@@ -6830,10 +6707,6 @@ class BackendRuntime:
     @staticmethod
     def _angle_distance_deg(a: float, b: float) -> float:
         return float(abs((float(a) - float(b) + 180.0) % 360.0 - 180.0))
-
-    @staticmethod
-    def _angle_delta_clockwise(start_deg: float, stop_deg: float) -> float:
-        return float((float(stop_deg) - float(start_deg)) % 360.0)
 
     @classmethod
     def _json_float_list(cls, values: object) -> list[float | None]:
@@ -7069,72 +6942,8 @@ class BackendRuntime:
                 values.append(self._json_float(peak.get("rel_db")))
         return values
 
-    def _classification_hint_payload(
-        self,
-        *,
-        primary_bearing: float,
-        peak_display_bearings: list[float | None],
-    ) -> dict[str, object]:
-        jammer_min = self._finite_metric_float(
-            self._experiment_manifest.get("jammer_expected_bearing_deg_min")
-        )
-        jammer_max = self._finite_metric_float(
-            self._experiment_manifest.get("jammer_expected_bearing_deg_max")
-        )
-        blade_min = self._finite_metric_float(
-            self._experiment_manifest.get("bladeRF_expected_bearing_deg_min")
-        )
-        blade_max = self._finite_metric_float(
-            self._experiment_manifest.get("bladeRF_expected_bearing_deg_max")
-        )
-        secondary = [
-            value for value in peak_display_bearings[1:] if value is not None
-        ]
-        return {
-            "expected_jammer_bearing_min": jammer_min,
-            "expected_jammer_bearing_max": jammer_max,
-            "expected_bladeRF_bearing_min": blade_min,
-            "expected_bladeRF_bearing_max": blade_max,
-            "primary_peak_inside_expected_jammer_range": self._bearing_in_range_or_none(
-                primary_bearing,
-                jammer_min,
-                jammer_max,
-            ),
-            "primary_peak_inside_expected_bladeRF_range": self._bearing_in_range_or_none(
-                primary_bearing,
-                blade_min,
-                blade_max,
-            ),
-            "secondary_peak_inside_expected_jammer_range": self._any_bearing_in_range_or_none(
-                secondary,
-                jammer_min,
-                jammer_max,
-            ),
-            "secondary_peak_inside_expected_bladeRF_range": self._any_bearing_in_range_or_none(
-                secondary,
-                blade_min,
-                blade_max,
-            ),
-        }
-
     def _lcmv_target_angle_policy(self, display_bearing_deg: float) -> dict[str, object]:
         bearing = float(display_bearing_deg) % 360.0
-        hints = self._classification_hint_payload(
-            primary_bearing=bearing,
-            peak_display_bearings=[bearing],
-        )
-        in_jammer_range = hints.get("primary_peak_inside_expected_jammer_range") is True
-        in_bladerf_range = hints.get("primary_peak_inside_expected_bladeRF_range") is True
-        confirmed_jammer = in_jammer_range and not in_bladerf_range
-        protected_bladerf = in_bladerf_range and not in_jammer_range
-        if confirmed_jammer:
-            classification = "expected_jammer"
-        elif protected_bladerf:
-            classification = "expected_bladeRF"
-        elif in_jammer_range and in_bladerf_range:
-            classification = "ambiguous_expected_ranges"
-        else:
-            classification = "unclassified"
         healthy_angle_change = None
         if self._healthy_reference_display_bearing_deg is not None:
             healthy_angle_change = self._angle_distance_deg(
@@ -7142,43 +6951,13 @@ class BackendRuntime:
                 float(self._healthy_reference_display_bearing_deg),
             )
         return {
-            **hints,
-            "lcmv_target_classification": classification,
-            "lcmv_target_confirmed_jammer_bearing": bool(confirmed_jammer),
-            "lcmv_target_protected_bladeRF_bearing": bool(protected_bladerf),
+            "lcmv_target_classification": "unclassified",
+            "lcmv_target_confirmed_jammer_bearing": False,
+            "lcmv_target_protected_bladeRF_bearing": False,
             "lcmv_target_angle_change_from_healthy_deg": self._json_float(
                 healthy_angle_change
             ),
         }
-
-    def _any_bearing_in_range_or_none(
-        self,
-        bearings: list[float],
-        start_deg: float | None,
-        stop_deg: float | None,
-    ) -> bool | None:
-        if start_deg is None or stop_deg is None:
-            return None
-        return any(self._bearing_in_range(value, start_deg, stop_deg) for value in bearings)
-
-    def _bearing_in_range_or_none(
-        self,
-        bearing_deg: float,
-        start_deg: float | None,
-        stop_deg: float | None,
-    ) -> bool | None:
-        if start_deg is None or stop_deg is None:
-            return None
-        return self._bearing_in_range(bearing_deg, start_deg, stop_deg)
-
-    @staticmethod
-    def _bearing_in_range(bearing_deg: float, start_deg: float, stop_deg: float) -> bool:
-        bearing = float(bearing_deg) % 360.0
-        start = float(start_deg) % 360.0
-        stop = float(stop_deg) % 360.0
-        if start <= stop:
-            return start <= bearing <= stop
-        return bearing >= start or bearing <= stop
 
     def _format_optional_float(self, value: object, digits: int = 2) -> str:
         try:

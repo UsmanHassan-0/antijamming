@@ -24,9 +24,6 @@ class AccuracyMixin:
             "accuracy_window_points": len(run_points),
             "accuracy_scope": "run_cumulative",
             "cep_sample_count": 0,
-            # Keep the old key as a compatibility alias for consumers written
-            # before cumulative CEP was introduced.
-            "cep_window_points": minimum_count,
             "cep_min_points": minimum_count,
             "cep_scope": "run_cumulative",
             "cep_ready": False,

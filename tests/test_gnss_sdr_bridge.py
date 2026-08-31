@@ -19,7 +19,7 @@ from antijamming.config import StreamConfig
 from antijamming.gnss import GnssSdrBridge
 from antijamming.gnss.sdr_bridge.bridge import GnssFifoWriteStall
 from antijamming.gnss.sdr_bridge.fifo import PER_SOURCE_FIFO_STRIPE_SAMPLES
-from antijamming.gnss.gnss_sdr import (
+from antijamming.gnss.sdr_bridge import (
     PRN_CARRIER_LOCK_THRESHOLD,
     PRN_CNO_MAX_PEAK_TO_PEAK_DB,
     PRN_CNO_MAX_STDEV_DB,
@@ -75,7 +75,6 @@ def _pipe_backed_bridge(
         read_fds.append(read_fd)
         write_fds.append(write_fd)
     bridge._fifo_fds = list(write_fds)
-    bridge._fifo_fd = write_fds[0]
     bridge._fifo_source_bytes = [0 for _ in range(source_count)]
     return bridge, read_fds, write_fds
 
@@ -1606,16 +1605,17 @@ def test_bridge_expires_stale_gsv_geometry(tmp_path: Path) -> None:
 
     assert fresh_snapshot["sky_prns"][0]["prn"] == 11
     assert fresh_snapshot["sky_geometry_count"] == 1
-    assert "observed_monotonic_s" in bridge._sat_geometry_by_prn[11]
+    gps_11 = ("gps", 11)
+    assert "observed_monotonic_s" in bridge._sat_geometry_by_prn[gps_11]
 
-    bridge._sat_geometry_by_prn[11]["observed_monotonic_s"] = (
+    bridge._sat_geometry_by_prn[gps_11]["observed_monotonic_s"] = (
         time.monotonic() - SKY_GEOMETRY_TIMEOUT_S - 1.0
     )
     stale_snapshot = bridge.snapshot()
 
     assert stale_snapshot["sky_prns"] == []
     assert stale_snapshot["sky_geometry_count"] == 0
-    assert 11 not in bridge._sat_geometry_by_prn
+    assert gps_11 not in bridge._sat_geometry_by_prn
 
 
 def test_bridge_expires_used_in_fix_without_fresh_gsa(tmp_path: Path) -> None:
@@ -2264,7 +2264,6 @@ def test_bridge_reports_empirical_cep_only_after_accuracy_window_is_full(
     warming = bridge._build_accuracy_snapshot([point(3.0), point(1.0), point(2.0)])
     assert warming["cep_ready"] is False
     assert warming["cep_sample_count"] == 3
-    assert warming["cep_window_points"] == 4
     assert warming["cep_min_points"] == 4
     assert warming["cep_scope"] == "run_cumulative"
     assert "cep50_m" not in warming
@@ -2437,43 +2436,13 @@ class _FakeOverflowDevice:
         self.stopped = True
 
 
-class _FakeOverflowThenIdleDevice:
-    def __init__(self, runtime: BackendRuntime, channels: int, overflows: int) -> None:
-        self._runtime = runtime
-        self.channels = channels
-        self.overflows = overflows
-        self.recv_count = 0
-        self.stopped = False
-
-    def recv_chunk(self) -> tuple[object, str]:
-        import numpy as np
-
-        self.recv_count += 1
-        if self.recv_count >= self.overflows:
-            self._runtime._running = False
-        return np.zeros((self.channels, 0), dtype=np.complex64), "overflow"
-
-    def stop(self) -> None:
-        self.stopped = True
-
-
-class _CountingChunk:
-    def __init__(self) -> None:
-        self.shape = (4, 8)
-        self.copy_count = 0
-
-    def copy(self) -> "_CountingChunk":
-        self.copy_count += 1
-        return self
-
-
 class _FakeOneChunkDevice:
-    def __init__(self, runtime: BackendRuntime, chunk: _CountingChunk) -> None:
+    def __init__(self, runtime: BackendRuntime, chunk: np.ndarray) -> None:
         self._runtime = runtime
         self._chunk = chunk
         self.stopped = False
 
-    def recv_chunk(self) -> tuple[_CountingChunk, str]:
+    def recv_chunk(self) -> tuple[np.ndarray, str]:
         self._runtime._running = False
         return self._chunk, "ok"
 
@@ -2706,7 +2675,7 @@ def test_backend_exception_stops_blocking_device_before_rx_join(
         "antijamming.runtime.backend.finalize_session_logs",
         lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(runtime, "_log_experiment_startup_context", lambda: None)
+    monkeypatch.setattr(runtime, "_log_runtime_startup_context", lambda: None)
     monkeypatch.setattr(runtime, "_record_runtime_event", lambda *_args, **_kwargs: {})
 
     def fail_after_rx_blocks() -> dict:

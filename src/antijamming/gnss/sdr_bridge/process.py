@@ -21,12 +21,6 @@ class ProcessMixin:
                 self._cfg.gnss_sdr_build_dir / "src" / "main" / "gnss-sdr",
                 self._cfg.gnss_sdr_install_dir / "gnss-sdr",
                 self._cfg.gnss_sdr_install_dir / "bin" / "gnss-sdr",
-                self._cfg.gnss_sdr_repo_dir
-                / "build-usman"
-                / "src"
-                / "main"
-                / "gnss-sdr",
-                self._cfg.gnss_sdr_repo_dir / "build" / "src" / "main" / "gnss-sdr",
             ]
         )
 

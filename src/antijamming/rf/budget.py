@@ -1,4 +1,4 @@
-"""RF budget calculations for the current GNSS anti-jam lab chain."""
+"""Offline RF-budget calculations for retained lab measurements."""
 
 from __future__ import annotations
 
@@ -7,117 +7,6 @@ import math
 
 
 C0_M_PER_S = 299_792_458.0
-
-EXPECTED_EXPERIMENT_FIELDS = (
-    "name",
-    "rx_chain",
-    "center_freq_hz",
-    "sample_rate_sps",
-    "rx_bandwidth_hz",
-    "usrp_rx_gain_db",
-    "calibration_file_expected_gain_db",
-    "bladeRF_tx_gain_db",
-    "bladeRF_tx_power_dbm_est",
-    "bladeRF_tx_power_basis_description",
-    "bladeRF_tx_power_basis_bandwidth_hz",
-    "bladeRF_distance_m",
-    "bladeRF_tx_antenna_gain_dbi",
-    "bladeRF_tx_cable_loss_db",
-    "bladeRF_expected_bearing_deg_min",
-    "bladeRF_expected_bearing_deg_max",
-    "jammer_attenuation_db",
-    "jammer_l1_4mhz_avg_dbm",
-    "jammer_peak_dbm",
-    "jammer_fullband_avg_dbm",
-    "jammer_fullband_low_hz",
-    "jammer_fullband_high_hz",
-    "jammer_distance_m",
-    "jammer_tx_antenna_gain_dbi",
-    "jammer_tx_cable_loss_db",
-    "rx_antenna_gain_dbi",
-    "jammer_expected_bearing_deg_min",
-    "jammer_expected_bearing_deg_max",
-    "horizontal_distance_m",
-    "height_difference_m",
-    "slant_distance_m",
-    "bpf_part",
-    "bpf_l1_loss_db",
-    "pre_bpf_cable_loss_db",
-    "lna_part",
-    "lna_gain_db",
-    "lna_output_p1db_dbm",
-    "lna_input_p1db_dbm",
-    "dc_block_loss_db",
-    "post_lna_cable_loss_db",
-    "twinrx_max_rf_input_dbm",
-    "bladeRF_sw_gain_db",
-    "jammer_power_basis_dbm",
-    "jammer_power_basis_description",
-    "distance_m",
-    "tx_antenna_gain_dbi",
-    "rx_antenna_gain_dbi",
-    "chain_loss_db",
-    "pre_lna_loss_db",
-    "post_lna_loss_db",
-    "bandwidth_hz",
-    "calibration_correction_mode",
-    "lcmv_test_null_method",
-)
-
-
-def manifest_from_config(config: object) -> dict[str, object]:
-    """Return a JSON-safe experiment manifest with optional config values filled."""
-
-    raw = getattr(config, "experiment", None)
-    experiment = dict(raw) if isinstance(raw, Mapping) else {}
-    manifest: dict[str, object] = {key: None for key in EXPECTED_EXPERIMENT_FIELDS}
-    for key, value in experiment.items():
-        manifest[str(key)] = _json_safe(value)
-
-    runtime_defaults = {
-        "center_freq_hz": getattr(config, "center_freq_hz", None),
-        "sample_rate_sps": getattr(config, "sample_rate", None),
-        "rx_bandwidth_hz": getattr(config, "usrp_rx_bandwidth_hz", None),
-        "usrp_rx_gain_db": getattr(config, "gain_db", None),
-        "bandwidth_hz": getattr(config, "usrp_rx_bandwidth_hz", None),
-        "calibration_correction_mode": getattr(
-            config, "calibration_correction_mode", None
-        ),
-        "lcmv_test_null_method": getattr(config, "lcmv_test_null_method", None),
-    }
-    for key, value in runtime_defaults.items():
-        if manifest.get(key) is None:
-            manifest[key] = _json_safe(value)
-    aliases = {
-        "bladeRF_sw_gain_db": manifest.get("bladeRF_tx_gain_db"),
-        "jammer_power_basis_dbm": manifest.get("jammer_l1_4mhz_avg_dbm"),
-        "jammer_power_basis_description": (
-            "jammer L1 4 MHz average power"
-            if manifest.get("jammer_l1_4mhz_avg_dbm") is not None
-            else None
-        ),
-        "distance_m": manifest.get("slant_distance_m")
-        or manifest.get("horizontal_distance_m"),
-    }
-    for key, value in aliases.items():
-        if manifest.get(key) is None:
-            manifest[key] = _json_safe(value)
-    pre_lna_loss = _sum_if_known(
-        _number(manifest.get("pre_bpf_cable_loss_db")),
-        _number(manifest.get("bpf_l1_loss_db")),
-    )
-    post_lna_loss = _sum_if_known(
-        _number(manifest.get("dc_block_loss_db")),
-        _number(manifest.get("post_lna_cable_loss_db")),
-    )
-    if manifest.get("pre_lna_loss_db") is None:
-        manifest["pre_lna_loss_db"] = pre_lna_loss
-    if manifest.get("post_lna_loss_db") is None:
-        manifest["post_lna_loss_db"] = post_lna_loss
-    if manifest.get("chain_loss_db") is None:
-        manifest["chain_loss_db"] = _sum_if_known(pre_lna_loss, post_lna_loss)
-    return manifest
-
 
 def compute_rf_budget(values: Mapping[str, object]) -> dict[str, object]:
     """Compute expected RF levels for the corrected BPF-before-LNA chain."""
@@ -357,22 +246,4 @@ def _chain_gain(
     return float(lna_gain_db - pre_lna_loss_db - post_lna_loss_db)
 
 
-def _json_safe(value: object) -> object:
-    if isinstance(value, (str, bool)) or value is None:
-        return value
-    if isinstance(value, int):
-        return int(value)
-    if isinstance(value, float):
-        return float(value) if math.isfinite(value) else None
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    return str(value)
-
-
-__all__ = [
-    "EXPECTED_EXPERIMENT_FIELDS",
-    "compute_rf_budget",
-    "manifest_from_config",
-]
+__all__ = ["compute_rf_budget"]

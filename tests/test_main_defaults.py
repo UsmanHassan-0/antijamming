@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -15,7 +14,6 @@ from threadpoolctl import threadpool_info
 from antijamming.config import (
     DEFAULT_RUNTIME_CONFIG_PATH,
     REPO_ROOT,
-    apply_stream_config_file,
     default_stream_config,
     load_stream_config_file,
 )
@@ -24,7 +22,6 @@ from antijamming.logging.setup import ImmediateFileHandler
 from antijamming.app.main import _reap_backend_process, _runtime_config, parse_args
 from antijamming.app.runtime_config import build_runtime_config
 from antijamming.config.schemas.runtime import VALID_LCMV_METHODS
-from antijamming.rf.budget import manifest_from_config
 from antijamming.radio.usrp.uhd_events import (
     UhdConsoleMarkerMonitor,
     UhdConsoleMarkerScanner,
@@ -117,7 +114,6 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.process_every_n_chunks == 15
     assert cfg.samples_per_chunk == 32768
     assert cfg.gnss_feed_queue_maxsize == 512
-    assert cfg.auto_rate_backoff is False
     assert cfg.min_sample_rate == cfg.sample_rate
     assert cfg.stop_on_overflow is True
     assert cfg.rx_clipping_component_threshold == 0.98
@@ -172,20 +168,18 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
         "reimport",
         "reimport",
     )
-    assert cfg.experiment == {}
     assert cfg.expected_sources == 1
     assert cfg.gnss_accuracy_window_points == 1
 
 
-def test_runtime_config_experiment_section_is_optional(tmp_path) -> None:
+def test_runtime_config_rejects_stale_experiment_section(tmp_path) -> None:
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
-    payload.pop("experiment", None)
-    path = tmp_path / "runtime_without_experiment.json"
+    payload["experiment"] = {"name": "legacy_bench_manifest"}
+    path = tmp_path / "runtime_with_stale_experiment.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    cfg = load_stream_config_file(path)
-
-    assert cfg.experiment == {}
+    with pytest.raises(ValueError, match="Unknown runtime config key.*experiment"):
+        load_stream_config_file(path)
 
 
 def test_runtime_profile_authors_sample_rate_once_and_derives_followers(
@@ -195,23 +189,15 @@ def test_runtime_profile_authors_sample_rate_once_and_derives_followers(
     assert "usrp_rx_bandwidth_hz" not in payload
     assert "gnss_sdr_if_bandwidth_hz" not in payload
     assert "min_sample_rate" not in payload
-    experiment = payload.get("experiment", {})
-    assert "sample_rate_sps" not in experiment
-    assert "rx_bandwidth_hz" not in experiment
 
     payload["sample_rate"] = 6_250_000
     path = tmp_path / "runtime_with_one_sample_rate.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     cfg = load_stream_config_file(path)
-    manifest = manifest_from_config(cfg)
-
     assert cfg.sample_rate == 6_250_000.0
     assert cfg.usrp_rx_bandwidth_hz == 6_250_000.0
     assert cfg.min_sample_rate == 6_250_000.0
-    assert manifest["sample_rate_sps"] == 6_250_000.0
-    assert manifest["rx_bandwidth_hz"] == 6_250_000.0
-    assert manifest["bandwidth_hz"] == 6_250_000.0
 
 
 @pytest.mark.parametrize(
@@ -224,18 +210,6 @@ def test_runtime_profile_rejects_authored_sample_rate_followers(
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     payload[field] = payload["sample_rate"]
     path = tmp_path / f"runtime_with_duplicate_{field}.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="must not be authored"):
-        load_stream_config_file(path)
-
-
-@pytest.mark.parametrize("field", ["sample_rate_sps", "rx_bandwidth_hz"])
-def test_runtime_profile_rejects_experiment_rate_duplicates(tmp_path, field) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
-    payload["experiment"] = {}
-    payload["experiment"][field] = payload["sample_rate"]
-    path = tmp_path / f"runtime_with_duplicate_experiment_{field}.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="must not be authored"):
@@ -289,19 +263,16 @@ def test_runtime_config_rejects_legacy_lcmv_methods(tmp_path, method) -> None:
         load_stream_config_file(path)
 
 
-def test_runtime_config_loads_operator_experiment_section(tmp_path) -> None:
+def test_runtime_config_rejects_legacy_expected_bearing_target_mode(tmp_path) -> None:
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
-    payload["experiment"] = {
-        "name": "unit_test",
-        "jammer_attenuation_db": 80.0,
-    }
-    path = tmp_path / "runtime_with_experiment.json"
+    payload["lcmv_target_selection_mode"] = (
+        "expected_jammer_range_peak_or_center"
+    )
+    path = tmp_path / "runtime_with_legacy_expected_bearing_mode.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    cfg = load_stream_config_file(path)
-
-    assert cfg.experiment["name"] == "unit_test"
-    assert cfg.experiment["jammer_attenuation_db"] == 80.0
+    with pytest.raises(ValueError, match="Invalid lcmv_target_selection_mode"):
+        load_stream_config_file(path)
 
 
 def test_runtime_config_rejects_duplicate_json_keys(tmp_path) -> None:
@@ -318,7 +289,7 @@ def test_runtime_config_rejects_duplicate_json_keys(tmp_path) -> None:
 def test_runtime_config_rejects_non_finite_json_numbers(tmp_path, constant) -> None:
     path = tmp_path / "nonfinite.json"
     path.write_text(
-        f'{{"experiment": {{"measurement": {constant}}}}}', encoding="utf-8"
+        f'{{"gnss_shared_u1_phase_satellites": [{constant}]}}', encoding="utf-8"
     )
 
     with pytest.raises(ValueError, match="non-finite JSON number"):
@@ -337,50 +308,6 @@ def test_runtime_config_rejects_non_finite_string_sample_rate(
 
     with pytest.raises(ValueError, match="positive finite number"):
         load_stream_config_file(path)
-
-
-def test_rejected_runtime_overlay_is_transactional(tmp_path) -> None:
-    cfg = default_stream_config()
-    original_gain = cfg.gain_db
-    path = tmp_path / "partially_invalid_overlay.json"
-    path.write_text(
-        json.dumps({"gain_db": 1.25, "unknown_after_valid_key": True}),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="Unknown runtime config key"):
-        apply_stream_config_file(cfg, path)
-
-    assert cfg.gain_db == original_gain
-
-
-def test_runtime_overlay_sample_rate_and_followers_publish_together(tmp_path) -> None:
-    cfg = default_stream_config()
-    path = tmp_path / "sample_rate_overlay.json"
-    path.write_text(json.dumps({"sample_rate": 5_000_000.0}), encoding="utf-8")
-
-    apply_stream_config_file(cfg, path)
-
-    assert cfg.sample_rate == 5_000_000.0
-    assert cfg.usrp_rx_bandwidth_hz == 5_000_000.0
-    assert cfg.min_sample_rate == 5_000_000.0
-
-
-def test_preserved_bench_manifest_loads_only_as_an_explicit_overlay() -> None:
-    overlay = (
-        REPO_ROOT
-        / "configs/experiments/realtime_measured_bladerf_preserve_lcmv_test.json"
-    )
-
-    cfg = apply_stream_config_file(default_stream_config(), overlay)
-
-    assert cfg.experiment["rx_chain"] == (
-        "antenna->cable->BPF->LNA->DC_block->cable->TwinRX"
-    )
-    assert cfg.experiment["jammer_attenuation_db"] == 50.0
-    assert cfg.experiment["bladeRF_tx_gain_db"] == 50.0
-    assert cfg.experiment["bladeRF_distance_m"] == pytest.approx(3.4798)
-    assert cfg.experiment["jammer_distance_m"] == pytest.approx(2.7432)
 
 
 def test_product_shell_entrypoints_are_parseable() -> None:
@@ -687,56 +614,6 @@ def test_runtime_config_builds_product_profile_without_cli_overrides() -> None:
     assert cfg.sample_rate == float(profile["sample_rate"])
 
 
-def test_runtime_config_applies_opt_in_partial_overlay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    profile = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
-    overlay = tmp_path / "runtime_test.json"
-    overlay.write_text(
-        json.dumps(
-            {
-                "gnss_pvt_elevation_mask_deg": 5.0,
-                "expected_sources": 2,
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("ANTIJAM_RUNTIME_OVERLAY", str(overlay))
-
-    cfg = build_runtime_config()
-
-    assert cfg.gnss_pvt_elevation_mask_deg == 5.0
-    assert cfg.expected_sources == 2
-    assert cfg.sample_rate == 4_000_000.0
-    assert cfg.center_freq_hz == 1_575_420_000.0
-    assert cfg.auto_rate_backoff is False
-    assert cfg.stop_on_overflow is True
-    assert cfg.rx_clipping_component_threshold == 0.98
-    assert cfg.rx_clipping_fraction_threshold == 0.001
-    assert cfg.ui_update_interval_s == 0.1
-    assert cfg.dsp_update_interval_s == 0.1
-    assert cfg.prn_chart_update_interval_s == 0.1
-    assert cfg.skyplot_update_interval_s == 0.1
-    assert cfg.process_every_n_chunks == 15
-    assert cfg.samples_per_chunk == 32768
-    assert cfg.gnss_feed_queue_maxsize == 512
-    assert cfg.usrp_addr.startswith(str(profile["usrp_addr"]))
-    assert "recv_frame_size=8000" in cfg.usrp_addr
-    assert "send_frame_size=8000" in cfg.usrp_addr
-    assert cfg.recv_frame_size == 8000
-    assert cfg.send_frame_size == 8000
-    assert "recv_buff_size=50000000" in cfg.usrp_addr
-    assert "num_recv_frames=4096" in cfg.usrp_addr
-    assert cfg.gnss_sdr_echo_stdout is False
-    assert cfg.gnss_shared_u1_phase_compensation_enabled is True
-    assert cfg.gnss_shared_u1_phase_satellites == ()
-    assert cfg.gnss_1c_channel_count == 10
-    assert cfg.gnss_channels_in_acquisition == 10
-    assert cfg.phase_calibration_file is not None
-    assert cfg.phase_calibration_file.is_absolute()
-    assert cfg.phase_correction_vector is not None
-
-
 def test_product_profile_uses_dynamic_shared_u1_phase_fanout() -> None:
     cfg = build_runtime_config()
 
@@ -745,6 +622,5 @@ def test_product_profile_uses_dynamic_shared_u1_phase_fanout() -> None:
     assert cfg.gnss_1c_channel_count == 10
     assert cfg.gnss_channels_in_acquisition == 10
     assert cfg.gain_db == 45.0
-    assert cfg.experiment == {}
     assert cfg.sample_rate == 4_000_000.0
     assert cfg.center_freq_hz == 1_575_420_000.0

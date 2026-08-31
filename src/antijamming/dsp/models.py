@@ -19,13 +19,6 @@ def internal_angle_to_operator_bearing_deg(angle_deg: float) -> float:
     return (90.0 - angle) % 360.0
 
 
-def operator_bearing_to_internal_angle_deg(bearing_deg: float) -> float:
-    """Map operator bearing back to the internal CCW azimuth convention."""
-
-    bearing = normalize_angle_deg(float(bearing_deg))
-    return (90.0 - bearing) % 360.0
-
-
 def operator_bearing_axis_for_internal_scan(
     scan_angles_deg: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:

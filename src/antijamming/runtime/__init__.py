@@ -18,14 +18,5 @@ __all__ = [
     "PhaseResult",
     "PhaseWorkItem",
     "RuntimeUiMetrics",
-    "StreamWorker",
     "put_latest",
 ]
-
-
-def __getattr__(name: str):
-    if name == "StreamWorker":
-        from .worker import StreamWorker
-
-        return StreamWorker
-    raise AttributeError(name)

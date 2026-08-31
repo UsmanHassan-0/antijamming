@@ -33,7 +33,7 @@ from antijamming.dsp.models import (
 from antijamming.dsp.phase import load_calibration_correction_selection
 from antijamming.config import REPO_ROOT, StreamConfig
 from antijamming.gnss.sdr_bridge.constants import PVT_DEGRADED_PDOP_THRESHOLD
-from antijamming.runtime import StreamWorker
+from antijamming.runtime.remote_worker import RemoteStreamWorker
 
 from antijamming.ui.widgets.cards import (
     make_panel,
@@ -108,14 +108,13 @@ _RESPONSIVE_COMPACT_HEIGHT = 1100
 class MainWindow(QMainWindow):
     """Compose controls, plots, and GNSS status views for the realtime GUI."""
 
-    def __init__(self, config: StreamConfig, worker: StreamWorker) -> None:
+    def __init__(self, config: StreamConfig, worker: RemoteStreamWorker) -> None:
         super().__init__()
         self._cfg = config
         self._worker = worker
         self._log = logging.getLogger("antijamming.app")
         self._ui_log = logging.getLogger("antijamming.ui")
         self._stream_running = False
-        self._stream_stopping = False
         self._stream_status_state = "idle"
 
         # Summary labels are operator-facing state. Detailed detector rows and
@@ -160,13 +159,6 @@ class MainWindow(QMainWindow):
         self._tracking_prn_count = 0
         self._stable_prn_count = 0
         self._used_in_pvt_count = 0
-        self._current_tracking_prns: list[int] = []
-        self._current_tracking_satellite_ids: list[str] = []
-        self._stable_prns: list[int] = []
-        self._current_used_in_pvt_prns: list[int] = []
-        self._raw_used_in_fix_prns: list[int] = []
-        self._fresh_geometry_prns: list[int] = []
-        self._tracking_without_geometry: list[int] = []
         self._latest_gnss_snapshot: dict[str, object] = {}
         self._receiver_projection = ReceiverProjection()
         self._latest_pending_metrics: dict | None = None
@@ -197,7 +189,6 @@ class MainWindow(QMainWindow):
         self._doa_summary_text = "--"
         self._source_count_summary_text = self._source_count_display_text({})
         self._status_chip = QLabel("Stream: Idle")
-        self._mode_chip = QLabel("")
         self._fix_chip = QLabel("Not available")
         self._doa_chip = QLabel("--")
         self._stable_prns_chip = QLabel("0")
@@ -600,7 +591,6 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        self._doa_polar_db_tile = polar_db_tile
         container_layout.addLayout(
             make_stretch_row(
                 (
@@ -960,42 +950,36 @@ class MainWindow(QMainWindow):
         self._stream_status_state = state
         if state == "starting":
             self._stream_running = True
-            self._stream_stopping = False
             self._run_btn.setText("Starting...")
             self._run_btn.setEnabled(False)
             self._run_btn.setStyleSheet(disabled_button_style())
             self._set_status_chip(message, INFO)
         elif state == "running":
             self._stream_running = True
-            self._stream_stopping = False
             self._run_btn.setText("■ Stop")
             self._run_btn.setEnabled(True)
             self._run_btn.setStyleSheet(stop_button_style())
             self._set_status_chip(message, SUCCESS)
         elif state == "degraded":
             self._stream_running = True
-            self._stream_stopping = False
             self._run_btn.setText("■ Stop")
             self._run_btn.setEnabled(True)
             self._run_btn.setStyleSheet(stop_button_style())
             self._set_status_chip(message, WARNING)
         elif state == "stopping":
             self._stream_running = True
-            self._stream_stopping = True
             self._run_btn.setText("Stopping...")
             self._run_btn.setEnabled(False)
             self._run_btn.setStyleSheet(disabled_button_style())
             self._set_status_chip(message, WARNING)
         elif state == "error":
             self._stream_running = False
-            self._stream_stopping = False
             self._run_btn.setText("▶ Start")
             self._run_btn.setEnabled(True)
             self._run_btn.setStyleSheet(start_button_style())
             self._set_status_chip(message, ALERT)
         else:
             self._stream_running = False
-            self._stream_stopping = False
             self._run_btn.setText("▶ Start")
             self._run_btn.setEnabled(True)
             self._run_btn.setStyleSheet(start_button_style())
@@ -1096,12 +1080,7 @@ class MainWindow(QMainWindow):
         self._bladerf_gain_spin.setRange(-23.75, 66.0)
         self._bladerf_gain_spin.setDecimals(2)
         self._bladerf_gain_spin.setSingleStep(1.0)
-        configured_bladerf_gain = valid_float(
-            getattr(self._cfg, "experiment", {}).get("bladeRF_tx_gain_db")
-        )
-        self._bladerf_gain_spin.setValue(
-            50.0 if configured_bladerf_gain is None else configured_bladerf_gain
-        )
+        self._bladerf_gain_spin.setValue(50.0)
         self._bladerf_gain_spin.setAccessibleName("bladeRF software gain dB")
         self._bladerf_gain_spin.setEnabled(False)
         self._bladerf_gain_spin.editingFinished.connect(
@@ -1724,23 +1703,15 @@ class MainWindow(QMainWindow):
     def _update_skyplot_monitors(
         self,
         sky_entries: list[dict[str, object]],
-        unplaced_tracking_prns: list[int] | None = None,
     ) -> None:
         for monitor in self._skyplot_monitors():
-            monitor.update_snapshot(sky_entries, unplaced_tracking_prns)
+            monitor.update_snapshot(sky_entries)
 
     def _clear_gnss_operator_state(self) -> None:
         self._latest_gnss_snapshot = {}
         if self._prn_monitor is not None:
             self._prn_monitor.update_snapshot([])
         self._update_skyplot_monitors([])
-        self._current_tracking_prns = []
-        self._current_tracking_satellite_ids = []
-        self._stable_prns = []
-        self._current_used_in_pvt_prns = []
-        self._raw_used_in_fix_prns = []
-        self._fresh_geometry_prns = []
-        self._tracking_without_geometry = []
         self._set_prn_counts(0, 0)
         self._set_fix_chip("NO FIX", ALERT)
         self._set_receiver_pvt_details({}, False)
@@ -1776,15 +1747,6 @@ class MainWindow(QMainWindow):
         self._latest_gnss_snapshot = dict(gnss_snapshot)
         now = time.monotonic()
         receiver_state = self._receiver_projection.build_view_state(gnss_snapshot)
-        self._current_tracking_prns = receiver_state.current_tracking_prns
-        self._current_tracking_satellite_ids = (
-            receiver_state.current_tracking_satellite_ids
-        )
-        self._stable_prns = receiver_state.stable_prns
-        self._current_used_in_pvt_prns = receiver_state.current_used_in_pvt_prns
-        self._raw_used_in_fix_prns = receiver_state.raw_used_in_fix_prns
-        self._fresh_geometry_prns = receiver_state.fresh_geometry_prns
-        self._tracking_without_geometry = receiver_state.tracking_without_geometry
 
         receiver_tab_active = self._receiver_tab_active()
         prn_update_due = receiver_tab_active and self._display_update_due(
@@ -1807,13 +1769,9 @@ class MainWindow(QMainWindow):
         if skyplot_update_due:
             signature = self._skyplot_signature(
                 receiver_state.sky_entries,
-                receiver_state.tracking_without_geometry,
             )
             if signature != self._last_skyplot_signature:
-                self._update_skyplot_monitors(
-                    receiver_state.sky_entries,
-                    receiver_state.tracking_without_geometry,
-                )
+                self._update_skyplot_monitors(receiver_state.sky_entries)
                 self._last_skyplot_signature = signature
             self._last_skyplot_update_s = now
         if prn_update_due or skyplot_update_due:
@@ -1925,15 +1883,7 @@ class MainWindow(QMainWindow):
         cep95 = valid_float(accuracy.get("cep95_m")) if pvt_current else None
         minimum_points = max(
             0,
-            int(
-                valid_float(
-                    accuracy.get(
-                        "cep_min_points",
-                        accuracy.get("cep_window_points"),
-                    )
-                )
-                or 0
-            ),
+            int(valid_float(accuracy.get("cep_min_points")) or 0),
         )
         truth_available = bool(accuracy.get("truth_available", False))
         ready = (
@@ -1984,7 +1934,6 @@ class MainWindow(QMainWindow):
     def _skyplot_signature(
         self,
         sky_entries: list[dict[str, object]],
-        unplaced_tracking_prns: list[int],
     ) -> tuple[object, ...]:
         placed = tuple(
             sorted(
@@ -1998,7 +1947,7 @@ class MainWindow(QMainWindow):
                 for entry in sky_entries
             )
         )
-        return placed + (("unplaced", tuple(sorted(set(unplaced_tracking_prns)))),)
+        return placed
 
     @staticmethod
     def _rounded_float(value: float | None, digits: int) -> float | None:

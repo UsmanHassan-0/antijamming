@@ -41,11 +41,6 @@ _SAMPLE_RATE_DERIVED_FIELDS = (
     "min_sample_rate",
 )
 
-_EXPERIMENT_SAMPLE_RATE_FIELDS = (
-    "sample_rate_sps",
-    "rx_bandwidth_hz",
-)
-
 _OPTIONAL_JSON_DEFAULTS: dict[str, Any] = {
     "calibration_correction_mode": "complex_gain",
     "lcmv_test_null_method": "covariance_lcmv_ideal",
@@ -76,7 +71,6 @@ _OPTIONAL_JSON_DEFAULTS: dict[str, Any] = {
     "gnss_shared_u1_phase_satellites": (),
     "gnss_shared_u1_phase_transition_s": 1.0,
     "gnss_shared_u1_phase_min_quality_measurements": 3,
-    "experiment": {},
 }
 
 _PATH_KEYS = {
@@ -124,37 +118,6 @@ def load_stream_config_file(path: Path) -> StreamConfig:
     return StreamConfig.from_profile_values(values)
 
 
-def apply_stream_config_file(cfg: StreamConfig, path: Path) -> StreamConfig:
-    """Apply a JSON runtime profile to an existing StreamConfig instance."""
-
-    payload = _read_runtime_profile(path)
-    _reject_authored_sample_rate_followers(payload)
-    valid_fields = _json_profile_fields()
-
-    updates: dict[str, Any] = {}
-    for key, value in payload.items():
-        if str(key).startswith("_"):
-            continue
-
-        if key not in valid_fields:
-            raise ValueError(f"Unknown runtime config key {key!r} in {path}")
-
-        updates[key] = _coerce_config_value(key, value)
-
-    if "sample_rate" in updates:
-        sample_rate = _positive_finite_sample_rate(updates["sample_rate"])
-        updates["sample_rate"] = sample_rate
-        for key in _SAMPLE_RATE_DERIVED_FIELDS:
-            updates[key] = sample_rate
-
-    # Publish only after every key has been checked and coerced. A rejected
-    # overlay must not leave the caller with a partially changed live config.
-    for key, value in updates.items():
-        setattr(cfg, key, value)
-
-    return cfg
-
-
 def _read_runtime_profile(path: Path) -> dict[str, Any]:
     def reject_nonstandard_constant(value: str) -> None:
         raise ValueError(f"non-finite JSON number {value!r}")
@@ -182,7 +145,7 @@ def _read_runtime_profile(path: Path) -> dict[str, Any]:
 
 
 def _reject_non_finite_numbers(value: object, *, location: str = "root") -> None:
-    """Reject non-finite numbers recursively, including nested experiment data."""
+    """Reject non-finite numbers recursively in runtime configuration data."""
 
     if isinstance(value, bool) or value is None:
         return
@@ -235,19 +198,12 @@ def _coerce_runtime_profile(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _reject_authored_sample_rate_followers(payload: dict[str, Any]) -> None:
     authored = sorted(set(_SAMPLE_RATE_DERIVED_FIELDS).intersection(payload))
-    experiment = payload.get("experiment")
-    if isinstance(experiment, dict):
-        authored.extend(
-            f"experiment.{key}"
-            for key in _EXPERIMENT_SAMPLE_RATE_FIELDS
-            if key in experiment
-        )
     if authored:
         names = ", ".join(authored)
         raise ValueError(
             f"Runtime sample-rate follower field(s) must not be authored: {names}. "
             "Set sample_rate once; the loader derives the USRP bandwidth, minimum "
-            "rate, and experiment manifest values. The GNSS renderer separately "
+            "rate. The GNSS renderer separately "
             "normalizes its signal-specific input-filter edges for that rate."
         )
 
@@ -324,7 +280,6 @@ def _coerce_config_value(key: str, value: Any) -> Any:
 
 
 __all__ = [
-    "apply_stream_config_file",
     "default_stream_config",
     "load_stream_config_file",
 ]

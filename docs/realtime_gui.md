@@ -88,16 +88,12 @@ GNSS-SDR runtime profile values.
 `sample_rate` is the single authored receive-rate setting. Changing that one
 number also sets the USRP RX bandwidth and fixed minimum rate. Do not add
 separate `usrp_rx_bandwidth_hz` or `min_sample_rate` keys; the loader rejects
-those duplicates. When an optional experiment overlay is selected, the runtime
-also records its sample rate and bandwidth from this same product setting.
+those duplicates.
 
-Bench geometry and external transmitter settings are not runtime controls. They
-live in optional files under `configs/experiments/`, not in the product profile.
-To reproduce the preserved measured bladeRF/jammer manifest, launch with:
-
-```bash
-ANTIJAM_RUNTIME_OVERLAY=configs/experiments/realtime_measured_bladerf_preserve_lcmv_test.json ./run_realtime.sh
-```
+Both launchers build from the one checked-in product profile. There is no
+runtime-overlay interface. Bench geometry, external transmitter settings,
+expected bearings, and their RF-budget calculations belong in dated audit
+evidence, not live product configuration.
 
 The GNSS-SDR digital input filter uses `Freq_Xlating_Fir_Filter` at zero IF and
 decimation 1. It has a fixed 2.6 MHz physical passband and a 3.0 MHz stopband
@@ -151,7 +147,7 @@ and sweep tooling. This realtime repo consumes the exported calibration artifact
 checked in at:
 
 ```text
-configs/calibration/x300_phase_offsets_100khz.json
+configs/calibration/x300_phase_offsets_added_hw_100khz.json
 ```
 
 Regenerate that file in the calibration repo when the RF wiring or LO topology

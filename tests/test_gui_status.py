@@ -30,6 +30,7 @@ from antijamming.ui.widgets.skyplot import (
     _skyplot_view_range_for_side,
     _skyplot_xy,
 )
+from antijamming.ui.widgets.skyplot.monitor import _skyplot_static_label_positions
 from antijamming.ui.theme import (
     ALERT,
     BEIDOU_TRACKING,
@@ -111,12 +112,6 @@ def _plain_text(label) -> str:
     return re.sub(r"<[^>]+>", "", label.text()).strip()
 
 
-def _assert_empty_curve(curve) -> None:
-    x_values, y_values = curve.getData()
-    assert x_values is None or len(x_values) == 0
-    assert y_values is None or len(y_values) == 0
-
-
 def _is_descendant(child, parent) -> bool:
     widget = child
     while widget is not None:
@@ -139,10 +134,11 @@ def test_skyplot_coordinate_mapping_and_static_labels(qtbot) -> None:
     assert east_x == pytest.approx(1.0)
     assert east_y == pytest.approx(0.0, abs=1e-12)
     assert skyplot._ring_radii == pytest.approx((1.0, 2.0 / 3.0, 1.0 / 3.0))
-    assert skyplot._static_label_positions["30°"][1] == pytest.approx(2.0 / 3.0)
-    assert skyplot._static_label_positions["60°"][1] == pytest.approx(1.0 / 3.0)
-    assert skyplot._static_label_positions["30°"][0] > 0.0
-    assert skyplot._static_label_positions["60°"][0] > 0.0
+    label_positions = _skyplot_static_label_positions(skyplot._current_plot_side())
+    assert label_positions["30°"][1] == pytest.approx(2.0 / 3.0)
+    assert label_positions["60°"][1] == pytest.approx(1.0 / 3.0)
+    assert label_positions["30°"][0] > 0.0
+    assert label_positions["60°"][0] > 0.0
     x_min, x_max, y_min, y_max = skyplot._view_range
     assert x_min <= -1.15
     assert x_max >= 1.15
@@ -150,9 +146,9 @@ def test_skyplot_coordinate_mapping_and_static_labels(qtbot) -> None:
     assert y_max >= 1.15
     assert all(
         x_min < x < x_max and y_min < y < y_max
-        for x, y in skyplot._static_label_positions.values()
+        for x, y in label_positions.values()
     )
-    assert {"N", "E", "S", "W"}.issubset(skyplot._static_label_positions)
+    assert {"N", "E", "S", "W"}.issubset(label_positions)
     assert len(skyplot._band_items) == 3
     assert all(band.zValue() < skyplot._ring_items[0].zValue() for band in skyplot._band_items)
     assert len(skyplot._ring_items) == 3
@@ -285,11 +281,9 @@ def test_skyplot_skips_missing_geometry_and_tracks_unplaced_prns(qtbot) -> None:
             {"prn": 12, "state": "tracking"},
             {"prn": 14, "state": "tracking", "az_deg": 90.0},
         ],
-        unplaced_tracking_prns=[12, 14],
     )
 
     assert skyplot._plotted_prns == [5, 7, 9]
-    assert skyplot._unplaced_tracking_prns == [12, 14]
     assert skyplot._marker_items
     assert all(item.zValue() > skyplot._ring_items[0].zValue() for item in skyplot._marker_items)
     assert all(
@@ -1002,7 +996,6 @@ def test_receiver_tab_uses_one_content_height_overview_and_expanding_prn_card(
         window._algorithm_plots_container.sizePolicy().verticalPolicy()
         == QSizePolicy.Policy.Expanding
     )
-    assert window._doa_polar_db_tile.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Expanding
     assert window._receiver_card.maximumHeight() < 16777215
     assert window._prn_card.maximumHeight() == 16777215
     receiver_layout = window._receiver_tab.layout()
@@ -1134,7 +1127,6 @@ def test_gui_keeps_gnss_sdr_runtime_status_in_main_view(qtbot) -> None:
 
     window._on_data_ready({"gnss_snapshot": {}})
     assert not hasattr(window, "_mode_toggle_btn")
-    assert window._mode_chip.text() == ""
     assert not hasattr(window, "_gnss_feed_status_label")
     assert cfg.gnss_sdr_enable is True
     assert window._gnss_chip.text() == ""
@@ -1183,7 +1175,6 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     assert _is_descendant(window._antijam_status_card, window._antijam_tab)
     assert _is_descendant(window._lcmv_response_container, window._antijam_tab)
     assert _is_descendant(window._lcmv_response_container, window._algorithm_plots_container)
-    assert _is_descendant(window._doa_polar_db_tile, window._algorithm_plots_container)
     assert _is_descendant(window._lcmv_response_plot, window._lcmv_response_container)
     assert not hasattr(window, "_lcmv_rms_plot")
     assert not hasattr(window, "_lcmv_rms_bars")
@@ -1360,12 +1351,6 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
         window._skyplot_monitor._marker_items[1].opts["pen"].color().name().upper()
         == GPS_TRACKING_FIX.upper()
     )
-    assert window._skyplot_monitor._unplaced_tracking_prns == [12, 14]
-    assert window._current_tracking_prns == [5, 9, 12, 13, 14]
-    assert window._stable_prns == [5, 9]
-    assert window._current_used_in_pvt_prns == [9]
-    assert window._fresh_geometry_prns == [5, 7, 9, 13]
-    assert window._tracking_without_geometry == [12, 14]
     assert window._prn_monitor._bar_item.zValue() == pytest.approx(10.0)
     assert [
         brush.color().alpha()
@@ -1414,9 +1399,6 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     assert window._prn_monitor._bar_positions == []
     assert [label.toPlainText() for label in window._prn_monitor._label_items] == []
     assert window._skyplot_monitor._plotted_prns == []
-    assert window._stable_prns == []
-    assert window._current_used_in_pvt_prns == []
-    assert window._fresh_geometry_prns == [11]
 
     window._on_data_ready(
         {
@@ -1624,8 +1606,6 @@ def test_receiver_projection_prevents_skyplot_tracking_contradictions(qtbot) -> 
     # still withholds an unstable channel without fresh PVT geometry.
     assert window._prn_monitor._displayed_prns == [12]
     assert window._skyplot_monitor._plotted_prns == []
-    assert window._stable_prns == []
-    assert window._current_used_in_pvt_prns == []
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
     assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 1"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 0"
@@ -1722,9 +1702,6 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
     assert window._prn_monitor._displayed_prns == [5, 9]
     assert window._prn_monitor._bar_colors == [GPS_TRACKING, GPS_TRACKING]
     assert window._skyplot_monitor._plotted_prns == [5]
-    assert window._stable_prns == [5]
-    assert window._current_used_in_pvt_prns == []
-    assert window._raw_used_in_fix_prns == [9]
     assert _plain_text(window._position_status_label) == "PVT fix: 3D Fix"
     assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 2"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 1 (G09)"
@@ -1772,7 +1749,6 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
 
     assert window._prn_monitor._displayed_prns == [5, 9]
     assert window._skyplot_monitor._plotted_prns == [5]
-    assert window._current_used_in_pvt_prns == []
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
     assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 2"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 0"
@@ -1819,8 +1795,6 @@ def test_receiver_projection_clears_operator_state_on_error(qtbot) -> None:
 
     assert window._prn_monitor._displayed_prns == []
     assert window._skyplot_monitor._plotted_prns == []
-    assert window._stable_prns == []
-    assert window._current_used_in_pvt_prns == []
     assert _plain_text(window._position_status_label) == "PVT fix: NO FIX"
     assert _plain_text(window._satellites_tracked_label) == "Satellites tracked: 0"
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 0"
@@ -1884,21 +1858,15 @@ def test_receiver_projection_clears_stable_prn_during_tracking_monitor_gap(qtbot
 
     window._on_data_ready(locked_snapshot)
     assert window._prn_monitor._displayed_prns == [9]
-    assert window._stable_prns == [9]
-    assert window._current_used_in_pvt_prns == [9]
 
     window._on_data_ready(transient_gap_snapshot)
 
     assert window._prn_monitor._displayed_prns == []
-    assert window._stable_prns == []
-    assert window._current_used_in_pvt_prns == []
     assert window._skyplot_monitor._plotted_prns == []
     assert _plain_text(window._satellites_used_label) == "Satellites used for PVT: 1 (G09)"
     window._on_data_ready(transient_gap_snapshot)
 
     assert window._prn_monitor._displayed_prns == []
-    assert window._stable_prns == []
-    assert window._current_used_in_pvt_prns == []
 
 
 def test_receiver_projection_does_not_hold_tracked_placeholder(qtbot) -> None:
@@ -1952,8 +1920,6 @@ def test_receiver_projection_does_not_hold_tracked_placeholder(qtbot) -> None:
     assert window._prn_monitor._pending_tracking_prns == []
     assert window._prn_monitor._bar_heights == []
     assert [label.toPlainText() for label in window._prn_monitor._label_items] == []
-    assert window._stable_prns == []
-    assert window._current_used_in_pvt_prns == []
 
 
 def test_gui_latches_stream_failure_through_cleanup_statuses(qtbot) -> None:
@@ -1988,7 +1954,6 @@ def test_gui_marks_gnss_handoff_pause_as_degraded_not_stopping(qtbot) -> None:
 
     assert window._stream_status_state == "degraded"
     assert window._stream_running is True
-    assert window._stream_stopping is False
     assert window._run_btn.text() == "■ Stop"
     assert window._run_btn.isEnabled() is True
     assert _plain_text(window._status_chip) == f"Stream: {message}"
@@ -2030,7 +1995,7 @@ def test_gui_shows_gnss_fix_accuracy_from_snapshot(qtbot) -> None:
                     "cep50_m": 0.48,
                     "cep95_m": 1.27,
                     "cep_sample_count": 30,
-                    "cep_window_points": 30,
+                    "cep_min_points": 30,
                     "cep_ready": True,
                     "truth_available": True,
                 }

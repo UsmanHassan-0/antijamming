@@ -40,7 +40,6 @@ VALID_LCMV_PRESERVE_MODES = frozenset(
 VALID_LCMV_TARGET_MODES = frozenset(
     {
         "strongest_music_peak",
-        "expected_jammer_range_peak_or_center",
         "realtime_non_preserve_peak",
     }
 )
@@ -114,8 +113,8 @@ class StreamConfig:
     channels: tuple[int, int, int, int]
 
     # Sole authored product sample rate. The runtime profile loader derives the
-    # USRP RX bandwidth, GNSS-SDR IF bandwidth, minimum rate, and experiment
-    # manifest rate/bandwidth from this value.
+    # USRP RX bandwidth and minimum rate from this value. GNSS-SDR filter edges
+    # are separately normalized for the selected rate.
     sample_rate: float
 
     # GPS L1 center frequency.
@@ -189,7 +188,6 @@ class StreamConfig:
     # Keep the configured receive/GNSS rates fixed during product runs.
     # Overflows are logged as transport health events instead of silently
     # changing sample rate.
-    auto_rate_backoff: bool
     # Derived from sample_rate; fixed-rate product runs do not author it separately.
     min_sample_rate: float
 
@@ -427,10 +425,6 @@ class StreamConfig:
 
     # Limit expensive/high-volume DoA log emissions.
     doa_log_interval_s: float
-
-    # Optional operator-authored test manifest. Runtime must not require it;
-    # missing values are logged as unknown/null in diagnostics.
-    experiment: dict[str, object]
 
     # -------------------------------------------------------------------------
     # Derived Config Views

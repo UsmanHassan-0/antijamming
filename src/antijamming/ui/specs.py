@@ -34,7 +34,6 @@ PLOT_AXIS_BOTTOM_HEIGHT = grid(8)
 PLOT_LEGEND_OFFSET = grid_tuple(2, 2)
 PLOT_LEGEND_SAMPLE_WIDTH = grid(2)
 PLOT_GRID_ALPHA_PERCENT = 35
-PLOT_DENSE_GRID_ALPHA_PERCENT = 30
 
 
 # =============================================================================
@@ -43,12 +42,8 @@ PLOT_DENSE_GRID_ALPHA_PERCENT = 30
 
 # Window and card dimensions are intentionally centralized here rather than in
 # MainWindow, keeping layout changes independent from update/rendering logic.
-WINDOW_DEFAULT_WIDTH = grid(160)
-WINDOW_DEFAULT_HEIGHT = grid(110)
 SUMMARY_CARD_MIN_WIDTH = grid(28)
 SUMMARY_CARD_MAX_WIDTH = grid(38)
-SCROLLBAR_THICKNESS = grid(2)
-SCROLLBAR_HANDLE_MIN_LENGTH = grid(4)
 
 
 # =============================================================================
@@ -57,7 +52,6 @@ SCROLLBAR_HANDLE_MIN_LENGTH = grid(4)
 
 # GNSS widgets have fixed-format content: 32 possible GPS L1 C/A PRNs and a
 # square skyplot. Stable dimensions prevent labels and bars from resizing panels.
-PRN_COUNT = 32
 PRN_STATE_BAR_HEIGHT = 8.0
 PRN_PLOT_MIN_HEIGHT = grid(34)
 PRN_PLOT_AXIS_BOTTOM_HEIGHT = grid(4)
@@ -69,4 +63,3 @@ SKYPLOT_MIN_SIZE = grid(40)
 # =============================================================================
 
 REALTIME_ALGORITHM_PLOT_MIN_HEIGHT = grid(30)
-REALTIME_ALGORITHM_PLOT_COMPACT_MIN_HEIGHT = grid(10)
