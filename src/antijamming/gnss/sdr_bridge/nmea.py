@@ -6,7 +6,13 @@ import time
 
 from antijamming.gnss.constellations import normalize_constellation
 
-from .models import _constellation_from_token, _sat_constellation, _sat_key, _sat_public_fields
+from .models import (
+    _SatKey,
+    _constellation_from_token,
+    _sat_constellation,
+    _sat_key,
+    _sat_public_fields,
+)
 
 class NmeaMixin:
     def _handle_nmea_line(self, line: str) -> None:

@@ -261,7 +261,9 @@ class UsrpRxDevice:
                         f"{timeout_s:.2f}s: unlocked channels={unlocked}"
                     )
                 return state
-        time.sleep(0.05)
+            # Sensor polling is a control-plane operation.  Avoid hammering UHD
+            # and a host CPU while TwinRX settles after the timed retune.
+            time.sleep(0.05)
 
     # -------------------------------------------------------------------------
     # Stream Startup and Diagnostics

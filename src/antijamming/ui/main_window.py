@@ -226,6 +226,9 @@ class MainWindow(QMainWindow):
         self._metrics_timer = QTimer(self)
         self._metrics_timer.setInterval(self._operator_ui_refresh_ms())
         self._metrics_timer.timeout.connect(self._flush_pending_metrics)
+        self._startup_screen_timer = QTimer(self)
+        self._startup_screen_timer.setSingleShot(True)
+        self._startup_screen_timer.timeout.connect(self.maximize_to_available_screen)
 
         self.setWindowTitle("Anti-Jamming Control")
         self._build_ui()
@@ -281,7 +284,7 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         if not self._startup_screen_fit_done:
-            QTimer.singleShot(0, self.maximize_to_available_screen)
+            self._startup_screen_timer.start(0)
 
     def maximize_to_available_screen(self) -> None:
         screen = self.screen() or QGuiApplication.primaryScreen()
@@ -840,7 +843,7 @@ class MainWindow(QMainWindow):
         color: str,
         detail_value: str | None = None,
     ) -> None:
-        setattr(self, "_receiver_fix_text", fix_type)
+        self._receiver_fix_text = fix_type
         if self._fix_chip.text() != fix_type:
             self._fix_chip.setText(fix_type)
         self._set_status_row(
@@ -1388,6 +1391,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._log.info("GUI close requested")
+        self._startup_screen_timer.stop()
+        self._metrics_timer.stop()
         if hasattr(self._worker, "stop"):
             try:
                 self._worker.stop("GUI close")

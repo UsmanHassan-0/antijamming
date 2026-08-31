@@ -1,6 +1,6 @@
 # RF Hardware And Link Budget
 
-The realtime profile targets GPS L1 at `1575.42 MHz` with `4 MHz` receive bandwidth. The current experiment metadata in `configs/antijamming/x300_realtime.json` records the jammer basis as `9.51 dBm` at `1575.42 MHz` over `4 MHz`, plus attenuation, distance, antenna gains, chain losses, LNA gain, and USRP gain.
+The realtime profile targets GPS L1 at `1575.42 MHz` with `4 MHz` receive bandwidth. Bench geometry and external bladeRF/jammer settings are not runtime controls. The preserved optional overlay `configs/experiments/realtime_measured_bladerf_preserve_lcmv_test.json` records the jammer basis as `9.51 dBm` at `1575.42 MHz` over `4 MHz`, plus attenuation, distance, antenna gains, chain losses, LNA gain, and USRP gain.
 
 BladeRF software gain and RF output power are not the same thing. The loggable RF budget in `src/antijamming/rf/budget.py` separates configured transmitter/generator settings from estimated power at the receive antenna and USRP input. This matters because a bladeRF gain number is a control value; the jammer power used for J/S must be a measured or calibrated RF power basis.
 

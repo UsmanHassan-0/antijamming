@@ -18,7 +18,6 @@ class ConfigRendererMixin:
         template_path = self._cfg.gnss_sdr_config_template.expanduser().resolve()
         template = template_path.read_text(encoding="utf-8")
         shared_phase = self._shared_u1_phase_enabled()
-        phase_satellites = self._shared_u1_phase_satellites()
         channels_1c_count = (
             self._shared_u1_phase_source_count()
             if shared_phase
@@ -260,7 +259,7 @@ class ConfigRendererMixin:
         sample_rate_sps = int(round(sample_rate_hz))
         # Validate that the configured rate can represent the physical GPS L1
         # pass/stop edges before asking GNU Radio to derive low-pass taps.
-        self.input_filter_bandwidth_hz
+        self._validate_input_filter_configuration()
         shared_phase = self._shared_u1_phase_enabled()
         satellites = self._shared_u1_phase_satellites()
         count = self._shared_u1_phase_source_count() if shared_phase else 1
@@ -349,6 +348,10 @@ class ConfigRendererMixin:
 
     @property
     def input_filter_bandwidth_hz(self) -> float:
+        self._validate_input_filter_configuration()
+        return GPS_L1_CA_PROCESSING_BANDWIDTH_HZ
+
+    def _validate_input_filter_configuration(self) -> None:
         self._active_signal_ids()
         sample_rate_hz = max(1.0, float(self._cfg.sample_rate))
         if sample_rate_hz <= GNSS_INPUT_FILTER_STOPBAND_HZ:
@@ -357,7 +360,6 @@ class ConfigRendererMixin:
                 f"GPS L1 input-filter stopband at {GNSS_INPUT_FILTER_STOPBAND_HZ:.0f} Hz "
                 "below Nyquist; increase sample_rate"
             )
-        return GPS_L1_CA_PROCESSING_BANDWIDTH_HZ
 
     def _warn_if_gps_l1_is_outside_capture_band(self) -> None:
         half_span_hz = 0.5 * float(self._cfg.sample_rate)

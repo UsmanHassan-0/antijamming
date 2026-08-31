@@ -317,11 +317,10 @@ class StreamConfig:
     gnss_truth_static_lon_deg: float | None
     gnss_truth_static_alt_m: float | None
 
-    # PVT truth-error display parameters. The point count is only the minimum
+    # PVT truth-error display parameter. The point count is only the minimum
     # before cumulative CEP is first published; the product profile uses one so
     # CEP begins with the first valid PVT fix.
     gnss_accuracy_window_points: int
-    gnss_accuracy_log_interval_s: float
 
     # Template used to render the GNSS-SDR FIFO receiver config.
     gnss_sdr_config_template: Path

@@ -5,7 +5,6 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 
 from antijamming.radio.usrp import device as device_module
 from antijamming.radio.usrp.device import UsrpRxDevice

@@ -5317,8 +5317,6 @@ class BackendRuntime:
                     getattr(result, "weights", []),
                     dtype=np.complex128,
                 ).reshape(-1)
-                healthy_ref_power = self._vector_response_power(uniform_w, healthy_norm)
-                healthy_method_power = self._vector_response_power(weights, healthy_norm)
                 ideal_ref_power = self._vector_response_power(uniform_w, ideal_norm)
                 ideal_method_power = self._vector_response_power(weights, ideal_norm)
                 u1_ref_power = self._vector_response_power(uniform_w, u1_norm)

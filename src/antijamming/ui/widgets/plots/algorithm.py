@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-import weakref
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
@@ -85,11 +84,21 @@ class _LegendItemProxy:
 class _PolarPlotWidget(pg.PlotWidget):
     """PlotWidget that keeps polar labels visible as the box aspect changes."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._deferred_resize_timer = QTimer(self)
+        self._deferred_resize_timer.setSingleShot(True)
+        self._deferred_resize_timer.timeout.connect(self._apply_deferred_view_range)
+
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         _apply_polar_view_range(self)
-        plot_ref = weakref.ref(self)
-        QTimer.singleShot(0, lambda: _apply_polar_view_range_if_alive(plot_ref))
+        timer = getattr(self, "_deferred_resize_timer", None)
+        if timer is not None:
+            timer.start(0)
+
+    def _apply_deferred_view_range(self) -> None:
+        _apply_polar_view_range(self)
 
 
 # =============================================================================
@@ -379,15 +388,6 @@ def _apply_polar_view_range(plot: pg.PlotWidget) -> None:
         )
     except RuntimeError:
         return
-
-
-def _apply_polar_view_range_if_alive(
-    plot_ref: weakref.ReferenceType[pg.PlotWidget],
-) -> None:
-    plot = plot_ref()
-    if plot is None:
-        return
-    _apply_polar_view_range(plot)
 
 
 def set_polar_data_radius(plot: pg.PlotWidget, radius: float) -> None:

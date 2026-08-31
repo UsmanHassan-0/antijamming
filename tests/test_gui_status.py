@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import QLabel, QCheckBox, QScrollArea, QSizePolicy, QSpinBo
 
 from antijamming.config import StreamConfig
 from antijamming.ui.main_window import MainWindow
-from antijamming.ui.specs import PRN_STATE_BAR_HEIGHT, SKYPLOT_MIN_SIZE
+from antijamming.ui.specs import SKYPLOT_MIN_SIZE
 from antijamming.ui.widgets.prn_monitor import (
     PRN_BAR_GAP,
     PRN_BAR_OUTER_MARGIN,
@@ -42,7 +42,6 @@ from antijamming.ui.theme import (
     GPS_TRACKING_FIX,
     INPUT_BORDER,
     INFO,
-    WARNING,
     WHITE,
     operator_tabs_style,
 )
@@ -693,6 +692,8 @@ def test_gui_close_requests_worker_cleanup(qtbot) -> None:
 
     assert worker.stopped is True
     assert worker.stop_reasons[-1] == "GUI close"
+    assert window._metrics_timer.isActive() is False
+    assert window._startup_screen_timer.isActive() is False
 
 
 def test_gui_shows_output_path_and_system_feed_info(qtbot) -> None:

@@ -147,3 +147,25 @@ def test_json_ipc_round_trip_does_not_require_backend_or_hardware(tmp_path) -> N
     finally:
         client.close()
         server.close()
+
+
+def test_json_ipc_server_close_joins_acceptor_and_sessions(tmp_path) -> None:
+    socket_path = tmp_path / "headless.sock"
+    server = JsonIpcServer(socket_path, on_command=lambda _command, _args: {})
+    clients = [JsonIpcClient(socket_path) for _ in range(8)]
+    server.start()
+    accept_thread = server._accept_thread
+    assert accept_thread is not None
+
+    try:
+        for client in clients:
+            client.connect()
+        _wait_for(lambda: len(server._session_snapshot()) == len(clients))
+    finally:
+        server.close()
+        for client in clients:
+            client.close()
+
+    assert not accept_thread.is_alive()
+    assert server._session_snapshot() == []
+    assert not socket_path.exists()

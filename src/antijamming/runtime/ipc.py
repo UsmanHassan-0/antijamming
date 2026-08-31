@@ -168,6 +168,19 @@ class _ClientSession:
         except OSError:
             pass
 
+    def wait_closed(self, timeout_s: float = 1.0) -> None:
+        """Wait briefly for this session's reader/sender to leave their loops."""
+
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        current = threading.current_thread()
+        for thread in (self._reader, self._sender):
+            if thread is current or thread.ident is None:
+                continue
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                break
+            thread.join(timeout=remaining_s)
+
     def _send(self, message: dict[str, Any]) -> None:
         encoded = (
             json.dumps(message, separators=(",", ":"), allow_nan=False) + "\n"
@@ -311,10 +324,23 @@ class JsonIpcServer:
                 listener.close()
             except OSError:
                 pass
+        # The acceptor may already have returned a connection when shutdown
+        # closes the listener.  Join it before snapshotting sessions so that a
+        # late accepted session cannot escape cleanup.
+        accept_thread = self._accept_thread
+        self._accept_thread = None
+        if (
+            accept_thread is not None
+            and accept_thread is not threading.current_thread()
+            and accept_thread.ident is not None
+        ):
+            accept_thread.join(timeout=1.0)
         with self._sessions_lock:
             sessions = list(self._sessions)
         for session in sessions:
             session.close()
+        for session in sessions:
+            session.wait_closed(timeout_s=1.0)
         try:
             if self.socket_path.is_socket():
                 self.socket_path.unlink()

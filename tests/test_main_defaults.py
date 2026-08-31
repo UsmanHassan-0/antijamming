@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -11,6 +12,7 @@ from threadpoolctl import threadpool_info
 from antijamming.config import (
     DEFAULT_RUNTIME_CONFIG_PATH,
     REPO_ROOT,
+    apply_stream_config_file,
     default_stream_config,
     load_stream_config_file,
 )
@@ -167,15 +169,9 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
         "reimport",
         "reimport",
     )
-    assert cfg.experiment["rx_chain"] == "antenna->cable->BPF->LNA->DC_block->cable->TwinRX"
+    assert cfg.experiment == {}
     assert cfg.expected_sources == 1
     assert cfg.gnss_accuracy_window_points == 1
-    assert cfg.experiment["jammer_attenuation_db"] == 50.0
-    assert cfg.experiment["jammer_attenuation_db_min"] == 0.0
-    assert cfg.experiment["jammer_attenuation_db_max"] == 90.0
-    assert cfg.experiment["bladeRF_tx_gain_db"] == 50.0
-    assert cfg.experiment["bladeRF_distance_m"] == pytest.approx(3.4798)
-    assert cfg.experiment["jammer_distance_m"] == pytest.approx(2.7432)
 
 
 def test_runtime_config_experiment_section_is_optional(tmp_path) -> None:
@@ -194,8 +190,9 @@ def test_runtime_profile_authors_sample_rate_once_and_derives_followers(tmp_path
     assert "usrp_rx_bandwidth_hz" not in payload
     assert "gnss_sdr_if_bandwidth_hz" not in payload
     assert "min_sample_rate" not in payload
-    assert "sample_rate_sps" not in payload["experiment"]
-    assert "rx_bandwidth_hz" not in payload["experiment"]
+    experiment = payload.get("experiment", {})
+    assert "sample_rate_sps" not in experiment
+    assert "rx_bandwidth_hz" not in experiment
 
     payload["sample_rate"] = 6_250_000
     path = tmp_path / "runtime_with_one_sample_rate.json"
@@ -229,6 +226,7 @@ def test_runtime_profile_rejects_authored_sample_rate_followers(tmp_path, field)
 @pytest.mark.parametrize("field", ["sample_rate_sps", "rx_bandwidth_hz"])
 def test_runtime_profile_rejects_experiment_rate_duplicates(tmp_path, field) -> None:
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["experiment"] = {}
     payload["experiment"][field] = payload["sample_rate"]
     path = tmp_path / f"runtime_with_duplicate_experiment_{field}.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -297,6 +295,23 @@ def test_runtime_config_loads_operator_experiment_section(tmp_path) -> None:
 
     assert cfg.experiment["name"] == "unit_test"
     assert cfg.experiment["jammer_attenuation_db"] == 80.0
+
+
+def test_preserved_bench_manifest_loads_only_as_an_explicit_overlay() -> None:
+    overlay = (
+        REPO_ROOT
+        / "configs/experiments/realtime_measured_bladerf_preserve_lcmv_test.json"
+    )
+
+    cfg = apply_stream_config_file(default_stream_config(), overlay)
+
+    assert cfg.experiment["rx_chain"] == (
+        "antenna->cable->BPF->LNA->DC_block->cable->TwinRX"
+    )
+    assert cfg.experiment["jammer_attenuation_db"] == 50.0
+    assert cfg.experiment["bladeRF_tx_gain_db"] == 50.0
+    assert cfg.experiment["bladeRF_distance_m"] == pytest.approx(3.4798)
+    assert cfg.experiment["jammer_distance_m"] == pytest.approx(2.7432)
 
 
 def test_product_shell_entrypoints_are_parseable() -> None:
@@ -562,6 +577,6 @@ def test_product_profile_uses_dynamic_shared_u1_phase_fanout() -> None:
     assert cfg.gnss_1c_channel_count == 10
     assert cfg.gnss_channels_in_acquisition == 10
     assert cfg.gain_db == 45.0
-    assert cfg.experiment["jammer_attenuation_db"] == 50.0
+    assert cfg.experiment == {}
     assert cfg.sample_rate == 4_000_000.0
     assert cfg.center_freq_hz == 1_575_420_000.0
