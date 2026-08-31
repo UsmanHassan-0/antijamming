@@ -46,7 +46,6 @@ def test_phase_only_mode_selects_phase_only_vector(tmp_path) -> None:
     )
 
     assert selection.applied_mode == "phase_only"
-    assert selection.fallback_used is False
     assert np.allclose(np.abs(selection.vector), np.ones(4))
 
 
@@ -61,7 +60,6 @@ def test_complex_gain_mode_selects_complex_gain_vector(tmp_path) -> None:
     )
 
     assert selection.applied_mode == "complex_gain"
-    assert selection.fallback_used is False
     assert np.allclose(np.abs(selection.vector), [1.0, 2.0, 0.5, 1.5])
 
 
@@ -76,24 +74,31 @@ def test_omitted_mode_defaults_to_complex_gain_vector(tmp_path) -> None:
 
     assert selection.configured_mode == "complex_gain"
     assert selection.applied_mode == "complex_gain"
-    assert selection.fallback_used is False
     assert np.allclose(np.abs(selection.vector), [1.0, 2.0, 0.5, 1.5])
 
 
-def test_complex_gain_missing_falls_back_to_phase_only(tmp_path) -> None:
+def test_complex_gain_missing_is_rejected_instead_of_changing_modes(tmp_path) -> None:
     path = tmp_path / "cal.json"
     _write_calibration(path, include_complex=False)
 
-    selection = load_calibration_correction_selection(
-        path,
-        mode="complex_gain",
-        expected_channel_count=4,
-    )
+    with pytest.raises(ValueError, match="complex_gain calibration is required"):
+        load_calibration_correction_selection(
+            path,
+            mode="complex_gain",
+            expected_channel_count=4,
+        )
 
-    assert selection.applied_mode == "phase_only"
-    assert selection.fallback_used is True
-    assert "complex_gain requested but invalid" in selection.fallback_reason
-    assert np.allclose(np.abs(selection.vector), np.ones(4))
+
+def test_unknown_calibration_mode_is_rejected(tmp_path) -> None:
+    path = tmp_path / "cal.json"
+    _write_calibration(path)
+
+    with pytest.raises(ValueError, match="unknown calibration_correction_mode"):
+        load_calibration_correction_selection(
+            path,
+            mode="typo_mode",
+            expected_channel_count=4,
+        )
 
 
 def test_complex_gain_correction_changes_calibrated_channel_power(tmp_path) -> None:

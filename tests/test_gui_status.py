@@ -12,6 +12,8 @@ from PyQt6.QtGui import QCloseEvent, QFont, QFontMetrics, QGuiApplication
 from PyQt6.QtWidgets import QLabel, QCheckBox, QScrollArea, QSizePolicy, QSpinBox
 
 from antijamming.config import StreamConfig
+from antijamming.gnss.constellations import satellite_label
+from antijamming.runtime.remote_worker import RemoteStreamWorker
 from antijamming.ui.main_window import MainWindow
 from antijamming.ui.specs import SKYPLOT_MIN_SIZE
 from antijamming.ui.widgets.prn_monitor import (
@@ -108,6 +110,28 @@ class SlowFinishWorker(DummyWorker):
         self.finished.emit()
 
 
+def test_remote_worker_close_retain_state_until_ipc_reader_stops(tmp_path) -> None:
+    class RetryingClient:
+        def __init__(self) -> None:
+            self.results = iter((False, True))
+
+        def close(self) -> bool:
+            return next(self.results)
+
+    worker = RemoteStreamWorker(tmp_path / "unused.sock")
+    worker._client = RetryingClient()  # type: ignore[assignment]
+    worker._backend_running = True
+    worker._stopped.clear()
+
+    assert worker.close() is False
+    assert worker.isRunning() is True
+    assert worker.wait(0) is False
+
+    assert worker.close() is True
+    assert worker.isRunning() is False
+    assert worker.wait(0) is True
+
+
 def _plain_text(label) -> str:
     return re.sub(r"<[^>]+>", "", label.text()).strip()
 
@@ -119,6 +143,22 @@ def _is_descendant(child, parent) -> bool:
             return True
         widget = widget.parentWidget()
     return False
+
+
+def _sat(
+    prn: int,
+    *,
+    constellation: str = "gps",
+    **fields: object,
+) -> dict[str, object]:
+    label = satellite_label(constellation, prn)
+    assert label is not None
+    return {
+        "constellation": constellation,
+        "prn": int(prn),
+        "satellite_id": label,
+        **fields,
+    }
 
 
 def test_skyplot_coordinate_mapping_and_static_labels(qtbot) -> None:
@@ -204,7 +244,7 @@ def test_skyplot_static_labels_fit_inside_viewbox(qtbot, side_px: int) -> None:
     skyplot.set_plot_side(side_px)
     skyplot.update_snapshot(
         [
-            {"prn": 5, "state": "tracking", "az_deg": 0.0, "el_deg": 0.0},
+            _sat(5, state="tracking", az_deg=0.0, el_deg=0.0),
         ]
     )
     skyplot.show()
@@ -254,7 +294,7 @@ def test_skyplot_marker_size_and_text_follow_plot_size(qtbot) -> None:
     skyplot.set_plot_side(compact_side)
     skyplot.update_snapshot(
         [
-            {"prn": 5, "state": "tracking", "az_deg": 45.0, "el_deg": 50.0},
+            _sat(5, state="tracking", az_deg=45.0, el_deg=50.0),
         ]
     )
 
@@ -275,11 +315,17 @@ def test_skyplot_skips_missing_geometry_and_tracks_unplaced_prns(qtbot) -> None:
 
     skyplot.update_snapshot(
         [
-            {"prn": 5, "state": "tracking", "az_deg": 45.0, "el_deg": 50.0},
-            {"prn": 7, "state": "visible", "az_deg": 180.0, "el_deg": 30.0},
-            {"prn": 9, "state": "tracking", "az_deg": 270.0, "el_deg": 35.0, "used_in_fix": True},
-            {"prn": 12, "state": "tracking"},
-            {"prn": 14, "state": "tracking", "az_deg": 90.0},
+            _sat(5, state="tracking", az_deg=45.0, el_deg=50.0),
+            _sat(7, state="visible", az_deg=180.0, el_deg=30.0),
+            _sat(
+                9,
+                state="tracking",
+                az_deg=270.0,
+                el_deg=35.0,
+                used_in_fix=True,
+            ),
+            _sat(12, state="tracking"),
+            _sat(14, state="tracking", az_deg=90.0),
         ],
     )
 
@@ -309,17 +355,30 @@ def test_skyplot_uses_supported_constellation_prefixes(qtbot) -> None:
 
     skyplot.update_snapshot(
         [
-            {"prn": 12, "constellation": "gps", "state": "tracking", "az_deg": 20.0, "el_deg": 45.0},
+            _sat(12, state="tracking", az_deg=20.0, el_deg=45.0),
+            _sat(
+                7,
+                constellation="beidou",
+                state="tracking",
+                az_deg=60.0,
+                el_deg=40.0,
+                used_in_fix=True,
+            ),
+            _sat(
+                3,
+                constellation="glonass",
+                state="tracking",
+                az_deg=80.0,
+                el_deg=35.0,
+            ),
             {
-                "prn": 7,
-                "constellation": "beidou",
+                "constellation": "sbas",
+                "prn": 1,
+                "satellite_id": "S01",
                 "state": "tracking",
-                "az_deg": 60.0,
-                "el_deg": 40.0,
-                "used_in_fix": True,
+                "az_deg": 100.0,
+                "el_deg": 30.0,
             },
-            {"prn": 3, "constellation": "glonass", "state": "tracking", "az_deg": 80.0, "el_deg": 35.0},
-            {"prn": 1, "constellation": "sbas", "state": "tracking", "az_deg": 100.0, "el_deg": 30.0},
         ]
     )
 
@@ -335,27 +394,22 @@ def test_prn_chart_labels_bars_with_cno_and_axis_with_satellites(qtbot) -> None:
 
     monitor.update_snapshot(
         [
-            {
-                "prn": 12,
-                "constellation": "glonass",
-                "state": "tracking",
-                "cno_db_hz": 36.7,
-                "cno_stable": True,
-            },
-            {
-                "prn": 5,
-                "state": "tracking",
-                "cno_db_hz": 42.4,
-                "cno_stable": True,
-            },
-            {
-                "prn": 7,
-                "system": "beidou",
-                "state": "tracking",
-                "cno_db_hz": 38.1,
-                "cno_stable": True,
-                "used_in_fix": True,
-            },
+            _sat(
+                12,
+                constellation="glonass",
+                state="tracking",
+                cno_db_hz=36.7,
+                cno_stable=True,
+            ),
+            _sat(5, state="tracking", cno_db_hz=42.4, cno_stable=True),
+            _sat(
+                7,
+                constellation="beidou",
+                state="tracking",
+                cno_db_hz=38.1,
+                cno_stable=True,
+                used_in_fix=True,
+            ),
         ]
     )
 
@@ -386,12 +440,12 @@ def test_prn_chart_does_not_render_unstable_tracking_placeholder(qtbot) -> None:
 
     monitor.update_snapshot(
         [
-            {
-                "prn": 9,
-                "state": "tracking",
-                "observable_cno_db_hz": 43.25,
-                "observable_valid_pseudorange": True,
-            }
+            _sat(
+                9,
+                state="tracking",
+                observable_cno_db_hz=43.25,
+                observable_valid_pseudorange=True,
+            )
         ]
     )
 
@@ -481,12 +535,7 @@ def test_gui_coalesces_live_metrics_to_latest_refresh(qtbot) -> None:
             "pvt_output_seen": True,
             "pvt_current": True,
             "prns": [
-                {
-                    "prn": 4,
-                    "state": "tracking",
-                    "cno_db_hz": 31.0,
-                    "cno_stable": True,
-                }
+                _sat(4, state="tracking", cno_db_hz=31.0, cno_stable=True)
             ],
             "sky_prns": [],
         }
@@ -496,12 +545,7 @@ def test_gui_coalesces_live_metrics_to_latest_refresh(qtbot) -> None:
             "pvt_output_seen": True,
             "pvt_current": True,
             "prns": [
-                {
-                    "prn": 8,
-                    "state": "tracking",
-                    "cno_db_hz": 39.0,
-                    "cno_stable": True,
-                }
+                _sat(8, state="tracking", cno_db_hz=39.0, cno_stable=True)
             ],
             "sky_prns": [],
         }
@@ -523,49 +567,18 @@ def test_gui_coalesces_live_metrics_to_latest_refresh(qtbot) -> None:
     assert window._metrics_coalesced_drop_count == 1
 
 
-def test_gui_rf_markers_include_current_attenuation_and_bladerf_gain(qtbot) -> None:
+def test_gui_rf_markers_record_only_physical_state(qtbot) -> None:
     worker = DummyWorker()
     window = MainWindow(StreamConfig(), worker)  # type: ignore[arg-type]
     qtbot.addWidget(window)
 
     assert window._jammer_on_button.isEnabled() is False
-    assert window._jammer_attenuation_spin.isEnabled() is True
     window._on_status("USRP stream started")
-    assert worker.rf_events[:2] == [
-        (
-            "attenuation_db",
-            {
-                "attenuation_db": 50.0,
-                "notes": (
-                    "Automatically recorded GUI configured attenuation; "
-                    "this is not a measured RF power"
-                ),
-            },
-        ),
-        (
-            "bladeRF_gain_db",
-            {
-                "bladeRF_gain_db": 50.0,
-                "notes": (
-                    "Automatically recorded GUI selected bladeRF software gain; "
-                    "the GUI does not query or command an external bladeRF process"
-                ),
-            },
-        ),
-    ]
-    window._jammer_attenuation_spin.setValue(50.0)
-    window._bladerf_gain_spin.setValue(50.0)
+    assert worker.rf_events == []
     window._jammer_on_button.click()
 
-    assert worker.rf_events[-1] == (
-        "jammer_on",
-        {"attenuation_db": 50.0, "bladeRF_gain_db": 50.0},
-    )
+    assert worker.rf_events[-1] == ("jammer_on", {})
     assert "jammer ON" in _plain_text(window._rf_event_status_label)
-
-    window._jammer_attenuation_spin.setValue(40.0)
-    window._record_rf_setting("attenuation_db")
-    assert worker.rf_events[-1] == ("attenuation_db", {"attenuation_db": 40.0})
 
 
 def test_gui_metrics_timer_clamps_aggressive_ui_interval(qtbot) -> None:
@@ -601,22 +614,22 @@ def test_gnss_operator_widgets_have_independent_display_throttles(qtbot, monkeyp
                 "pvt_current": False,
                 "receiver_time_s": receiver_time_s,
                 "prns": [
-                    {
-                        "prn": prn,
-                        "state": "tracking",
-                        "cno_db_hz": cno,
-                        "cno_stable": True,
-                        "used_in_fix": False,
-                    }
+                    _sat(
+                        prn,
+                        state="tracking",
+                        cno_db_hz=cno,
+                        cno_stable=True,
+                        used_in_fix=False,
+                    )
                 ],
                 "sky_prns": [
-                    {
-                        "prn": prn,
-                        "state": "tracking",
-                        "az_deg": az_deg,
-                        "el_deg": 45.0,
-                        "used_in_fix": False,
-                    }
+                    _sat(
+                        prn,
+                        state="tracking",
+                        az_deg=az_deg,
+                        el_deg=45.0,
+                        used_in_fix=False,
+                    )
                 ],
             }
         }
@@ -769,8 +782,8 @@ def test_gui_lcmv_test_toggle_defaults_off_and_updates_runtime(qtbot) -> None:
     assert _plain_text(window._lcmv_test_status_label) == (
         "LCMV Test Nulling: OFF: Uniform beamformer"
     )
-    assert _plain_text(window._lcmv_null_bearing_label) == (
-        "Null bearing / MUSIC peak: --"
+    assert _plain_text(window._lcmv_music_candidate_label) == (
+        "MUSIC guard candidate (not null bearing): --"
     )
 
     window._lcmv_test_checkbox.setChecked(True)
@@ -804,7 +817,7 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
     )
     assert "ARMED: Uniform output" in _plain_text(window._lcmv_test_status_label)
     assert "not applied (armed uniform)" in _plain_text(
-        window._lcmv_null_bearing_label
+        window._lcmv_music_candidate_label
     )
 
     window._refresh_lcmv_test_status(
@@ -812,7 +825,7 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
             "lcmv_test": {
                 "enabled": True,
                 "mode": "on",
-                "active_lcmv_method": "covariance_lcmv_ideal",
+                "active_lcmv_method": "covariance_lcmv_measured_u1",
                 "weight_transition_active": True,
                 "weight_transition_progress": 0.5,
                 "spatial_vector_diagnostics": {
@@ -822,6 +835,9 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
         }
     )
     assert "ACTIVATING: Smooth weight transition 50%" in _plain_text(
+        window._lcmv_test_status_label
+    )
+    assert "interference-evidence gate latched" in _plain_text(
         window._lcmv_test_status_label
     )
 
@@ -836,7 +852,7 @@ def test_gui_labels_jammer_excess_suppression_separately_from_total_output(qtbot
             "lcmv_test": {
                 "enabled": True,
                 "mode": "on",
-                "null_bearing_deg": 145.0,
+                "music_bearing_deg": 145.0,
                 "weight_transition_active": True,
                 "spatial_vector_diagnostics": {
                     "lcmv_jammer_detected_latched": True,
@@ -852,7 +868,7 @@ def test_gui_labels_jammer_excess_suppression_separately_from_total_output(qtbot
         }
     )
 
-    text = _plain_text(window._lcmv_null_bearing_label)
+    text = _plain_text(window._lcmv_music_candidate_label)
     assert "jammer-excess suppression 12.2 dB applied / 31.8 dB target" in text
     assert "total out reduction 7.5 dB (wanted included)" in text
 
@@ -1069,7 +1085,7 @@ def test_gui_keeps_gnss_sdr_runtime_status_in_main_view(qtbot) -> None:
         {
             "gnss_snapshot": {
                 "tracking_count": 2,
-                "tracking_prns": [5, 9],
+                "tracking_satellites": ["G05", "G09"],
                 "acquired_count": 0,
                 "pvt_output_seen": True,
                 "pvt_current": True,
@@ -1082,8 +1098,8 @@ def test_gui_keeps_gnss_sdr_runtime_status_in_main_view(qtbot) -> None:
                 "udp_parse_errors": 0,
                 "avg_tracking_cno_db_hz": 38.25,
                 "prns": [
-                    {"channel": 0, "prn": 5, "state": "tracking"},
-                    {"channel": 1, "prn": 9, "state": "tracking"},
+                    _sat(5, channel=0, state="tracking"),
+                    _sat(9, channel=1, state="tracking"),
                 ],
             }
         }
@@ -1199,86 +1215,76 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
                 "pvt_output_seen": True,
                 "pvt_current": True,
                 "prns": [
-                    {
-                        "prn": 5,
-                        "state": "tracking",
-                        "cno_db_hz": 42.4,
-                        "cno_smoothed_db_hz": 42.0,
-                        "cno_sample_count": 20,
-                        "cno_stdev_db": 0.4,
-                        "cno_peak_to_peak_db": 1.0,
-                        "cno_stable_window_count": 3,
-                        "cno_stable": True,
-                    },
-                    {"prn": 7, "state": "acquired", "cno_db_hz": 31.5},
-                    {
-                        "prn": 9,
-                        "state": "tracking",
-                        "cno_db_hz": 36.4,
-                        "cno_smoothed_db_hz": 36.0,
-                        "cno_sample_count": 20,
-                        "cno_stdev_db": 0.5,
-                        "cno_peak_to_peak_db": 1.2,
-                        "cno_stable_window_count": 3,
-                        "cno_stable": True,
-                        "used_in_fix": True,
-                    },
-                    {
-                        "prn": 12,
-                        "state": "tracking",
-                        "cno_db_hz": 34.0,
-                        "cno_smoothed_db_hz": 34.0,
-                        "cno_sample_count": 2,
-                        "cno_stdev_db": 0.2,
-                        "cno_peak_to_peak_db": 0.4,
-                        "cno_stable": False,
-                        "cno_unstable_reason": "too_few_samples",
-                    },
-                    {
-                        "prn": 13,
-                        "state": "tracking",
-                        "cno_db_hz": 34.5,
-                        "cno_smoothed_db_hz": 34.0,
-                        "cno_sample_count": 20,
-                        "cno_stdev_db": 1.2,
-                        "cno_peak_to_peak_db": 2.0,
-                        "cno_stable": False,
-                        "cno_unstable_reason": "high_variance",
-                    },
-                    {
-                        "prn": 14,
-                        "state": "tracking",
-                        "cno_db_hz": 39.0,
-                        "cno_smoothed_db_hz": 39.0,
-                        "cno_sample_count": 20,
-                        "cno_stdev_db": 0.2,
-                        "cno_peak_to_peak_db": 0.5,
-                        "cno_stable": False,
-                        "cno_unstable_reason": "awaiting_nav",
-                        "cno_history_stable": True,
-                    },
+                    _sat(
+                        5,
+                        state="tracking",
+                        cno_db_hz=42.4,
+                        cno_smoothed_db_hz=42.0,
+                        cno_sample_count=20,
+                        cno_stdev_db=0.4,
+                        cno_peak_to_peak_db=1.0,
+                        cno_stable_window_count=3,
+                        cno_stable=True,
+                    ),
+                    _sat(7, state="acquired", cno_db_hz=31.5),
+                    _sat(
+                        9,
+                        state="tracking",
+                        cno_db_hz=36.4,
+                        cno_smoothed_db_hz=36.0,
+                        cno_sample_count=20,
+                        cno_stdev_db=0.5,
+                        cno_peak_to_peak_db=1.2,
+                        cno_stable_window_count=3,
+                        cno_stable=True,
+                        used_in_fix=True,
+                    ),
+                    _sat(
+                        12,
+                        state="tracking",
+                        cno_db_hz=34.0,
+                        cno_smoothed_db_hz=34.0,
+                        cno_sample_count=2,
+                        cno_stdev_db=0.2,
+                        cno_peak_to_peak_db=0.4,
+                        cno_stable=False,
+                        cno_unstable_reason="too_few_samples",
+                    ),
+                    _sat(
+                        13,
+                        state="tracking",
+                        cno_db_hz=34.5,
+                        cno_smoothed_db_hz=34.0,
+                        cno_sample_count=20,
+                        cno_stdev_db=1.2,
+                        cno_peak_to_peak_db=2.0,
+                        cno_stable=False,
+                        cno_unstable_reason="high_variance",
+                    ),
+                    _sat(
+                        14,
+                        state="tracking",
+                        cno_db_hz=39.0,
+                        cno_smoothed_db_hz=39.0,
+                        cno_sample_count=20,
+                        cno_stdev_db=0.2,
+                        cno_peak_to_peak_db=0.5,
+                        cno_stable=False,
+                        cno_unstable_reason="awaiting_nav",
+                        cno_history_stable=True,
+                    ),
                 ],
                 "sky_prns": [
-                    {
-                        "prn": 5,
-                        "state": "tracking",
-                        "az_deg": 45.0,
-                        "el_deg": 50.0,
-                    },
-                    {"prn": 7, "state": "acquired", "az_deg": 180.0, "el_deg": 20.0},
-                    {
-                        "prn": 13,
-                        "state": "tracking",
-                        "az_deg": 20.0,
-                        "el_deg": 45.0,
-                    },
-                    {
-                        "prn": 9,
-                        "state": "tracking",
-                        "az_deg": 270.0,
-                        "el_deg": 35.0,
-                        "used_in_fix": True,
-                    },
+                    _sat(5, state="tracking", az_deg=45.0, el_deg=50.0),
+                    _sat(7, state="acquired", az_deg=180.0, el_deg=20.0),
+                    _sat(13, state="tracking", az_deg=20.0, el_deg=45.0),
+                    _sat(
+                        9,
+                        state="tracking",
+                        az_deg=270.0,
+                        el_deg=35.0,
+                        used_in_fix=True,
+                    ),
                 ],
             }
         }
@@ -1381,15 +1387,15 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     window._on_data_ready(
         {
             "gnss_snapshot": {
-                "prns": [],
-                "sky_prns": [
-                    {
-                        "prn": 11,
-                        "state": "visible",
-                        "az_deg": 10.0,
-                        "el_deg": 30.0,
-                        "snr_db_hz": 37.0,
-                    },
+                    "prns": [],
+                    "sky_prns": [
+                        _sat(
+                            11,
+                            state="visible",
+                            az_deg=10.0,
+                            el_deg=30.0,
+                            snr_db_hz=37.0,
+                        ),
                 ],
             }
         }
@@ -1403,10 +1409,10 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     window._on_data_ready(
         {
             "gnss_snapshot": {
-                "prns": [
-                    {"prn": 1, "state": "searched"},
-                    {"prn": 2, "state": "assigned"},
-                    {"prn": 3, "state": "lost"},
+                    "prns": [
+                        _sat(1, state="searched"),
+                        _sat(2, state="assigned"),
+                        _sat(3, state="lost"),
                 ],
             }
         }
@@ -1419,8 +1425,8 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     window._on_data_ready(
         {
             "gnss_snapshot": {
-                "prns": [
-                    {"prn": 14, "state": "acquired"},
+                    "prns": [
+                        _sat(14, state="acquired"),
                 ],
             }
         }
@@ -1434,26 +1440,21 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     window._on_data_ready(
         {
             "gnss_snapshot": {
-                "prns": [
-                    {"prn": 2, "state": "searched"},
-                    {"prn": 3, "state": "assigned"},
-                    {
-                        "prn": 8,
-                        "state": "tracking",
-                        "cno_smoothed_db_hz": 33.0,
-                        "cno_sample_count": 20,
-                        "cno_stable_window_count": 3,
-                        "cno_stable": True,
-                    },
-                    {"prn": 9, "state": "acquired"},
-                ],
-                "sky_prns": [
-                    {
-                        "prn": 12,
-                        "state": "visible",
-                        "az_deg": 25.0,
-                        "el_deg": 45.0,
-                    },
+                    "prns": [
+                        _sat(2, state="searched"),
+                        _sat(3, state="assigned"),
+                        _sat(
+                            8,
+                            state="tracking",
+                            cno_smoothed_db_hz=33.0,
+                            cno_sample_count=20,
+                            cno_stable_window_count=3,
+                            cno_stable=True,
+                        ),
+                        _sat(9, state="acquired"),
+                    ],
+                    "sky_prns": [
+                        _sat(12, state="visible", az_deg=25.0, el_deg=45.0),
                 ],
             }
         }
@@ -1470,8 +1471,8 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     window._on_data_ready(
         {
             "gnss_snapshot": {
-                "acquired_prns": [14],
-                "tracking_prns": [21],
+                "acquired_satellites": ["G14"],
+                "tracking_satellites": ["G21"],
             }
         }
     )
@@ -1485,19 +1486,19 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
     window._on_data_ready(
         {
             "gnss_snapshot": {
-                "prns": [
-                    {"prn": 8, "state": "assigned"},
-                    {
-                        "prn": 9,
-                        "state": "tracking",
-                        "cno_db_hz": 35.6,
-                        "cno_smoothed_db_hz": 35.0,
-                        "cno_sample_count": 20,
-                        "cno_stable_window_count": 3,
-                        "cno_stable": True,
-                    },
-                    {"prn": 10, "state": "lost"},
-                    {"prn": 11, "state": "acquired", "used_in_fix": True},
+                    "prns": [
+                        _sat(8, state="assigned"),
+                        _sat(
+                            9,
+                            state="tracking",
+                            cno_db_hz=35.6,
+                            cno_smoothed_db_hz=35.0,
+                            cno_sample_count=20,
+                            cno_stable_window_count=3,
+                            cno_stable=True,
+                        ),
+                        _sat(10, state="lost"),
+                        _sat(11, state="acquired", used_in_fix=True),
                 ],
             }
         }
@@ -1511,18 +1512,18 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
 
     window._on_data_ready(
         {
-            "gnss_snapshot": {
-                "prns": [
-                    {
-                        "prn": prn,
-                        "state": "tracking",
-                        "cno_db_hz": 31.0 + prn,
-                        "cno_smoothed_db_hz": 30.0 + prn,
-                        "cno_sample_count": 20,
-                        "cno_stable_window_count": 3,
-                        "cno_stable": True,
-                    }
-                    for prn in range(1, 11)
+                "gnss_snapshot": {
+                    "prns": [
+                        _sat(
+                            prn,
+                            state="tracking",
+                            cno_db_hz=31.0 + prn,
+                            cno_smoothed_db_hz=30.0 + prn,
+                            cno_sample_count=20,
+                            cno_stable_window_count=3,
+                            cno_stable=True,
+                        )
+                        for prn in range(1, 11)
                 ],
             }
         }
@@ -1540,15 +1541,15 @@ def test_realtime_gui_shows_prn_monitor_and_skyplot(qtbot) -> None:
         {
             "gnss_snapshot": {
                 "prns": [
-                    {
-                        "prn": 4,
-                        "state": "tracking",
-                        "cno_db_hz": 37.8,
-                        "cno_smoothed_db_hz": 37.0,
-                        "cno_sample_count": 20,
-                        "cno_stable_window_count": 3,
-                        "cno_stable": True,
-                    },
+                    _sat(
+                        4,
+                        state="tracking",
+                        cno_db_hz=37.8,
+                        cno_smoothed_db_hz=37.0,
+                        cno_sample_count=20,
+                        cno_stable_window_count=3,
+                        cno_stable=True,
+                    ),
                 ],
             }
         }
@@ -1580,23 +1581,23 @@ def test_receiver_projection_prevents_skyplot_tracking_contradictions(qtbot) -> 
                 "pvt_current": False,
                 "accuracy": {"fix_type": "3D Fix", "three_d_error_m": 0.8},
                 "prns": [
-                    {
-                        "prn": 12,
-                        "state": "tracking",
-                        "cno_db_hz": 39.0,
-                        "cno_stable": False,
-                        "cno_unstable_reason": "high_variance",
-                        "used_in_fix": True,
-                    }
+                    _sat(
+                        12,
+                        state="tracking",
+                        cno_db_hz=39.0,
+                        cno_stable=False,
+                        cno_unstable_reason="high_variance",
+                        used_in_fix=True,
+                    )
                 ],
                 "sky_prns": [
-                    {
-                        "prn": 12,
-                        "state": "tracking",
-                        "az_deg": 120.0,
-                        "el_deg": 40.0,
-                        "used_in_fix": True,
-                    }
+                    _sat(
+                        12,
+                        state="tracking",
+                        az_deg=120.0,
+                        el_deg=40.0,
+                        used_in_fix=True,
+                    )
                 ],
             }
         }
@@ -1625,21 +1626,14 @@ def test_prn_chart_keeps_gps_and_beidou_with_same_prn_number(qtbot) -> None:
                 "pvt_output_seen": True,
                 "pvt_current": True,
                 "prns": [
-                    {
-                        "prn": 5,
-                        "state": "tracking",
-                        "satellite_id": "G05",
-                        "cno_db_hz": 41.2,
-                        "cno_stable": True,
-                    },
-                    {
-                        "prn": 5,
-                        "constellation": "beidou",
-                        "satellite_id": "C05",
-                        "state": "tracking",
-                        "cno_db_hz": 38.7,
-                        "cno_stable": True,
-                    },
+                    _sat(5, state="tracking", cno_db_hz=41.2, cno_stable=True),
+                    _sat(
+                        5,
+                        constellation="beidou",
+                        state="tracking",
+                        cno_db_hz=38.7,
+                        cno_stable=True,
+                    ),
                 ],
                 "sky_prns": [],
             }
@@ -1669,31 +1663,26 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
                     "three_d_error_m": 1.4,
                 },
                 "prns": [
-                    {
-                        "prn": 5,
-                        "state": "tracking",
-                        "cno_db_hz": 41.2,
-                        "cno_stable": True,
-                    },
-                    {
-                        "prn": 9,
-                        "state": "tracking",
-                        "cno_db_hz": 20.0,
-                        "cno_stable": False,
-                        "cno_unstable_reason": "low_cno",
-                        "used_in_fix": True,
-                    },
+                    _sat(5, state="tracking", cno_db_hz=41.2, cno_stable=True),
+                    _sat(
+                        9,
+                        state="tracking",
+                        cno_db_hz=20.0,
+                        cno_stable=False,
+                        cno_unstable_reason="low_cno",
+                        used_in_fix=True,
+                    ),
                 ],
                 "sky_prns": [
-                    {"prn": 5, "state": "tracking", "az_deg": 20.0, "el_deg": 55.0},
-                    {
-                        "prn": 9,
-                        "state": "tracking",
-                        "az_deg": 200.0,
-                        "el_deg": 35.0,
-                        "used_in_fix": True,
-                    },
-                    {"prn": 11, "state": "visible", "az_deg": 80.0, "el_deg": 25.0},
+                    _sat(5, state="tracking", az_deg=20.0, el_deg=55.0),
+                    _sat(
+                        9,
+                        state="tracking",
+                        az_deg=200.0,
+                        el_deg=35.0,
+                        used_in_fix=True,
+                    ),
+                    _sat(11, state="visible", az_deg=80.0, el_deg=25.0),
                 ],
             }
         }
@@ -1718,30 +1707,25 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
                 "pvt_current": False,
                 "accuracy": {"fix_type": "3D Fix", "three_d_error_m": 1.4},
                 "prns": [
-                    {
-                        "prn": 5,
-                        "state": "tracking",
-                        "cno_db_hz": 41.2,
-                        "cno_stable": True,
-                    },
-                    {
-                        "prn": 9,
-                        "state": "tracking",
-                        "cno_db_hz": 20.0,
-                        "cno_stable": False,
-                        "cno_unstable_reason": "low_cno",
-                        "used_in_fix": True,
-                    },
+                    _sat(5, state="tracking", cno_db_hz=41.2, cno_stable=True),
+                    _sat(
+                        9,
+                        state="tracking",
+                        cno_db_hz=20.0,
+                        cno_stable=False,
+                        cno_unstable_reason="low_cno",
+                        used_in_fix=True,
+                    ),
                 ],
                 "sky_prns": [
-                    {"prn": 5, "state": "tracking", "az_deg": 20.0, "el_deg": 55.0},
-                    {
-                        "prn": 9,
-                        "state": "tracking",
-                        "az_deg": 200.0,
-                        "el_deg": 35.0,
-                        "used_in_fix": True,
-                    },
+                    _sat(5, state="tracking", az_deg=20.0, el_deg=55.0),
+                    _sat(
+                        9,
+                        state="tracking",
+                        az_deg=200.0,
+                        el_deg=35.0,
+                        used_in_fix=True,
+                    ),
                 ],
             }
         }
@@ -1775,15 +1759,10 @@ def test_receiver_projection_clears_operator_state_on_error(qtbot) -> None:
                 "pvt_current": True,
                 "accuracy": {"fix_type": "3D Fix", "three_d_error_m": 1.4},
                 "prns": [
-                    {
-                        "prn": 5,
-                        "state": "tracking",
-                        "cno_db_hz": 41.2,
-                        "cno_stable": True,
-                    }
+                    _sat(5, state="tracking", cno_db_hz=41.2, cno_stable=True)
                 ],
                 "sky_prns": [
-                    {"prn": 5, "state": "tracking", "az_deg": 20.0, "el_deg": 55.0},
+                    _sat(5, state="tracking", az_deg=20.0, el_deg=55.0),
                 ],
             }
         }
@@ -1811,23 +1790,23 @@ def test_receiver_projection_clears_stable_prn_during_tracking_monitor_gap(qtbot
             "pvt_output_seen": True,
             "pvt_current": True,
             "prns": [
-                {
-                    "prn": 9,
-                    "state": "tracking",
-                    "cno_db_hz": 38.6,
-                    "carrier_lock_test": 0.95,
-                    "cno_stable": True,
-                    "used_in_fix": True,
-                }
+                _sat(
+                    9,
+                    state="tracking",
+                    cno_db_hz=38.6,
+                    carrier_lock_test=0.95,
+                    cno_stable=True,
+                    used_in_fix=True,
+                )
             ],
             "sky_prns": [
-                {
-                    "prn": 9,
-                    "state": "tracking",
-                    "az_deg": 270.0,
-                    "el_deg": 35.0,
-                    "used_in_fix": True,
-                }
+                _sat(
+                    9,
+                    state="tracking",
+                    az_deg=270.0,
+                    el_deg=35.0,
+                    used_in_fix=True,
+                )
             ],
         }
     }
@@ -1836,22 +1815,22 @@ def test_receiver_projection_clears_stable_prn_during_tracking_monitor_gap(qtbot
             "pvt_output_seen": True,
             "pvt_current": True,
             "prns": [
-                {
-                    "prn": 9,
-                    "state": "tracking",
-                    "cno_stable": False,
-                    "cno_unstable_reason": "missing_cno",
-                    "used_in_fix": True,
-                }
+                _sat(
+                    9,
+                    state="tracking",
+                    cno_stable=False,
+                    cno_unstable_reason="missing_cno",
+                    used_in_fix=True,
+                )
             ],
             "sky_prns": [
-                {
-                    "prn": 9,
-                    "state": "tracking",
-                    "az_deg": 270.0,
-                    "el_deg": 35.0,
-                    "used_in_fix": True,
-                }
+                _sat(
+                    9,
+                    state="tracking",
+                    az_deg=270.0,
+                    el_deg=35.0,
+                    used_in_fix=True,
+                )
             ],
         }
     }
@@ -1880,16 +1859,16 @@ def test_receiver_projection_does_not_hold_tracked_placeholder(qtbot) -> None:
             "pvt_output_seen": True,
             "pvt_current": True,
             "prns": [
-                {
-                    "prn": 9,
-                    "state": "tracking",
-                    "cno_db_hz": 38.6,
-                    "carrier_lock_test": 0.95,
-                    "cno_stable": True,
-                }
+                _sat(
+                    9,
+                    state="tracking",
+                    cno_db_hz=38.6,
+                    carrier_lock_test=0.95,
+                    cno_stable=True,
+                )
             ],
             "sky_prns": [
-                {"prn": 9, "state": "tracking", "az_deg": 270.0, "el_deg": 35.0}
+                _sat(9, state="tracking", az_deg=270.0, el_deg=35.0)
             ],
         }
     }
@@ -1898,15 +1877,15 @@ def test_receiver_projection_does_not_hold_tracked_placeholder(qtbot) -> None:
             "pvt_output_seen": True,
             "pvt_current": True,
             "prns": [
-                {
-                    "prn": 9,
-                    "state": "tracking",
-                    "cno_stable": False,
-                    "cno_unstable_reason": "missing_cno",
-                }
+                _sat(
+                    9,
+                    state="tracking",
+                    cno_stable=False,
+                    cno_unstable_reason="missing_cno",
+                )
             ],
             "sky_prns": [
-                {"prn": 9, "state": "tracking", "az_deg": 270.0, "el_deg": 35.0}
+                _sat(9, state="tracking", az_deg=270.0, el_deg=35.0)
             ],
         }
     }
@@ -2139,12 +2118,7 @@ def test_gui_uses_gnss_sdr_pvt_observation_count_for_used_count(qtbot) -> None:
                 "pvt_current": True,
                 "pvt_observation_count": 8,
                 "prns": [
-                    {
-                        "prn": 5,
-                        "state": "tracking",
-                        "cno_db_hz": 41.0,
-                        "cno_stable": True,
-                    }
+                    _sat(5, state="tracking", cno_db_hz=41.0, cno_stable=True)
                 ],
                 "sky_prns": [],
             }
@@ -2208,7 +2182,7 @@ def test_gui_shows_doa_and_rx_health(qtbot) -> None:
             "lcmv_test": {
                 "enabled": True,
                 "mode": "on",
-                "null_bearing_deg": expected_bearing,
+                "music_bearing_deg": expected_bearing,
                 "lcmv_response_db": lcmv_response_db,
             },
             "rx_signal_health": {
@@ -2261,6 +2235,9 @@ def test_gui_shows_doa_and_rx_health(qtbot) -> None:
     bearing_scan, order = window._bearing_axis_for_internal_scan(scan)
     assert np.allclose(lcmv_x, bearing_scan)
     assert np.allclose(lcmv_y, lcmv_response_db[order])
+    assert not hasattr(window, "_gnss_fifo_u1_response_curve")
+    assert window._lcmv_response_curve.name() == "Measured-U1 target weights (model)"
+    assert len(window._lcmv_response_plot.listDataItems()) == 1
     assert window._lcmv_response_marker.value() == pytest.approx(expected_bearing)
 
     # The offscreen Qt backend can retain a paint event for pyqtgraph's axes

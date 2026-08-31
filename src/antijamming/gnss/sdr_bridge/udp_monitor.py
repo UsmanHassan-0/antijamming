@@ -32,41 +32,46 @@ class UdpMonitorMixin:
             self._log.info("GNSS-SDR UDP monitors disabled in configuration.")
             return
 
-        for spec in specs:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.settimeout(0.2)
-            try:
-                sock.bind(("127.0.0.1", spec.port))
-            except OSError as exc:
-                sock.close()
-                self._err_log.error(
-                    "Failed binding GNSS-SDR UDP %s monitor on 127.0.0.1:%d: %s",
+        try:
+            for spec in specs:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.settimeout(0.2)
+                try:
+                    sock.bind(("127.0.0.1", spec.port))
+                except OSError as exc:
+                    sock.close()
+                    raise RuntimeError(
+                        "Failed binding required GNSS-SDR UDP "
+                        f"{spec.name} monitor on 127.0.0.1:{spec.port}: {exc}"
+                    ) from exc
+                thread = threading.Thread(
+                    target=self._run_udp_monitor,
+                    name=f"gnss_sdr_udp_{spec.name}",
+                    args=(spec, sock),
+                    daemon=True,
+                )
+                try:
+                    thread.start()
+                except BaseException:
+                    sock.close()
+                    raise
+                self._udp_monitor_sockets.append(sock)
+                self._udp_monitor_threads.append(thread)
+                self._handoff_log.info(
+                    "GNSS-SDR UDP %s monitor listening on 127.0.0.1:%d",
                     spec.name,
                     spec.port,
-                    exc,
                 )
-                continue
-            thread = threading.Thread(
-                target=self._run_udp_monitor,
-                name=f"gnss_sdr_udp_{spec.name}",
-                args=(spec, sock),
-                daemon=True,
-            )
-            try:
-                thread.start()
-            except BaseException:
-                sock.close()
-                raise
-            self._udp_monitor_sockets.append(sock)
-            self._udp_monitor_threads.append(thread)
-            self._handoff_log.info(
-                "GNSS-SDR UDP %s monitor listening on 127.0.0.1:%d",
-                spec.name,
-                spec.port,
-            )
+        except BaseException:
+            # Receiver state, PRN C/N0, and PVT charts consume these sockets.
+            # A partial monitor set is not a healthy bridge and must not leave
+            # earlier sockets/threads behind while startup unwinds.
+            self._monitor_stop.set()
+            self._stop_udp_monitors()
+            raise
 
-    def _stop_udp_monitors(self) -> None:
+    def _stop_udp_monitors(self) -> bool:
         sockets = list(getattr(self, "_udp_monitor_sockets", []))
         self._udp_monitor_sockets.clear()
         for sock in sockets:
@@ -85,6 +90,7 @@ class UdpMonitorMixin:
                 "GNSS-SDR UDP monitor threads did not stop within 1.0 s: %s",
                 ",".join(thread.name for thread in live_threads),
             )
+        return not live_threads
 
     def _udp_monitor_specs(self) -> list[_UdpMonitorSpec]:
         specs: list[_UdpMonitorSpec] = []

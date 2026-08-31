@@ -13,7 +13,6 @@ from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QBoxLayout,
     QCheckBox,
-    QDoubleSpinBox,
     QLabel,
     QMainWindow,
     QPushButton,
@@ -30,8 +29,7 @@ from antijamming.dsp.models import (
     internal_angle_to_operator_bearing_deg,
     operator_bearing_axis_for_internal_scan,
 )
-from antijamming.dsp.phase import load_calibration_correction_selection
-from antijamming.config import REPO_ROOT, StreamConfig
+from antijamming.config import StreamConfig
 from antijamming.gnss.sdr_bridge.constants import PVT_DEGRADED_PDOP_THRESHOLD
 from antijamming.runtime.remote_worker import RemoteStreamWorker
 
@@ -147,13 +145,13 @@ class MainWindow(QMainWindow):
         self._jammer_off_button = QPushButton("Record jammer OFF")
         self._bladerf_on_button = QPushButton("Record bladeRF ON")
         self._bladerf_off_button = QPushButton("Record bladeRF OFF")
-        self._jammer_attenuation_spin = QDoubleSpinBox()
-        self._bladerf_gain_spin = QDoubleSpinBox()
         self._operator_jammer_state = "UNKNOWN"
         self._operator_bladerf_state = "UNKNOWN"
         self._rf_event_control = self._build_rf_event_control()
         self._lcmv_test_status_label = QLabel("LCMV Test Nulling: OFF")
-        self._lcmv_null_bearing_label = QLabel("Null bearing / MUSIC peak: --")
+        self._lcmv_music_candidate_label = QLabel(
+            "MUSIC guard candidate (not null bearing): --"
+        )
         self._stream_status_text = "Idle"
         self._receiver_fix_text = "Not available"
         self._tracking_prn_count = 0
@@ -251,7 +249,6 @@ class MainWindow(QMainWindow):
         self._configure_expected_sources_control()
         self._configure_lcmv_test_control()
 
-        self._load_configured_phase_calibration()
         layout.addWidget(self._build_main_view(), stretch=1)
 
         self.setCentralWidget(root)
@@ -507,7 +504,7 @@ class MainWindow(QMainWindow):
             self._rf_event_control,
             self._rf_event_status_label,
             self._lcmv_test_status_label,
-            self._lcmv_null_bearing_label,
+            self._lcmv_music_candidate_label,
             self._music_sources_label,
             self._doa_status_label,
             self._rx_clipping_label,
@@ -553,11 +550,13 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
 
     def _build_realtime_algorithm_plots(self) -> QWidget:
-        self._lcmv_response_plot, self._lcmv_response_curve, self._lcmv_response_marker = (
-            build_lcmv_response_plot(
-                doa_min_deg=float(self._cfg.doa_min_deg),
-                doa_max_deg=float(self._cfg.doa_max_deg),
-            )
+        (
+            self._lcmv_response_plot,
+            self._lcmv_response_curve,
+            self._lcmv_response_marker,
+        ) = build_lcmv_response_plot(
+            doa_min_deg=float(self._cfg.doa_min_deg),
+            doa_max_deg=float(self._cfg.doa_max_deg),
         )
         (
             doa_polar_db_plot,
@@ -992,12 +991,6 @@ class MainWindow(QMainWindow):
             self._bladerf_off_button,
         ):
             button.setEnabled(rf_markers_enabled)
-        # Settings can be selected before Start. They are logged automatically
-        # when the new stream reports started; editing while running records a
-        # new setting event. These widgets record settings, not measured power.
-        rf_settings_enabled = state != "stopping"
-        self._jammer_attenuation_spin.setEnabled(rf_settings_enabled)
-        self._bladerf_gain_spin.setEnabled(rf_settings_enabled)
         if state in {"idle", "error"}:
             self._clear_gnss_operator_state()
             self._clear_antijam_operator_state()
@@ -1055,7 +1048,7 @@ class MainWindow(QMainWindow):
         return container
 
     def _build_rf_event_control(self) -> QWidget:
-        """Build operator-declared physical-state markers and RF settings."""
+        """Build operator-declared physical-state markers."""
 
         container = QWidget()
         container.setObjectName("rfEventMarkerControl")
@@ -1064,37 +1057,6 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(*ZERO_MARGINS)
         layout.setSpacing(COMPACT_SPACING)
-
-        settings_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
-        jammer_label = QLabel("Configured jammer attenuation (dB)")
-        self._jammer_attenuation_spin.setRange(0.0, 90.0)
-        self._jammer_attenuation_spin.setDecimals(1)
-        self._jammer_attenuation_spin.setSingleStep(1.0)
-        self._jammer_attenuation_spin.setValue(50.0)
-        self._jammer_attenuation_spin.setAccessibleName("Jammer attenuation dB")
-        self._jammer_attenuation_spin.setEnabled(False)
-        self._jammer_attenuation_spin.editingFinished.connect(
-            lambda: self._record_rf_setting("attenuation_db")
-        )
-        bladerf_label = QLabel("Declared bladeRF SW gain (dB)")
-        self._bladerf_gain_spin.setRange(-23.75, 66.0)
-        self._bladerf_gain_spin.setDecimals(2)
-        self._bladerf_gain_spin.setSingleStep(1.0)
-        self._bladerf_gain_spin.setValue(50.0)
-        self._bladerf_gain_spin.setAccessibleName("bladeRF software gain dB")
-        self._bladerf_gain_spin.setEnabled(False)
-        self._bladerf_gain_spin.editingFinished.connect(
-            lambda: self._record_rf_setting("bladeRF_gain_db")
-        )
-        for widget in (
-            jammer_label,
-            self._jammer_attenuation_spin,
-            bladerf_label,
-            self._bladerf_gain_spin,
-        ):
-            settings_row.addWidget(widget)
-        settings_row.addStretch(1)
-        layout.addLayout(settings_row)
 
         button_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
         button_row.setSpacing(COMPACT_SPACING)
@@ -1165,11 +1127,7 @@ class MainWindow(QMainWindow):
         if not callable(setter):
             self._log.error("RF event marker is unavailable: %s", marker)
             return
-        setter(
-            marker,
-            attenuation_db=float(self._jammer_attenuation_spin.value()),
-            bladeRF_gain_db=float(self._bladerf_gain_spin.value()),
-        )
+        setter(marker)
         if marker == "jammer_on":
             self._operator_jammer_state = "ON"
         elif marker == "jammer_off":
@@ -1184,55 +1142,6 @@ class MainWindow(QMainWindow):
             f"bladeRF {self._operator_bladerf_state}"
         )
         self._log.info("UI action: physical_rf_event=%s", marker)
-
-    def _record_rf_setting(self, event: str) -> None:
-        if self._stream_status_state not in {"running", "degraded"}:
-            return
-        setter = getattr(self._worker, "mark_rf_event", None)
-        if not callable(setter):
-            return
-        kwargs: dict[str, float] = {}
-        if event == "attenuation_db":
-            kwargs["attenuation_db"] = float(self._jammer_attenuation_spin.value())
-        elif event == "bladeRF_gain_db":
-            kwargs["bladeRF_gain_db"] = float(self._bladerf_gain_spin.value())
-        setter(event, **kwargs)
-        self._log.info("UI action: physical_rf_setting=%s values=%s", event, kwargs)
-
-    def _replay_known_rf_state_for_new_run(self) -> None:
-        """Record selected RF settings and seed the last declared state."""
-
-        setter = getattr(self._worker, "mark_rf_event", None)
-        if not callable(setter):
-            return
-        setter(
-            "attenuation_db",
-            attenuation_db=float(self._jammer_attenuation_spin.value()),
-            notes=(
-                "Automatically recorded GUI configured attenuation; "
-                "this is not a measured RF power"
-            ),
-        )
-        setter(
-            "bladeRF_gain_db",
-            bladeRF_gain_db=float(self._bladerf_gain_spin.value()),
-            notes=(
-                "Automatically recorded GUI selected bladeRF software gain; "
-                "the GUI does not query or command an external bladeRF process"
-            ),
-        )
-        for device, state in (
-            ("jammer", self._operator_jammer_state),
-            ("bladeRF", self._operator_bladerf_state),
-        ):
-            if state not in {"ON", "OFF"}:
-                continue
-            setter(
-                f"{device}_{state.lower()}",
-                attenuation_db=float(self._jammer_attenuation_spin.value()),
-                bladeRF_gain_db=float(self._bladerf_gain_spin.value()),
-                notes="GUI reasserted last explicit physical state after stream restart",
-            )
 
     def _configured_feed_label(self) -> str:
         if not bool(self._cfg.gnss_sdr_enable):
@@ -1329,39 +1238,6 @@ class MainWindow(QMainWindow):
         configured_ms = int(round(max(0.0, float(self._cfg.ui_update_interval_s)) * 1000.0))
         return max(_OPERATOR_UI_REFRESH_MIN_MS, configured_ms)
 
-    def _load_configured_phase_calibration(self) -> None:
-        path = self._cfg.phase_calibration_file
-        if path is None:
-            return
-        resolved = Path(path).expanduser()
-        if not resolved.is_absolute():
-            resolved = (REPO_ROOT / resolved).resolve()
-        if not resolved.exists():
-            self._log.warning("Configured phase correction file does not exist: %s", resolved)
-            return
-        try:
-            selection = load_calibration_correction_selection(
-                resolved,
-                mode=str(self._cfg.calibration_correction_mode),
-                expected_channel_count=len(self._cfg.channels),
-            )
-        except Exception as exc:
-            self._log.warning("Could not load configured phase correction %s: %s", resolved, exc)
-        else:
-            self._cfg.phase_calibration_file = resolved
-            self._cfg.phase_correction_vector = tuple(complex(v) for v in selection.vector)
-            self._cfg.calibration_correction_mode = selection.configured_mode
-            self._cfg.calibration_correction_metadata = selection.metadata(
-                expected_channel_count=len(self._cfg.channels)
-            )
-            if selection.fallback_used:
-                self._log.warning(
-                    "Calibration correction fallback: configured=%s applied=%s reason=%s",
-                    selection.configured_mode,
-                    selection.applied_mode,
-                    selection.fallback_reason,
-                )
-
     def _stop_worker(self) -> None:
         self._set_status_state("stopping", "Stopping")
         self.statusBar().showMessage("Stopping stream...", 2000)
@@ -1394,8 +1270,6 @@ class MainWindow(QMainWindow):
             self._set_status_state("degraded", message)
         elif "started" in lower:
             self._set_status_state("running", "Streaming")
-            if lower.strip() == "usrp stream started":
-                self._replay_known_rf_state_for_new_run()
         elif (
             "preparing" in lower
             or "initializing" in lower
@@ -1658,34 +1532,42 @@ class MainWindow(QMainWindow):
         status = metrics.get("lcmv_test", {}) if isinstance(metrics, dict) else {}
         if not isinstance(status, dict):
             status = {}
-        response = self._finite_vector(status.get("lcmv_response_db"))
-        if response.size > 1:
+        response_curves = (
+            (self._lcmv_response_curve, status.get("lcmv_response_db")),
+        )
+        finite_responses: list[np.ndarray] = []
+        for curve, raw_response in response_curves:
+            response = self._finite_vector(raw_response)
+            if response.size <= 1:
+                curve.setData([], [])
+                continue
             scan = self._scan_angles_for_size(response.size)
             bearing_scan, order = self._bearing_axis_for_internal_scan(scan)
             ordered_response = response[order]
-            self._lcmv_response_curve.setData(bearing_scan, ordered_response)
+            curve.setData(bearing_scan, ordered_response)
             finite = ordered_response[np.isfinite(ordered_response)]
             if finite.size:
-                y_min = float(np.min(finite))
-                y_max = float(np.max(finite))
-                if y_max <= y_min:
-                    y_max = y_min + 1.0
-                margin = max(1.0, 0.08 * (y_max - y_min))
-                self._lcmv_response_plot.setYRange(
-                    y_min - margin,
-                    y_max + margin,
-                    padding=0.0,
-                )
-                self._lcmv_response_plot.setLimits(
-                    yMin=y_min - margin,
-                    yMax=y_max + margin,
-                )
-        else:
-            self._lcmv_response_curve.setData([], [])
+                finite_responses.append(finite)
+        if finite_responses:
+            finite_all = np.concatenate(finite_responses)
+            y_min = float(np.min(finite_all))
+            y_max = float(np.max(finite_all))
+            if y_max <= y_min:
+                y_max = y_min + 1.0
+            margin = max(1.0, 0.08 * (y_max - y_min))
+            self._lcmv_response_plot.setYRange(
+                y_min - margin,
+                y_max + margin,
+                padding=0.0,
+            )
+            self._lcmv_response_plot.setLimits(
+                yMin=y_min - margin,
+                yMax=y_max + margin,
+            )
 
-        null_bearing = valid_float(status.get("null_bearing_deg"))
         music_bearing = valid_float(status.get("music_bearing_deg"))
-        bearing = null_bearing if null_bearing is not None else music_bearing
+        bearing = music_bearing
+        self._lcmv_response_marker.setVisible(bearing is not None)
         if bearing is not None:
             self._lcmv_response_marker.setValue(float(bearing) % 360.0)
 
@@ -1984,20 +1866,13 @@ class MainWindow(QMainWindow):
         self,
         metrics: dict | None,
         key: str,
-        *aliases: str,
     ) -> object:
         if not isinstance(metrics, dict):
             metrics = {}
         nested = metrics.get("source_count")
-        keys = (key, *aliases)
         if isinstance(nested, dict):
-            for candidate in keys:
-                if candidate in nested:
-                    return nested.get(candidate)
-        for candidate in keys:
-            if candidate in metrics:
-                return metrics.get(candidate)
-        return None
+            return nested.get(key)
+        return metrics.get(key)
 
     def _format_source_count_estimate(self, value: object) -> str:
         number = valid_float(value)
@@ -2018,16 +1893,8 @@ class MainWindow(QMainWindow):
         configured = self._source_count_metric(metrics, "n_sources")
         if configured is None:
             configured = self._cfg.expected_sources
-        gap = self._source_count_metric(
-            metrics,
-            "source_estimate_gap",
-            "source_est_gap",
-        )
-        effective_rank = self._source_count_metric(
-            metrics,
-            "source_effective_rank",
-            "effective_rank",
-        )
+        gap = self._source_count_metric(metrics, "source_estimate_gap")
+        effective_rank = self._source_count_metric(metrics, "source_effective_rank")
         return (
             f"set {self._format_source_count_estimate(configured)} | "
             f"eig-gap {self._format_source_count_estimate(gap)} | "
@@ -2086,14 +1953,17 @@ class MainWindow(QMainWindow):
             value = "OFF: Uniform beamformer"
             color = INFO
         elif mode == "on":
-            value = "ON: Covariance LCMV null active, jammer latched"
+            value = "ON: Covariance LCMV null active, interference-evidence gate latched"
             if transition_active:
                 progress_text = (
                     f" {100.0 * transition_progress:.0f}%"
                     if transition_progress is not None
                     else ""
                 )
-                value = f"ACTIVATING: Smooth weight transition{progress_text}"
+                value = (
+                    f"ACTIVATING: Smooth weight transition{progress_text}, "
+                    "interference-evidence gate latched"
+                )
             active_method = str(
                 status.get("active_lcmv_method")
                 or status.get("active_lcmv_null_method")
@@ -2128,9 +1998,8 @@ class MainWindow(QMainWindow):
             color,
         )
 
-        null_bearing = valid_float(status.get("null_bearing_deg"))
         music_bearing = valid_float(status.get("music_bearing_deg"))
-        bearing = null_bearing if null_bearing is not None else music_bearing
+        bearing = music_bearing
         if armed:
             bearing = None
         bearing_text = f"{bearing:.1f}°" if bearing is not None else "--"
@@ -2178,8 +2047,8 @@ class MainWindow(QMainWindow):
             if reduction_raw_avg_db is not None:
                 bearing_text = f"{bearing_text} | raw-avg {reduction_raw_avg_db:.1f} dB"
         self._set_status_row(
-            self._lcmv_null_bearing_label,
-            "Null bearing / MUSIC peak",
+            self._lcmv_music_candidate_label,
+            "MUSIC guard candidate (not null bearing)",
             bearing_text,
             color if bearing is not None else INFO,
         )
@@ -2302,16 +2171,14 @@ class MainWindow(QMainWindow):
         snapshot = self._latest_gnss_snapshot
         receiver_time = self._format_receiver_time(snapshot.get("receiver_time_s"))
         tracking_prns = self._format_satellite_list(
-            snapshot.get("tracking_satellites"),
-            snapshot.get("tracking_prns"),
+            snapshot.get("tracking_satellites")
         )
         tracking_channels = self._format_tracking_channels(snapshot.get("prns"))
         pvt_status = self._pvt_output_status(snapshot)
         geometry_count = self._format_count(snapshot.get("sky_geometry_count"))
         used_count = self._format_count(snapshot.get("used_in_fix_count"))
         used_satellites = self._format_satellite_list(
-            snapshot.get("used_in_fix_satellites"),
-            snapshot.get("used_in_fix_prns"),
+            snapshot.get("used_in_fix_satellites")
         )
         used_text = used_count if used_satellites == "--" else f"{used_count} ({used_satellites})"
         observables_count = self._format_count(snapshot.get("valid_observables_count"))
@@ -2352,20 +2219,13 @@ class MainWindow(QMainWindow):
         hours, rem_minutes = divmod(minutes, 60)
         return f"{hours:02d}:{rem_minutes:02d}:{rem_seconds:02d}"
 
-    def _format_satellite_list(self, labels_obj: object, fallback_prns_obj: object = None) -> str:
+    def _format_satellite_list(self, labels_obj: object) -> str:
         labels: list[str] = []
         if isinstance(labels_obj, (list, tuple, set)):
             for raw_label in labels_obj:
                 label = str(raw_label).strip()
                 if label and label != "--":
                     labels.append(label)
-        if not labels and isinstance(fallback_prns_obj, (list, tuple, set)):
-            labels = [
-                f"G{prn:02d}"
-                for raw_prn in fallback_prns_obj
-                for prn in [valid_prn(raw_prn)]
-                if prn is not None
-            ]
         if not labels:
             return "--"
         return ", ".join(labels)

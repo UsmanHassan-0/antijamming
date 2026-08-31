@@ -80,7 +80,10 @@ class HeadlessRuntimeService:
                     "Headless backend did not stop within 15 seconds; "
                     "the service process still owns the live backend."
                 )
-            self._server.close()
+            if not self._server.close():
+                self._loggers.get("errors", self._loggers["app"]).error(
+                    "Headless IPC server retained live accept/session threads at shutdown."
+                )
         return 0
 
     def request_shutdown(self, reason: str) -> None:
@@ -114,35 +117,41 @@ class HeadlessRuntimeService:
             self.request_shutdown(str(arguments.get("reason", "IPC shutdown")))
             return {"accepted": True}
         if normalized == "set_expected_sources":
-            count = int(arguments["count"])
+            count = arguments.get("count")
+            if type(count) is not int:
+                raise ValueError("set_expected_sources requires an integer 'count'")
             self._backend.set_expected_sources(count)
             return {"accepted": True, "count": count}
         if normalized == "set_lcmv_test_enabled":
-            enabled = bool(arguments["enabled"])
+            enabled = arguments.get("enabled")
+            if type(enabled) is not bool:
+                raise ValueError(
+                    "set_lcmv_test_enabled requires a boolean 'enabled'"
+                )
             self._backend.set_lcmv_test_enabled(enabled)
             return {"accepted": True, "enabled": enabled}
         if normalized == "mark_rf_event":
             event = str(arguments["event"])
             result = self._backend.mark_rf_event(
                 event,
-                attenuation_db=self._optional_float(arguments.get("attenuation_db")),
-                bladeRF_gain_db=self._optional_float(arguments.get("bladeRF_gain_db")),
                 notes=str(arguments.get("notes", "")),
                 source=str(arguments.get("source", "gui")),
             )
             return {"accepted": True, "event": result}
         raise ValueError(f"unknown antijamming command: {command!r}")
 
-    @staticmethod
-    def _optional_float(value: Any) -> float | None:
-        if value is None or value == "":
-            return None
-        return float(value)
-
     def _start_backend(self, reason: str) -> bool:
         with self._lifecycle_lock:
             if self._backend.is_running():
                 return False
+            prior_monitor = self._monitor_thread
+            if prior_monitor is not None and prior_monitor.is_alive():
+                # The previous monitor may have observed backend exit but not
+                # yet completed its own state publication. Starting another
+                # run here would let that old waiter attach to the new run.
+                return False
+            if self._monitor_thread is prior_monitor:
+                self._monitor_thread = None
             self._monitor_generation += 1
             generation = self._monitor_generation
             self._loggers["app"].info("Headless backend start requested: %s", reason)
@@ -219,7 +228,7 @@ def parse_args() -> argparse.Namespace:
 def run() -> int:
     args = parse_args()
     cfg = build_runtime_config()
-    loggers = setup_logging(cfg.log_dir)
+    loggers = setup_logging(cfg.log_dir, enabled=cfg.logging_enabled)
     numeric_pools = threadpool_info()
     loggers["app"].info(
         "Headless numeric thread pools limited to %d thread: %s",

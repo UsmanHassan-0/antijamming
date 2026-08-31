@@ -68,8 +68,8 @@ GNSS-SDR.AGNSS_ref_utc_time={agnss_ref_utc_time}
 ; FIFO Signal Source
 ; =============================================================================
 
-; Normal runs render one FIFO. Shared-U1 phase-continuity tests render one
-; synchronized FIFO per pinned PRN, all using the same spatial LCMV solution.
+; The runtime renders one FIFO per dynamic GNSS-SDR channel. Every channel uses
+; the same spatial LCMV solution with a per-tracked-PRN continuity scalar.
 {signal_source_config}
 
 ; Signal conditioner is rendered by the backend so the GNSS-SDR block graph stays explicit
@@ -168,7 +168,7 @@ PVT.iono_model=Broadcast
 PVT.trop_model=Saastamoinen
 ; Logs RTKLIB per-satellite residuals once per second so combined-IQ PVT errors
 ; can be tied to the actual measurements RTKLIB used or rejected.
-PVT.log_rtklib_residuals=true
+PVT.log_rtklib_residuals={pvt_log_rtklib_residuals}
 PVT.rtklib_residual_log_period_ms=1000
 PVT.output_path=./outputs/pvt
 PVT.rinex_output_path=./outputs/pvt

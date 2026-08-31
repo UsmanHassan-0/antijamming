@@ -7,10 +7,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import antijamming.dsp.beamforming as beamforming
+import antijamming.dsp.beamforming.lcmv as lcmv_module
 from antijamming.config import StreamConfig
 from antijamming.dsp.beamforming import (
     apply_beamformer,
-    covariance_lcmv_ideal_null_weights,
     covariance_lcmv_vector_null_weights,
     uniform_weights,
 )
@@ -19,6 +20,9 @@ from antijamming.dsp.models import (
     internal_angle_to_operator_bearing_deg,
 )
 from antijamming.dsp.phase import apply_phase_calibration
+from antijamming.gnss.shared_u1_phase_compensation import (
+    SharedU1PhaseCompensationBank,
+)
 from antijamming.runtime import BackendRuntime
 
 
@@ -40,6 +44,23 @@ def _build_loggers() -> dict[str, logging.Logger]:
         "errors",
     ]
     return {k: logging.getLogger(f"test.bf.{k}") for k in keys}
+
+
+def _install_product_fifo_bank(runtime: BackendRuntime) -> None:
+    cfg = runtime._config
+    source_count = int(cfg.gnss_1c_channel_count)
+    runtime._shared_u1_phase_bank = SharedU1PhaseCompensationBank(
+        source_count=source_count,
+        channel_count=len(cfg.channels),
+        sample_rate_hz=float(cfg.sample_rate),
+        samples_per_chunk=int(cfg.samples_per_chunk),
+        transition_s=float(cfg.gnss_shared_u1_phase_transition_s),
+        max_weight_norm=float(cfg.lcmv_max_weight_norm),
+    )
+    runtime._shared_u1_source_satellites_cache = tuple(
+        None for _ in range(source_count)
+    )
+    runtime._last_shared_u1_phase_status_log_ts = time.monotonic()
 
 
 def _prime_realtime_bladerf_reference(
@@ -81,6 +102,15 @@ def test_uniform_weights_are_raw_sum_coefficients() -> None:
     assert np.isclose(np.sum(weights), 4.0 + 0.0j)
 
 
+def test_ideal_null_solver_is_removed_not_disabled() -> None:
+    assert not hasattr(beamforming, "covariance_lcmv_ideal_null_weights")
+    assert not hasattr(lcmv_module, "covariance_lcmv_ideal_null_weights")
+    runtime = BackendRuntime(StreamConfig(), _build_loggers())
+    manifest = runtime._lcmv_runtime_manifest()
+    assert manifest["configured_common_lcmv_method"] == "covariance_lcmv_measured_u1"
+    assert manifest["candidate_methods"] == ["covariance_lcmv_measured_u1"]
+
+
 def test_uniform_combiner_outputs_single_stream() -> None:
     rng = np.random.default_rng(7)
     x = (
@@ -103,8 +133,6 @@ def test_uniform_combiner_rejects_wrong_weight_count() -> None:
 
 def test_dynamic_phase_source_mapping_ignores_stale_latest_by_prn_entry() -> None:
     cfg = StreamConfig(
-        gnss_shared_u1_phase_compensation_enabled=True,
-        gnss_shared_u1_phase_satellites=(),
         gnss_1c_channel_count=4,
         gnss_channels_in_acquisition=4,
     )
@@ -140,62 +168,6 @@ def test_dynamic_phase_source_mapping_ignores_stale_latest_by_prn_entry() -> Non
     assert runtime._tracking_source_satellites(snapshot) == (None, None, 14, None)
 
 
-def test_lcmv_steering_vector_uses_internal_angle_not_display_bearing() -> None:
-    display_bearing = 170.0
-    internal_angle = 280.0
-    wrong_internal = display_bearing
-    result = covariance_lcmv_ideal_null_weights(
-        covariance=np.eye(4, dtype=np.complex128),
-        n_channels=4,
-        null_angle_deg=internal_angle,
-        rf_freq_hz=1.57542e9,
-        array_spacing_m=0.07,
-    )
-    correct_steering = steering_vector(
-        np.asarray([internal_angle], dtype=np.float64),
-        1.57542e9,
-        0.07,
-    ).reshape(-1)
-    wrong_steering = steering_vector(
-        np.asarray([wrong_internal], dtype=np.float64),
-        1.57542e9,
-        0.07,
-    ).reshape(-1)
-
-    assert abs(np.vdot(correct_steering, result.weights)) < 1e-10
-    assert abs(np.vdot(wrong_steering, result.weights)) > 1e-3
-
-
-def test_covariance_lcmv_ideal_weights_satisfy_constraints() -> None:
-    null_angle = 123.0
-    steering = steering_vector(
-        np.asarray([null_angle], dtype=np.float64),
-        1.57542e9,
-        0.07,
-    ).reshape(-1)
-    covariance = 0.05 * np.eye(4, dtype=np.complex128) + 12.0 * np.outer(
-        steering,
-        steering.conj(),
-    )
-
-    result = covariance_lcmv_ideal_null_weights(
-        covariance=covariance,
-        n_channels=4,
-        null_angle_deg=null_angle,
-        rf_freq_hz=1.57542e9,
-        array_spacing_m=0.07,
-        diagonal_loading_rel=1e-3,
-        diagonal_loading_abs=0.0,
-    )
-
-    assert result.diagonal_loading > 0.0
-    assert np.vdot(np.ones((4,), dtype=np.complex128), result.weights) == pytest.approx(
-        4.0 + 0.0j,
-        abs=1e-9,
-    )
-    assert abs(np.vdot(steering, result.weights)) < 1e-8
-
-
 def test_covariance_lcmv_measured_vector_weights_satisfy_constraints() -> None:
     null_vector = np.array([1.0, 0.7j, -0.4 + 0.2j, 0.2 - 0.9j], dtype=np.complex128)
     null_norm = null_vector / np.linalg.norm(null_vector)
@@ -210,7 +182,7 @@ def test_covariance_lcmv_measured_vector_weights_satisfy_constraints() -> None:
         diagonal_loading_rel=1e-3,
     )
 
-    assert result.null_angle_deg is None
+    assert not hasattr(result, "null_angle_deg")
     assert np.vdot(np.ones((4,), dtype=np.complex128), result.weights) == pytest.approx(
         4.0 + 0.0j,
         abs=1e-9,
@@ -223,12 +195,9 @@ def test_lcmv_test_combiner_outputs_complex64_single_stream() -> None:
     x = (
         rng.standard_normal((4, 128)) + 1j * rng.standard_normal((4, 128))
     ).astype(np.complex128)
-    result = covariance_lcmv_ideal_null_weights(
+    result = covariance_lcmv_vector_null_weights(
         covariance=np.eye(4, dtype=np.complex128),
-        n_channels=4,
-        null_angle_deg=120.0,
-        rf_freq_hz=1.57542e9,
-        array_spacing_m=0.07,
+        null_vector=np.array([1.0, 0.7j, -0.4 + 0.2j, 0.2 - 0.9j]),
     )
 
     y = apply_beamformer(x, result.weights)
@@ -278,23 +247,6 @@ def test_rx_signal_health_flags_iq_components_near_full_scale() -> None:
     assert stats["peak_component"] == pytest.approx(0.99)
 
 
-def test_backend_gnss_weighted_sum_fast_path_matches_effective_weights() -> None:
-    rng = np.random.default_rng(42)
-    x = (
-        rng.normal(size=(4, 64)) + 1j * rng.normal(size=(4, 64))
-    ).astype(np.complex64)
-    effective_weights = np.array(
-        [0.25 + 0.10j, -0.15 + 0.20j, 0.40 - 0.05j, 0.05 - 0.30j],
-        dtype=np.complex64,
-    )
-
-    y = BackendRuntime._weighted_sum_complex64(x, effective_weights)
-    expected = np.asarray(effective_weights @ x, dtype=np.complex64)
-
-    assert y.dtype == np.complex64
-    assert np.allclose(y, expected, atol=1e-6)
-
-
 def test_beamformer_weight_ramp_preserves_measured_u1_response_each_chunk() -> None:
     cfg = StreamConfig(
         phase_correction_vector=None,
@@ -318,15 +270,13 @@ def test_beamformer_weight_ramp_preserves_measured_u1_response_each_chunk() -> N
     ).weights
     uniform = uniform_weights(4)
     preserve_target = np.vdot(preserve, uniform)
-    chunk = np.ones((4, 16), dtype=np.complex64)
-
     runtime._schedule_beamformer_weights(target, reason="unit-test smooth ramp")
     before = runtime._beamformer_transition_payload()
     assert before["weight_transition_active"] is True
     assert before["weight_transition_total_chunks"] == 3
 
     for step in range(1, 4):
-        runtime._gnss_output_vector(chunk)
+        runtime._advance_beamformer_transition()
         applied = runtime._get_beamformer_weights_copy()
         expected = uniform + (step / 3.0) * (target - uniform)
         assert np.allclose(applied, expected, atol=1e-10)
@@ -352,14 +302,12 @@ def test_covariance_target_update_does_not_restart_active_weight_ramp() -> None:
         [0.5 - 0.2j, 1.2 + 0.1j, 0.4 + 0.5j, 0.9 - 0.3j],
         dtype=np.complex128,
     )
-    chunk = np.ones((4, 16), dtype=np.complex64)
-
     runtime._schedule_beamformer_weights(
         first_target,
         reason="first covariance target",
         preempt_active_transition=False,
     )
-    runtime._gnss_output_vector(chunk)
+    runtime._advance_beamformer_transition()
     one_chunk = runtime._beamformer_transition_payload()
     assert one_chunk["weight_transition_completed_chunks"] == 1
 
@@ -374,8 +322,8 @@ def test_covariance_target_update_does_not_restart_active_weight_ramp() -> None:
     assert deferred["weight_transition_total_chunks"] == 3
     assert np.allclose(runtime._target_beamformer_weights, first_target)
 
-    runtime._gnss_output_vector(chunk)
-    runtime._gnss_output_vector(chunk)
+    runtime._advance_beamformer_transition()
+    runtime._advance_beamformer_transition()
     completed = runtime._beamformer_transition_payload()
     assert completed["weight_transition_active"] is False
     assert np.allclose(runtime._get_beamformer_weights_copy(), first_target)
@@ -392,9 +340,10 @@ def test_covariance_target_update_does_not_restart_active_weight_ramp() -> None:
     assert np.allclose(runtime._target_beamformer_weights, newer_target)
 
 
-def test_backend_gnss_output_uses_uniform_combiner_by_default() -> None:
+def test_backend_product_fifo_rows_use_uniform_combiner_by_default() -> None:
     cfg = StreamConfig(phase_correction_vector=None)
     runtime = BackendRuntime(cfg, _build_loggers())
+    _install_product_fifo_bank(runtime)
     x = np.array(
         [
             [1 + 0j, 2 + 0j],
@@ -405,23 +354,25 @@ def test_backend_gnss_output_uses_uniform_combiner_by_default() -> None:
         dtype=np.complex64,
     )
 
-    y = runtime._gnss_output_vector(x)
+    y = runtime._gnss_shared_u1_phase_output_matrix(x)
     expected = apply_beamformer(
         apply_phase_calibration(x.astype(np.complex128)),
         uniform_weights(len(cfg.channels)),
     )
 
+    assert y.shape == (cfg.gnss_1c_channel_count, x.shape[1])
     assert y.dtype == np.complex64
-    assert np.allclose(y, expected, atol=1e-5)
+    assert np.allclose(y, np.tile(expected, (cfg.gnss_1c_channel_count, 1)), atol=1e-5)
 
 
-def test_backend_gnss_output_static_calibration_uses_uniform_combiner() -> None:
+def test_backend_product_fifo_rows_apply_static_calibration() -> None:
     correction = np.array([1 + 0j, 0 - 1j, -1 + 0j, 0 + 1j], dtype=np.complex128)
     weights = uniform_weights(4)
     cfg = StreamConfig(
         phase_correction_vector=tuple(correction),
     )
     runtime = BackendRuntime(cfg, _build_loggers())
+    _install_product_fifo_bank(runtime)
     x = np.array(
         [
             [1 + 0j, 2 + 0j],
@@ -432,7 +383,7 @@ def test_backend_gnss_output_static_calibration_uses_uniform_combiner() -> None:
         dtype=np.complex64,
     )
 
-    y = runtime._gnss_output_vector(x)
+    y = runtime._gnss_shared_u1_phase_output_matrix(x)
     expected = apply_beamformer(
         apply_phase_calibration(
             x.astype(np.complex128),
@@ -442,7 +393,7 @@ def test_backend_gnss_output_static_calibration_uses_uniform_combiner() -> None:
     )
 
     assert y.dtype == np.complex64
-    assert np.allclose(y, expected, atol=1e-5)
+    assert np.allclose(y, np.tile(expected, (cfg.gnss_1c_channel_count, 1)), atol=1e-5)
     assert np.allclose(
         runtime._latest_gnss_effective_weights,
         np.asarray(np.conj(weights) * correction, dtype=np.complex64),
@@ -450,11 +401,9 @@ def test_backend_gnss_output_static_calibration_uses_uniform_combiner() -> None:
 
 
 def test_backend_gnss_handoff_label_is_uniform_array_sum() -> None:
-    cfg = StreamConfig(
-        phase_correction_vector=None,
-        gnss_shared_u1_phase_compensation_enabled=False,
-    )
+    cfg = StreamConfig(phase_correction_vector=None)
     runtime = BackendRuntime(cfg, _build_loggers())
+    _install_product_fifo_bank(runtime)
     x = np.array(
         [
             [1 + 0j, 2 + 0j],
@@ -465,26 +414,24 @@ def test_backend_gnss_handoff_label_is_uniform_array_sum() -> None:
         dtype=np.complex64,
     )
 
-    y = runtime._gnss_output_vector(x)
+    y = runtime._gnss_shared_u1_phase_output_matrix(x)
     expected = apply_beamformer(
         apply_phase_calibration(x.astype(np.complex128)),
         uniform_weights(len(cfg.channels)),
     )
 
-    assert runtime._gnss_handoff_mode_label() == "uniform_array_sum_continuous"
-    assert np.allclose(y, expected, atol=1e-5)
+    assert runtime._gnss_handoff_mode_label() == "shared_prn_phase_continuity_fanout"
+    assert np.allclose(y, np.tile(expected, (cfg.gnss_1c_channel_count, 1)), atol=1e-5)
 
 
 def test_backend_lcmv_test_missing_music_bearing_falls_back_to_uniform() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
         lcmv_weight_transition_s=0.0,
         phase_correction_vector=None,
-        gnss_shared_u1_phase_compensation_enabled=False,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
+    _install_product_fifo_bank(runtime)
     runtime.set_lcmv_test_enabled(True)
     x = np.array(
         [
@@ -500,298 +447,56 @@ def test_backend_lcmv_test_missing_music_bearing_falls_back_to_uniform() -> None
         x.astype(np.complex128),
         float("nan"),
         float("nan"),
+        target_selection_source="test_injected_invalid_target",
     )
 
     status = runtime._lcmv_status_copy()
-    y = runtime._gnss_output_vector(x)
+    y = runtime._gnss_shared_u1_phase_output_matrix(x)
     expected = apply_beamformer(
         apply_phase_calibration(x.astype(np.complex128)),
         uniform_weights(len(cfg.channels)),
     )
 
     assert status["mode"] == "fallback"
+    assert status["active_lcmv_method"] == "uniform_array_sum"
+    assert status["active_lcmv_null_method"] == "none"
     assert status["fallback_reason"] == "no valid MUSIC bearing available"
     assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
     assert y.dtype == np.complex64
-    assert np.allclose(y, expected, atol=1e-5)
+    assert np.allclose(y, np.tile(expected, (cfg.gnss_1c_channel_count, 1)), atol=1e-5)
 
 
-def test_backend_lcmv_test_phase_mismatch_keeps_uniform_stream() -> None:
+def test_lcmv_status_names_only_the_method_that_is_actually_applied() -> None:
+    runtime = BackendRuntime(StreamConfig(), _build_loggers())
+
+    off = runtime._lcmv_status_snapshot(enabled=False, mode="off")
+    fallback = runtime._lcmv_status_snapshot(enabled=True, mode="fallback")
+    active = runtime._lcmv_status_snapshot(enabled=True, mode="on")
+
+    assert off["active_lcmv_method"] == "uniform_array_sum"
+    assert off["active_lcmv_null_method"] == "none"
+    assert fallback["active_lcmv_method"] == "uniform_array_sum"
+    assert fallback["active_lcmv_null_method"] == "none"
+    assert active["active_lcmv_method"] == "covariance_lcmv_measured_u1"
+    assert active["active_lcmv_null_method"] == "covariance_lcmv_measured_u1"
+
+
+def test_backend_product_fifo_rejects_phase_correction_length_mismatch() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=True,
         phase_correction_vector=(1 + 0j, 1 + 0j),
     )
     runtime = BackendRuntime(cfg, _build_loggers())
-    runtime.set_lcmv_test_enabled(True)
+    _install_product_fifo_bank(runtime)
     x = np.ones((4, 8), dtype=np.complex64)
 
-    runtime._update_lcmv_test_from_music(
-        x.astype(np.complex128),
-        10.0,
-        80.0,
-    )
-    y = runtime._gnss_output_vector(x)
-
-    status = runtime._lcmv_status_copy()
-    assert status["mode"] == "fallback"
-    assert "phase correction" in str(status["fallback_reason"])
-    assert "channel count 4" in str(status["fallback_reason"])
-    assert y.shape == (8,)
-    assert y.dtype == np.complex64
-    assert np.allclose(y, np.full((8,), 4.0 + 0.0j, dtype=np.complex64))
-
-
-def test_backend_lcmv_test_valid_music_bearing_updates_gnss_weights() -> None:
-    rng = np.random.default_rng(24)
-    cfg = StreamConfig(
-        lcmv_test_enabled=True,
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
-        lcmv_weight_transition_s=0.0,
-        phase_correction_vector=None,
-        gnss_shared_u1_phase_compensation_enabled=False,
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    internal_angle = 88.75
-    source_vector = steering_vector(
-        np.asarray([internal_angle], dtype=np.float64),
-        cfg.center_freq_hz,
-        cfg.array_spacing_m,
-    ).reshape(-1)
-    source = rng.standard_normal(512) + 1j * rng.standard_normal(512)
-    noise = 0.002 * (
-        rng.standard_normal((4, 512)) + 1j * rng.standard_normal((4, 512))
-    )
-    x = (source_vector[:, None] * source[None, :] + noise).astype(np.complex64)
-
-    runtime._update_lcmv_test_from_music(
-        x.astype(np.complex128),
-        internal_angle,
-        (90.0 - internal_angle) % 360.0,
-    )
-
-    status = runtime._lcmv_status_copy()
-    y = runtime._gnss_output_vector(x)
-
-    assert status["mode"] == "on"
-    assert status["description"] == "Covariance LCMV null active"
-    assert status["active_lcmv_null_method"] == "covariance_lcmv_ideal"
-    assert status["active_lcmv_method"] == "covariance_lcmv_ideal"
-    assert status["active_lcmv_weights_source"] == "covariance_lcmv_ideal"
-    lcmv_response_db = np.asarray(status["lcmv_response_db"], dtype=np.float64)
-    lcmv_response_abs = np.asarray(status["lcmv_response_abs"], dtype=np.float64)
-    output_metrics = status["output_metrics"]
-    assert lcmv_response_db.shape == (cfg.doa_points,)
-    assert lcmv_response_abs.shape == (cfg.doa_points,)
-    assert np.all(np.isfinite(lcmv_response_db))
-    assert np.all(np.isfinite(lcmv_response_abs))
-    assert "suppression_db" not in status
-    assert "suppression_db_alias_of" not in status
-    assert output_metrics["measured_output_reduction_vs_uniform_db"] is not None
-    assert "lcmv_model_summary" in status
-    assert runtime._gnss_handoff_mode_label() == "lcmv_test_nulling_continuous"
-    active_weights = np.asarray(
-        status["spatial_vector_diagnostics"]["active_lcmv_weights"]["real"],
-        dtype=np.float64,
-    ) + 1j * np.asarray(
-        status["spatial_vector_diagnostics"]["active_lcmv_weights"]["imag"],
-        dtype=np.float64,
-    )
-    assert np.allclose(y, apply_beamformer(x.astype(np.complex128), active_weights))
-    assert y.shape == (512,)
-    assert y.dtype == np.complex64
-    assert np.all(np.isfinite(y))
-
-
-def test_backend_lcmv_keeps_covariance_active_when_wng_exceeds_limit() -> None:
-    rng = np.random.default_rng(240)
-    cfg = StreamConfig(
-        lcmv_test_enabled=True,
-        lcmv_test_null_method="covariance_lcmv_ideal",
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
-        lcmv_max_white_noise_gain_db=-100.0,
-        phase_correction_vector=None,
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    internal_angle = 280.0
-    source_vector = steering_vector(
-        np.asarray([internal_angle], dtype=np.float64),
-        cfg.center_freq_hz,
-        cfg.array_spacing_m,
-    ).reshape(-1)
-    source = rng.standard_normal(1024) + 1j * rng.standard_normal(1024)
-    noise = 0.002 * (
-        rng.standard_normal((4, 1024)) + 1j * rng.standard_normal((4, 1024))
-    )
-    x = (source_vector[:, None] * source[None, :] + noise).astype(np.complex128)
-
-    runtime._update_lcmv_test_from_music(
-        x,
-        internal_angle,
-        internal_angle_to_operator_bearing_deg(internal_angle),
-    )
-
-    status = runtime._lcmv_status_copy()
-    spatial = status["spatial_vector_diagnostics"]
-
-    assert status["mode"] == "on"
-    assert status["active_lcmv_method"] == "covariance_lcmv_ideal"
-    assert status["active_lcmv_null_method"] == "covariance_lcmv_ideal"
-    assert status["active_lcmv_weights_source"] == "covariance_lcmv_ideal"
-    assert status["active_lcmv_fallback_used"] is False
-    assert status["active_lcmv_fallback_reason"] == ""
-    assert "covariance_lcmv_ideal" in spatial["candidate_methods_valid"]
-    assert "covariance_lcmv_ideal" not in spatial["candidate_methods_rejected"]
-    assert "white_noise_gain_db" in spatial[
-        "candidate_covariance_lcmv_ideal_white_noise_gain_warning"
-    ]
-
-
-def test_backend_covariance_lcmv_measured_u1_mode_uses_covariance_weights() -> None:
-    rng = np.random.default_rng(51)
-    cfg = StreamConfig(
-        lcmv_test_enabled=True,
-        lcmv_test_null_method="covariance_lcmv_measured_u1",
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
-        phase_correction_vector=None,
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    source_vector = np.array([1.0, 1.0j, -0.5, -0.75j], dtype=np.complex128)
-    source = rng.standard_normal(512) + 1j * rng.standard_normal(512)
-    noise = 0.005 * (
-        rng.standard_normal((4, 512)) + 1j * rng.standard_normal((4, 512))
-    )
-    x = (source_vector[:, None] * source[None, :] + noise).astype(np.complex128)
-
-    runtime._update_lcmv_test_from_music(
-        x,
-        88.75,
-        (90.0 - 88.75) % 360.0,
-    )
-
-    status = runtime._lcmv_status_copy()
-    spatial = status["spatial_vector_diagnostics"]
-
-    assert status["mode"] == "on"
-    assert status["active_lcmv_null_method"] == "covariance_lcmv_measured_u1"
-    assert status["active_lcmv_weights_source"] == "covariance_lcmv_measured_u1"
-    assert "covariance_lcmv_measured_u1" in spatial["candidate_methods_valid"]
-    assert spatial["candidate_covariance_lcmv_measured_u1_condition_number_R"] is not None
-    assert spatial["active_lcmv_weights"]["real"] == status["output_metrics"]["lcmv_weights"]["real"]
-
-
-def test_backend_lcmv_logs_all_candidate_methods_and_angle_fields() -> None:
-    rng = np.random.default_rng(64)
-    cfg = StreamConfig(
-        lcmv_test_enabled=True,
-        lcmv_test_null_method="covariance_lcmv_ideal",
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
-        phase_correction_vector=None,
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    runtime._healthy_reference_vector = np.ones((4,), dtype=np.complex128) / 2.0
-    internal_angle = 280.0
-    display_bearing = internal_angle_to_operator_bearing_deg(internal_angle)
-    jammer_vector = steering_vector(
-        np.asarray([internal_angle], dtype=np.float64),
-        cfg.center_freq_hz,
-        cfg.array_spacing_m,
-    ).reshape(-1)
-    source = rng.standard_normal(1024) + 1j * rng.standard_normal(1024)
-    noise = 0.002 * (
-        rng.standard_normal((4, 1024)) + 1j * rng.standard_normal((4, 1024))
-    )
-    x = (jammer_vector[:, None] * source[None, :] + noise).astype(np.complex128)
-
-    runtime._update_lcmv_test_from_music(x, internal_angle, display_bearing)
-    status = runtime._lcmv_status_copy()
-    spatial = status["spatial_vector_diagnostics"]
-
-    assert status["mode"] == "on"
-    assert status["active_lcmv_method"] == "covariance_lcmv_ideal"
-    assert status["active_lcmv_weights_source"] == "covariance_lcmv_ideal"
-    assert status["heavy_diagnostics_emitted"] is True
-    assert status["heavy_diagnostics_skipped_due_to_throttle"] is False
-    assert spatial["music_internal_angle_deg"] == pytest.approx(280.0)
-    assert spatial["music_display_bearing_deg"] == pytest.approx(170.0)
-    assert spatial["null_internal_angle_deg"] == pytest.approx(280.0)
-    assert spatial["null_display_bearing_deg"] == pytest.approx(170.0)
-    assert spatial["steering_vector_angle_used_internal_deg"] == pytest.approx(280.0)
-    assert spatial["steering_vector_angle_used_display_deg"] == pytest.approx(170.0)
-    assert spatial["display_bearing_formula"] == "(90 - internal_angle_deg) % 360"
-    assert set(spatial["candidate_methods_computed"]) == {
-        "covariance_lcmv_ideal",
-        "covariance_lcmv_measured_u1",
-    }
-    assert "ideal_steering" not in spatial["candidate_methods_computed"]
-    assert "ideal_angle_fan" not in spatial["candidate_methods_computed"]
-    assert "covariance_lcmv_ideal" in spatial["candidate_methods_valid"]
-    assert "candidate_covariance_lcmv_ideal_white_noise_gain_db" in spatial
-    assert spatial["candidate_covariance_lcmv_ideal_desired_loss_vs_reference_db"] is not None
-    assert spatial["candidate_covariance_lcmv_ideal_effective_receiver_improvement_u1_db"] is not None
-    assert "candidate_covariance_lcmv_ideal_predicted_target_suppression_db" in spatial
-    assert "candidate_covariance_lcmv_ideal_condition_number_constraint" in spatial
-    assert "candidate_covariance_lcmv_ideal_output_power_from_R" in spatial
-    assert "candidate_covariance_lcmv_ideal_dominant_vector_suppression_db" in spatial
-    assert "dominant_vector_suppression_db" in spatial
-    assert spatial["covariance_lcmv_ideal_preserve_residual_abs"] < 1e-6
-    assert spatial["covariance_lcmv_ideal_null_residual_abs"] < 1e-6
-    assert spatial["jammer_only_suppression_estimate_available"] is False
-    assert spatial["active_method_applied"] == "covariance_lcmv_ideal"
-
-    runtime._update_lcmv_test_from_music(x, internal_angle, display_bearing)
-    status_after_second_update = runtime._lcmv_status_copy()
-    assert status_after_second_update["heavy_diagnostics_emitted"] is False
-    assert status_after_second_update["heavy_diagnostics_skipped_due_to_throttle"] is True
-
-
-def test_backend_lcmv_candidate_methods_do_not_feed_fifo_when_disabled() -> None:
-    rng = np.random.default_rng(641)
-    cfg = StreamConfig(
-        lcmv_test_enabled=True,
-        lcmv_test_null_method="covariance_lcmv_ideal",
-        lcmv_preserve_constraint_mode="uniform",
-        lcmv_target_selection_mode="strongest_music_peak",
-        lcmv_candidate_methods_enabled=False,
-        phase_correction_vector=None,
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    internal_angle = 280.0
-    vector = steering_vector(
-        np.asarray([internal_angle], dtype=np.float64),
-        cfg.center_freq_hz,
-        cfg.array_spacing_m,
-    ).reshape(-1)
-    source = rng.standard_normal(1024) + 1j * rng.standard_normal(1024)
-    noise = 0.002 * (
-        rng.standard_normal((4, 1024)) + 1j * rng.standard_normal((4, 1024))
-    )
-    x = (vector[:, None] * source[None, :] + noise).astype(np.complex128)
-
-    runtime._update_lcmv_test_from_music(
-        x,
-        internal_angle,
-        internal_angle_to_operator_bearing_deg(internal_angle),
-    )
-
-    status = runtime._lcmv_status_copy()
-    spatial = status["spatial_vector_diagnostics"]
-    assert status["active_lcmv_weights_source"] == "covariance_lcmv_ideal"
-    assert spatial["candidate_methods_computed"] == ["covariance_lcmv_ideal"]
-    assert np.allclose(
-        runtime._gnss_output_vector(x),
-        apply_beamformer(x, runtime._get_beamformer_weights_copy()),
-    )
+    with pytest.raises(ValueError, match="phase correction length mismatch"):
+        runtime._gnss_shared_u1_phase_output_matrix(x)
 
 
 def test_realtime_bladerf_tracker_wraps_angles_and_freezes_only_when_stable() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=False,
-        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
-        lcmv_target_selection_mode="realtime_non_preserve_peak",
         lcmv_realtime_preserve_window_samples=8,
         lcmv_realtime_preserve_min_samples=4,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
@@ -845,8 +550,6 @@ def test_realtime_bladerf_tracker_wraps_angles_and_freezes_only_when_stable() ->
 def test_realtime_lcmv_target_ignores_peaks_inside_frozen_bladerf_guard() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=False,
-        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
-        lcmv_target_selection_mode="realtime_non_preserve_peak",
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
         lcmv_realtime_preserve_guard_deg=20.0,
@@ -872,8 +575,6 @@ def test_realtime_lcmv_target_ignores_peaks_inside_frozen_bladerf_guard() -> Non
                 {"angle_deg": 150.0},
             ]
         },
-        primary_internal_deg=42.0,
-        primary_display_deg=48.0,
     )
 
     assert internal == pytest.approx(150.0)
@@ -884,8 +585,6 @@ def test_realtime_lcmv_target_ignores_peaks_inside_frozen_bladerf_guard() -> Non
 def test_realtime_lcmv_stays_uniform_for_angle_jump_without_jammer_evidence() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=False,
-        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
-        lcmv_target_selection_mode="realtime_non_preserve_peak",
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
         lcmv_realtime_preserve_guard_deg=20.0,
@@ -921,17 +620,19 @@ def test_realtime_lcmv_stays_uniform_for_angle_jump_without_jammer_evidence() ->
     assert "armed with frozen measured bladeRF U1" in status["fallback_reason"]
     assert spatial["lcmv_jammer_activation_evidence_now"] is False
     assert spatial["lcmv_jammer_detected_latched"] is False
+    assert spatial["lcmv_target_activation_evidence_met"] is False
+    assert "lcmv_target_confirmed_jammer_bearing" not in spatial
     assert spatial["lcmv_jammer_activation_angle_only_forbidden"] is True
     assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
 
 
-def test_realtime_lcmv_preserves_frozen_bladerf_angle_and_nulls_other_peak() -> None:
+@pytest.mark.parametrize("reported_music_angle", [150.0, 250.0])
+def test_realtime_lcmv_preserves_frozen_vector_and_nulls_measured_u1(
+    reported_music_angle: float, monkeypatch,
+) -> None:
     rng = np.random.default_rng(645)
     cfg = StreamConfig(
         lcmv_test_enabled=False,
-        lcmv_test_null_method="covariance_lcmv_ideal",
-        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
-        lcmv_target_selection_mode="realtime_non_preserve_peak",
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
         lcmv_realtime_preserve_guard_deg=20.0,
@@ -976,10 +677,17 @@ def test_realtime_lcmv_preserves_frozen_bladerf_angle_and_nulls_other_peak() -> 
         + noise
     ).astype(np.complex128)
 
+    calls = []
+    def measured_solver(**kwargs):
+        calls.append(kwargs)
+        return covariance_lcmv_vector_null_weights(**kwargs)
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.covariance_lcmv_vector_null_weights", measured_solver
+    )
     runtime._update_lcmv_test_from_music(
         x,
-        null_angle,
-        internal_angle_to_operator_bearing_deg(null_angle),
+        reported_music_angle,
+        internal_angle_to_operator_bearing_deg(reported_music_angle),
         raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
         cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
         target_selection_source="strongest_music_peak_outside_frozen_bladerf_guard",
@@ -989,19 +697,37 @@ def test_realtime_lcmv_preserves_frozen_bladerf_angle_and_nulls_other_peak() -> 
     spatial = status["spatial_vector_diagnostics"]
     weights = runtime._get_beamformer_weights_copy()
     preserve_norm = preserve_vector / np.linalg.norm(preserve_vector)
-    null_norm = null_vector / np.linalg.norm(null_vector)
+    _, eigenvectors = np.linalg.eigh(x @ x.conj().T / x.shape[1])
+    null_norm = eigenvectors[:, -1]
     uniform = uniform_weights(4)
 
     assert status["mode"] == "on"
     assert spatial["lcmv_jammer_activation_evidence_now"] is True
     assert spatial["lcmv_jammer_detected_latched"] is True
-    assert spatial["lcmv_preserve_constraint_mode"] == "realtime_bladerf_measured_u1"
+    assert spatial["lcmv_target_activation_evidence_met"] is True
+    assert "lcmv_target_confirmed_jammer_bearing" not in spatial
+    assert spatial["preserve_strategy"] == "realtime_bladerf_measured_u1"
     assert spatial["lcmv_preserve_internal_angle_deg"] == pytest.approx(preserve_angle)
-    assert spatial["null_internal_angle_deg"] == pytest.approx(null_angle)
+    assert "null_internal_angle_deg" not in spatial
+    assert "null_internal_deg" not in status
+    assert spatial["music_internal_angle_deg"] == reported_music_angle
+    assert spatial["active_lcmv_method"] == "covariance_lcmv_measured_u1"
+    assert spatial["candidate_methods_computed"] == ["covariance_lcmv_measured_u1"]
+    assert len(calls) == 1
+    assert "null_angle_deg" not in calls[0]
+    assert np.allclose(weights, runtime._get_shared_measured_u1_protection_weights_copy())
+    assert not any("ideal_lcmv" in key or "lcmv_ideal" in key for key in spatial)
     assert abs(np.vdot(preserve_norm, weights) - np.vdot(preserve_norm, uniform)) < 1e-6
     assert abs(np.vdot(null_norm, weights)) < 1e-6
     assert status["preserve_residual_abs"] < 1e-6
     assert status["null_residual_abs"] < 1e-6
+    assert status["gnss_fifo_measured_u1_protection_available"] is True
+    assert np.asarray(
+        status["gnss_fifo_measured_u1_model_response_db"], dtype=np.float64
+    ).shape == (cfg.doa_points,)
+    assert status["gnss_fifo_measured_u1_response_scope"] == (
+        "ideal_steering_scan_of_shared_weights_not_measured_ota_null"
+    )
 
     after_drop = runtime._lcmv_jammer_activation_evidence(
         covariance=np.eye(4, dtype=np.complex128),
@@ -1047,11 +773,8 @@ def test_healthy_pvt_auto_arms_lcmv_but_keeps_uniform_until_jammer() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=False,
         lcmv_auto_arm_after_pvt=True,
-        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
-        lcmv_target_selection_mode="realtime_non_preserve_peak",
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
-        gnss_shared_u1_phase_compensation_enabled=True,
         phase_correction_vector=None,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
@@ -1094,8 +817,6 @@ def test_lcmv_auto_arm_waits_for_pvt_and_respects_manual_off() -> None:
     cfg = StreamConfig(
         lcmv_test_enabled=False,
         lcmv_auto_arm_after_pvt=True,
-        lcmv_preserve_constraint_mode="realtime_bladerf_measured_u1",
-        gnss_shared_u1_phase_compensation_enabled=True,
         phase_correction_vector=None,
     )
     runtime = BackendRuntime(cfg, _build_loggers())

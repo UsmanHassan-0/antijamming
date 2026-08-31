@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -19,9 +20,13 @@ from antijamming.config import (
 )
 from antijamming.logging import LOGGER_DEFS, reset_session_logs, setup_logging
 from antijamming.logging.setup import ImmediateFileHandler
-from antijamming.app.main import _reap_backend_process, _runtime_config, parse_args
+from antijamming.app.main import (
+    _cleanup_gui_owners,
+    _reap_backend_process,
+    _runtime_config,
+    parse_args,
+)
 from antijamming.app.runtime_config import build_runtime_config
-from antijamming.config.schemas.runtime import VALID_LCMV_METHODS
 from antijamming.radio.usrp.uhd_events import (
     UhdConsoleMarkerMonitor,
     UhdConsoleMarkerScanner,
@@ -73,9 +78,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.gnss_truth_static_lat_deg == 37.352721
     assert cfg.gnss_truth_static_lon_deg == -121.915773
     assert cfg.gnss_truth_static_alt_m == 100.0
-    assert cfg.gnss_sdr_echo_stdout is False
-    assert cfg.gnss_shared_u1_phase_compensation_enabled is True
-    assert cfg.gnss_shared_u1_phase_satellites == ()
+    assert cfg.logging_enabled is True
     assert cfg.gnss_1c_channel_count == 10
     assert cfg.gnss_channels_in_acquisition == 10
     assert cfg.ui_update_interval_s == 0.1
@@ -83,11 +86,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.prn_chart_update_interval_s == 0.1
     assert cfg.skyplot_update_interval_s == 0.1
     assert cfg.lcmv_test_enabled is False
-    assert cfg.lcmv_test_max_weight_norm == 8.0
-    assert cfg.lcmv_test_condition_number_limit == 100_000_000.0
-    assert cfg.lcmv_test_null_method == "covariance_lcmv_ideal"
-    assert cfg.lcmv_preserve_constraint_mode == "realtime_bladerf_measured_u1"
-    assert cfg.lcmv_target_selection_mode == "realtime_non_preserve_peak"
+    assert cfg.lcmv_condition_number_limit == 100_000_000.0
     assert cfg.lcmv_realtime_preserve_window_samples == 40
     assert cfg.lcmv_realtime_preserve_min_samples == 20
     assert cfg.lcmv_realtime_preserve_max_circular_std_deg == 15.0
@@ -97,11 +96,6 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_jammer_activation_min_input_power_jump_db == 3.0
     assert cfg.lcmv_jammer_activation_min_generalized_gain_db == 6.0
     assert cfg.lcmv_weight_transition_s == 1.0
-    assert VALID_LCMV_METHODS == {
-        "covariance_lcmv_ideal",
-        "covariance_lcmv_measured_u1",
-    }
-    assert cfg.lcmv_candidate_methods_enabled is True
     assert cfg.lcmv_covariance_diagonal_loading_rel == 0.001
     assert cfg.lcmv_covariance_diagonal_loading_abs == 0.0
     assert cfg.lcmv_max_weight_norm == 8.0
@@ -109,7 +103,6 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_min_predicted_jammer_suppression_db == 18.0
     assert cfg.lcmv_heavy_diagnostics_interval_s == 1.0
     assert cfg.one_run_segmentation_enabled is True
-    assert cfg.healthy_reference_capture_enabled is True
     assert cfg.lcmv_auto_arm_after_pvt is True
     assert cfg.process_every_n_chunks == 15
     assert cfg.samples_per_chunk == 32768
@@ -138,7 +131,6 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.gnss_tracking_monitor_enable_protobuf is True
     assert cfg.gnss_tracking_monitor_decimation_factor == 10
     assert cfg.gnss_pvt_nmea_tty_enable is True
-    assert cfg.gnss_pvt_nmea_output_file_enable is False
     assert cfg.gnss_pvt_nmea_rate_ms == 1000
     assert cfg.gnss_acquisition_pfa == 0.01
     assert cfg.gnss_acquisition_doppler_max_hz == 10000
@@ -170,6 +162,17 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     )
     assert cfg.expected_sources == 1
     assert cfg.gnss_accuracy_window_points == 1
+
+
+def test_launcher_uses_runtime_logging_switch_for_all_diagnostic_persistence() -> None:
+    launcher = Path("run_realtime.sh").read_text(encoding="utf-8")
+    sidecar = Path("tools/run_realtime_sidecar.sh").read_text(encoding="utf-8")
+
+    assert '"logging_enabled"' in launcher
+    assert 'if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]' in launcher
+    assert "ANTIJAM_SIDECAR:-" not in launcher
+    assert "unset UHD_LOG_FILE" in launcher
+    assert "/home/qvise/antijamming" not in sidecar
 
 
 def test_runtime_config_rejects_stale_experiment_section(tmp_path) -> None:
@@ -216,54 +219,46 @@ def test_runtime_profile_rejects_authored_sample_rate_followers(
         load_stream_config_file(path)
 
 
-def test_runtime_config_calibration_mode_defaults_to_complex_gain(tmp_path) -> None:
+def test_runtime_config_requires_explicit_calibration_mode(tmp_path) -> None:
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     payload.pop("calibration_correction_mode", None)
     path = tmp_path / "runtime_without_calibration_mode.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    cfg = load_stream_config_file(path)
+    with pytest.raises(ValueError, match="missing required JSON key.*calibration_correction_mode"):
+        load_stream_config_file(path)
 
-    assert cfg.calibration_correction_mode == "complex_gain"
+
+def test_runtime_config_rejects_unknown_calibration_mode(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["calibration_correction_mode"] = "typo_mode"
+    path = tmp_path / "runtime_with_unknown_calibration_mode.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="calibration_correction_mode.*must be one of"):
+        load_stream_config_file(path)
 
 
-def test_runtime_config_gnss_startup_timeout_defaults_to_unlimited(tmp_path) -> None:
+def test_runtime_config_requires_explicit_gnss_startup_timeout(tmp_path) -> None:
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     payload.pop("gnss_sdr_startup_timeout_s", None)
     path = tmp_path / "runtime_without_gnss_startup_timeout.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    cfg = load_stream_config_file(path)
-
-    assert cfg.gnss_sdr_startup_timeout_s == 0.0
-
-
-def test_runtime_config_lcmv_method_defaults_to_covariance_ideal(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
-    payload.pop("lcmv_test_null_method", None)
-    path = tmp_path / "runtime_without_lcmv_method.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-    cfg = load_stream_config_file(path)
-
-    assert cfg.lcmv_test_null_method == "covariance_lcmv_ideal"
-
-
-@pytest.mark.parametrize(
-    "method",
-    ["ideal_steering", "ideal_angle_fan", "measured_dominant_eigenvector"],
-)
-def test_runtime_config_rejects_legacy_lcmv_methods(tmp_path, method) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
-    payload["lcmv_test_null_method"] = method
-    path = tmp_path / f"runtime_with_{method}.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="Invalid lcmv_test_null_method"):
+    with pytest.raises(ValueError, match="missing required JSON key.*gnss_sdr_startup_timeout_s"):
         load_stream_config_file(path)
 
 
-def test_runtime_config_rejects_legacy_expected_bearing_target_mode(tmp_path) -> None:
+def test_runtime_config_rejects_removed_lcmv_method_selector(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["lcmv_test_null_method"] = "covariance_lcmv_measured_u1"
+    path = tmp_path / "runtime_with_removed_lcmv_method_selector.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unknown runtime config key"):
+        load_stream_config_file(path)
+
+def test_runtime_config_rejects_removed_lcmv_target_selector(tmp_path) -> None:
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     payload["lcmv_target_selection_mode"] = (
         "expected_jammer_range_peak_or_center"
@@ -271,7 +266,37 @@ def test_runtime_config_rejects_legacy_expected_bearing_target_mode(tmp_path) ->
     path = tmp_path / "runtime_with_legacy_expected_bearing_mode.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Invalid lcmv_target_selection_mode"):
+    with pytest.raises(ValueError, match="Unknown runtime config key"):
+        load_stream_config_file(path)
+
+
+def test_runtime_config_rejects_removed_usrp_preservation_mode(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["preserve_usrp_session_on_stop"] = True
+    path = tmp_path / "runtime_with_removed_usrp_preservation_mode.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unknown runtime config key"):
+        load_stream_config_file(path)
+
+
+def test_runtime_config_rejects_removed_optional_local_gnss_mode(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["gnss_sdr_require_local"] = False
+    path = tmp_path / "runtime_with_optional_local_gnss_mode.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unknown runtime config key"):
+        load_stream_config_file(path)
+
+
+def test_runtime_config_rejects_removed_second_nmea_persistence_switch(tmp_path) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["gnss_pvt_nmea_output_file_enable"] = True
+    path = tmp_path / "runtime_with_removed_nmea_persistence_switch.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unknown runtime config key"):
         load_stream_config_file(path)
 
 
@@ -289,7 +314,7 @@ def test_runtime_config_rejects_duplicate_json_keys(tmp_path) -> None:
 def test_runtime_config_rejects_non_finite_json_numbers(tmp_path, constant) -> None:
     path = tmp_path / "nonfinite.json"
     path.write_text(
-        f'{{"gnss_shared_u1_phase_satellites": [{constant}]}}', encoding="utf-8"
+        f'{{"sample_rate": {constant}}}', encoding="utf-8"
     )
 
     with pytest.raises(ValueError, match="non-finite JSON number"):
@@ -306,7 +331,97 @@ def test_runtime_config_rejects_non_finite_string_sample_rate(
     path = tmp_path / "nonfinite_string_sample_rate.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="positive finite number"):
+    with pytest.raises(ValueError, match="sample_rate.*JSON number"):
+        load_stream_config_file(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("logging_enabled", "false", "logging_enabled.*JSON boolean"),
+        ("samples_per_chunk", True, "samples_per_chunk.*JSON integer"),
+        ("gain_db", "45", "gain_db.*JSON number"),
+        ("channels", [0, 1, 2], "channels.*exactly 4 items"),
+        ("channels", [0, 1, 2, "3"], r"channels\[3\].*JSON integer"),
+        ("antenna", "RX2", "Unknown runtime config key.*antenna"),
+        ("twinrx_lo_sharing", False, "Unknown runtime config key.*twinrx_lo_sharing"),
+        ("phase_calibration_file", 7, "phase_calibration_file.*path string"),
+    ],
+)
+def test_runtime_config_rejects_wrong_json_types(
+    tmp_path,
+    field,
+    value,
+    message,
+) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload[field] = value
+    path = tmp_path / f"runtime_with_wrong_{field}_type.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_stream_config_file(path)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"samples_per_chunk": 0}, "samples_per_chunk.*greater than zero"),
+        (
+            {"lcmv_min_predicted_jammer_suppression_db": -1.0},
+            "lcmv_min_predicted_jammer_suppression_db.*nonnegative",
+        ),
+        ({"gnss_pvt_nmea_rate_ms": 99}, "gnss_pvt_nmea_rate_ms.*at least 100"),
+        (
+            {"gnss_pvt_elevation_mask_deg": 91.0},
+            r"gnss_pvt_elevation_mask_deg.*\[-90, 90\]",
+        ),
+        (
+            {"gnss_tracking_1c_pll_filter_order": 1},
+            "gnss_tracking_1c_pll_filter_order.*at least 2",
+        ),
+        ({"channels": [1, 0, 2, 3]}, "channels.*exactly.*calibrated stream order"),
+        (
+            {"rx_antennas_by_channel": ["RX1", "RX2", "RX3", "RX2"]},
+            "rx_antennas_by_channel.*RX1 or RX2",
+        ),
+        (
+            {"rx_lo_sources_by_channel": ["internal", "companion", "guess", "reimport"]},
+            "rx_lo_sources_by_channel.*unsupported",
+        ),
+        (
+            {
+                "lcmv_realtime_preserve_window_samples": 10,
+                "lcmv_realtime_preserve_min_samples": 11,
+            },
+            "minimum samples must not exceed",
+        ),
+        ({"gnss_acquisition_pfa": 1.0}, "gnss_acquisition_pfa.*between 0 and 1"),
+        (
+            {"gnss_1c_channel_count": 4, "gnss_channels_in_acquisition": 5},
+            "concurrency must not exceed",
+        ),
+        (
+            {"gnss_monitor_udp_port": "1111"},
+            "monitor UDP ports must be distinct",
+        ),
+        (
+            {"gnss_sdr_sample_type": "short"},
+            "gnss_sdr_sample_type.*gr_complex",
+        ),
+    ],
+)
+def test_runtime_config_rejects_inconsistent_values(
+    tmp_path,
+    updates,
+    message,
+) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload.update(updates)
+    path = tmp_path / "runtime_with_inconsistent_values.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
         load_stream_config_file(path)
 
 
@@ -337,7 +452,7 @@ def test_project_docs_live_under_docs_directory() -> None:
     assert (REPO_ROOT / "docs/architecture_refactor_notes.md").exists()
     numbered_docs = (
         "00_system_architecture.md",
-        "01_rf_hardware_and_link_budget.md",
+        "01_rf_hardware_boundary.md",
         "02_calibration.md",
         "03_steering_model_and_angles.md",
         "04_doa_music_bartlett.md",
@@ -400,6 +515,25 @@ def test_runtime_file_logs_use_immediate_handlers(tmp_path) -> None:
     assert all(
         any(isinstance(handler, ImmediateFileHandler) for handler in logger.handlers)
         for logger in loggers.values()
+    )
+
+
+def test_master_logging_switch_disables_and_reenables_all_named_file_loggers(
+    tmp_path,
+) -> None:
+    log_dir = tmp_path / "disabled"
+    disabled = setup_logging(log_dir, enabled=False)
+
+    assert not log_dir.exists()
+    assert all(logger.disabled for logger in disabled.values())
+    assert all(not logger.handlers for logger in disabled.values())
+
+    enabled = setup_logging(log_dir, enabled=True)
+    assert log_dir.is_dir()
+    assert all(not logger.disabled for logger in enabled.values())
+    assert all(
+        any(isinstance(handler, ImmediateFileHandler) for handler in logger.handlers)
+        for logger in enabled.values()
     )
 
 
@@ -579,6 +713,57 @@ def test_backend_process_reaper_waits_after_sigkill(monkeypatch, tmp_path) -> No
     ]
 
 
+def test_gui_cleanup_attempt_reports_incomplete_owners_for_retry(tmp_path) -> None:
+    class RetryingMonitor:
+        def __init__(self) -> None:
+            self.results = iter((False, True))
+
+        def stop(self) -> bool:
+            return next(self.results)
+
+    class RetryingWorker:
+        def __init__(self) -> None:
+            self.close_results = iter((False, True))
+            self.shutdown_calls = 0
+
+        @staticmethod
+        def isRunning() -> bool:
+            return False
+
+        def shutdown_service(self, _reason: str) -> None:
+            self.shutdown_calls += 1
+
+        def close(self) -> bool:
+            return next(self.close_results)
+
+    class ExitedProcess:
+        pid = 12345
+
+        @staticmethod
+        def wait(*, timeout: float) -> int:
+            assert timeout == 18.0
+            return 0
+
+    loggers = setup_logging(tmp_path)
+    monitor = RetryingMonitor()
+    worker = RetryingWorker()
+    process = ExitedProcess()
+
+    assert not _cleanup_gui_owners(
+        uhd_marker_monitor=monitor,
+        worker=worker,
+        backend_process=process,  # type: ignore[arg-type]
+        loggers=loggers,
+    )
+    assert _cleanup_gui_owners(
+        uhd_marker_monitor=monitor,
+        worker=worker,
+        backend_process=process,  # type: ignore[arg-type]
+        loggers=loggers,
+    )
+    assert worker.shutdown_calls == 2
+
+
 def test_parse_args_accepts_diagnostic_control_flags(monkeypatch) -> None:
     monkeypatch.setattr(
         sys,
@@ -617,8 +802,6 @@ def test_runtime_config_builds_product_profile_without_cli_overrides() -> None:
 def test_product_profile_uses_dynamic_shared_u1_phase_fanout() -> None:
     cfg = build_runtime_config()
 
-    assert cfg.gnss_shared_u1_phase_compensation_enabled is True
-    assert cfg.gnss_shared_u1_phase_satellites == ()
     assert cfg.gnss_1c_channel_count == 10
     assert cfg.gnss_channels_in_acquisition == 10
     assert cfg.gain_db == 45.0

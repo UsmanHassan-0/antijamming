@@ -91,7 +91,7 @@ class ReceiverStateMixin:
             latest_accuracy = dict(self._latest_accuracy)
             pvt_observation_count = self._pvt_observation_count
             receiver_time_s = self._receiver_time_s
-            used_count = len(self._used_in_fix_prns)
+            used_count = len(self._used_in_fix_sat_keys)
         self._handoff_log.info(
             "GNSS receiver event: %s receiver_time_s=%s pvt_observations=%s "
             "used_count=%d valid_sats=%s fix_type=%s hdop=%s vdop=%s pdop=%s gdop=%s "

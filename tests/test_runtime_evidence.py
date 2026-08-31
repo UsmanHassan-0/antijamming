@@ -36,8 +36,6 @@ def test_session_finalization_retains_root_logs_and_dual_event_ledger(tmp_path) 
         tmp_path,
         "jammer_on",
         source="test",
-        attenuation_db=50.0,
-        bladeRF_gain_db=50.0,
         session_id=session.session_id,
         session_elapsed_s=session.elapsed_s(),
         context={"pvt_current": True},
@@ -56,9 +54,50 @@ def test_session_finalization_retains_root_logs_and_dual_event_ledger(tmp_path) 
     assert _read_jsonl(tmp_path / "operator_events.log")[0]["event"] == "jammer_on"
     archived = _read_jsonl(session.session_dir / "operator_events.jsonl")
     assert archived[0]["context"] == {"pvt_current": True}
+    assert "attenuation_db" not in archived[0]
+    assert "bladeRF_gain_db" not in archived[0]
     manifest = json.loads((session.session_dir / "session_manifest.json").read_text())
     assert manifest["finalized"] is True
     assert manifest["stop_reason"] == "unit test"
+
+
+def test_disabled_logging_builds_event_payload_without_writing_files(tmp_path) -> None:
+    payload = record_event(
+        tmp_path,
+        "jammer_on",
+        source="test",
+        persist=False,
+    )
+
+    assert payload["event"] == "jammer_on"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_disabled_logging_skips_context_serialization_and_timing_bookkeeping(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    loggers = setup_logging(tmp_path, enabled=False)
+    backend = BackendRuntime(
+        StreamConfig(log_dir=tmp_path, logging_enabled=False),
+        loggers,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_event_context_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled logging must not build evidence context")
+        ),
+    )
+
+    payload = backend._record_runtime_event("notes", source="test")
+    backend._maybe_log_runtime_evidence({"pvt_current": True})
+    backend._record_runtime_timing("synthetic", 0.25)
+
+    assert payload["event"] == "notes"
+    assert "context" not in payload
+    assert backend._perf_stats == {}
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_finalization_does_not_overwrite_exact_pid_scoped_gnss_artifacts(
@@ -243,6 +282,16 @@ def test_full_angle_log_keeps_one_copy_of_each_spectrum(tmp_path) -> None:
         cfg.array_spacing_m,
         n_sources=1,
     )
+    common_response = np.linspace(0.0, -30.0, scan.size)
+    fifo_response = np.linspace(-3.0, -18.0, scan.size)
+    backend._set_lcmv_status(
+        enabled=True,
+        mode="on",
+        lcmv_response_db=common_response,
+        gnss_fifo_measured_u1_model_response_db=fifo_response,
+        gnss_fifo_measured_u1_model_summary={"minimum_db": -18.0},
+        gnss_fifo_measured_u1_protection_available=True,
+    )
 
     backend._log_full_angle_analysis(
         doa_metrics=doa,
@@ -256,13 +305,27 @@ def test_full_angle_log_keeps_one_copy_of_each_spectrum(tmp_path) -> None:
     record = parse_json_line((tmp_path / "analysis.log").read_text())
 
     assert record is not None
-    assert record["schema_version"] == 2
+    assert record["schema_version"] == 4
     assert len(record["music_spectrum_linear"]) == scan.size
     assert len(record["bartlett_spectrum_linear"]) == scan.size
     assert "music_raw_spectrum" not in record
     assert "music_raw_display_sorted" not in record
     assert "bartlett_raw_spectrum" not in record
     assert "scan_display_sorted_deg" not in record
+    assert np.allclose(record["lcmv"]["lcmv_model_response_db"], common_response)
+    assert np.allclose(
+        record["lcmv"]["gnss_fifo_measured_u1_model_response_db"],
+        fifo_response,
+    )
+    assert record["lcmv"]["gnss_fifo_measured_u1_protection_available"] is True
+    assert record["lcmv"]["common_measured_u1_target_response_scope"] == (
+        "ideal_steering_scan_not_measured_ota_null_depth"
+    )
+    assert record["lcmv"]["gnss_fifo_measured_u1_response_scope"] == (
+        "ideal_steering_scan_of_shared_weights_not_measured_ota_null"
+    )
+    assert "common_model_music_comparison" in record["lcmv"]
+    assert "null_match" not in record["lcmv"]
 
 
 def test_session_audit_reports_scenario_and_carrier_continuity(tmp_path) -> None:
@@ -302,6 +365,8 @@ def test_session_audit_reports_scenario_and_carrier_continuity(tmp_path) -> None
                 "wall_time_unix_ns": epoch_ns,
                 "satellite_id": "G01",
                 "carrier_phase_rads": 0.2 * index,
+                "tracking_sample_counter": (index + 4) * 2_000_000,
+                "fs": 4_000_000,
                 "cn0_db_hz": 45.0,
                 "cycle_slip": False,
             }

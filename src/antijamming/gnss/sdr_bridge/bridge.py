@@ -96,9 +96,6 @@ class GnssSdrBridge(
             config.gnss_sdr_runtime_dir,
             config.gnss_sdr_log_dir,
         )
-        self._tracking_state_archive_dir = (
-            Path(config.log_dir).expanduser().resolve() / "tracking-state"
-        )
         self._runtime_session_id = str(session_id) if session_id else None
         self._runtime_session_dir = (
             Path(session_dir).expanduser().resolve() if session_dir is not None else None
@@ -131,16 +128,15 @@ class GnssSdrBridge(
         self._pipe_size_bytes: int | None = None
         self._fifo_source_bytes: list[int] = []
         self._fifo_max_source_lead_bytes = 0
-        self._glog_thread: threading.Thread | None = None
         self._monitor_stop = threading.Event()
         self._fifo_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
 
         # Receiver state extracted from GNSS-SDR logs and outputs.
         self._state_lock = threading.Lock()
         self._prn_states: dict[_SatKey, dict[str, object]] = {}
         self._channel_prn: dict[int, _SatKey] = {}
         self._receiver_time_s: int | None = None
-        self._session_epoch_s = 0.0
         self._pvt_output_seen = False
         self._pvt_observed_monotonic_s: float | None = None
         self._pvt_observation_count: int | None = None
@@ -152,7 +148,7 @@ class GnssSdrBridge(
         self._tracking_cno_history: dict[tuple[int, _SatKey], list[float]] = {}
         self._tracking_cno_stable_windows: dict[tuple[int, _SatKey], int] = {}
         self._sat_geometry_by_prn: dict[_SatKey, dict[str, object]] = {}
-        self._used_in_fix_prns: set[_SatKey] = set()
+        self._used_in_fix_sat_keys: set[_SatKey] = set()
         self._used_in_fix_observed_monotonic_s: float | None = None
         self._last_nmea_utc_s: float | None = None
         self._last_nmea_utc_text: str | None = None
@@ -185,30 +181,11 @@ class GnssSdrBridge(
 
         self._runtime_dir = Path(runtime_dir).expanduser().resolve()
         self._log_dir = Path(log_dir).expanduser().resolve()
-        shared_phase = bool(
-            getattr(self._cfg, "gnss_shared_u1_phase_compensation_enabled", False)
-        )
-        satellites = tuple(
-            int(value)
-            for value in getattr(self._cfg, "gnss_shared_u1_phase_satellites", ())
-        )
-        if shared_phase:
-            source_count = (
-                len(satellites)
-                if satellites
-                else max(1, int(self._cfg.gnss_1c_channel_count))
-            )
-            self._fifo_paths = [
-                self._runtime_dir
-                / (
-                    f"gnss_iq_G{satellites[index]:02d}.fifo"
-                    if satellites
-                    else f"gnss_iq_channel_{index:02d}.fifo"
-                )
-                for index in range(source_count)
-            ]
-        else:
-            self._fifo_paths = [self._runtime_dir / "gnss_iq.fifo"]
+        source_count = int(self._cfg.gnss_1c_channel_count)
+        self._fifo_paths = [
+            self._runtime_dir / f"gnss_iq_channel_{index:02d}.fifo"
+            for index in range(source_count)
+        ]
         self._fifo_path = self._fifo_paths[0]
         self._config_path = self._runtime_dir / "fifo_gps_l1.conf"
         self._console_log_path = self._runtime_dir / "console.log"
@@ -224,11 +201,32 @@ class GnssSdrBridge(
 
     @property
     def active(self) -> bool:
-        return (
+        process_and_fifo_active = (
             bool(self._fifo_fds)
             and len(self._fifo_fds) == len(self._fifo_paths)
             and self._proc is not None
             and self._proc.poll() is None
+        )
+        if not process_and_fifo_active:
+            return False
+        stdout_thread = self._stdout_thread
+        if stdout_thread is None or not stdout_thread.is_alive():
+            return False
+        if self._cfg.gnss_pvt_nmea_tty_enable:
+            nmea_thread = self._nmea_thread
+            if nmea_thread is None or not nmea_thread.is_alive():
+                return False
+        required_udp_threads = sum(
+            bool(enabled)
+            for enabled in (
+                self._cfg.gnss_pvt_monitor_enable,
+                self._cfg.gnss_monitor_enable,
+                self._cfg.gnss_tracking_monitor_enable,
+            )
+        )
+        udp_threads = tuple(self._udp_monitor_threads)
+        return len(udp_threads) == required_udp_threads and all(
+            thread.is_alive() for thread in udp_threads
         )
 
     def start(self) -> bool:
@@ -251,10 +249,7 @@ class GnssSdrBridge(
                 msg += (
                     f" System gnss-sdr at {system_gnss} is being ignored because it is not repo-local."
                 )
-            if self._cfg.gnss_sdr_require_local:
-                raise FileNotFoundError(msg)
-            self._log.warning("%s", msg)
-            return False
+            raise FileNotFoundError(msg)
 
         try:
             return self._start_resolved(exe_path)
@@ -280,16 +275,16 @@ class GnssSdrBridge(
         # in this Python process.
         for fifo_path in self._fifo_paths:
             os.mkfifo(fifo_path)
-        self._console_log_path.write_text("", encoding="utf-8")
-        self._receiver_log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._receiver_log_path.write_text("", encoding="utf-8")
+        if self._cfg.logging_enabled:
+            self._console_log_path.write_text("", encoding="utf-8")
+            self._receiver_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._receiver_log_path.write_text("", encoding="utf-8")
         self._prepare_nmea_tty()
         rendered_config = self._render_config()
         self._config_path.write_text(rendered_config, encoding="utf-8")
         self._archive_runtime_artifacts(config_only=True)
         self._log_rendered_config_summary(rendered_config)
         self._monitor_stop.clear()
-        self._session_epoch_s = time.time()
         self._tracking_state_started_monotonic_ns = time.monotonic_ns()
         self._tracking_state_sequence = 0
         self._open_tracking_state_log()
@@ -305,7 +300,7 @@ class GnssSdrBridge(
             self._tracking_cno_history.clear()
             self._tracking_cno_stable_windows.clear()
             self._sat_geometry_by_prn.clear()
-            self._used_in_fix_prns.clear()
+            self._used_in_fix_sat_keys.clear()
             self._used_in_fix_observed_monotonic_s = None
             self._last_nmea_utc_s = None
             self._last_nmea_utc_text = None
@@ -371,13 +366,6 @@ class GnssSdrBridge(
         stdout_thread.start()
         self._stdout_thread = stdout_thread
         self._start_nmea_tty_reader()
-        glog_thread = threading.Thread(
-            target=self._monitor_glog_files,
-            name="gnss_sdr_glog",
-            daemon=True,
-        )
-        glog_thread.start()
-        self._glog_thread = glog_thread
         startup_timeout_s = float(self._cfg.gnss_sdr_startup_timeout_s)
         timeout_label = "none" if startup_timeout_s <= 0.0 else f"{startup_timeout_s:.1f}s"
         self._report_startup(
@@ -431,25 +419,21 @@ class GnssSdrBridge(
             float(self._cfg.sample_rate) / 1e6,
             self.input_filter_bandwidth_hz / 1e6,
         )
-        self._warn_if_gps_l1_is_outside_capture_band()
         self._app_log.info("GNSS-SDR bridge active: %s", exe_path)
         return True
 
     def write(self, samples: np.ndarray) -> bool:
         source_count = len(self._fifo_paths)
         sample_array = np.asarray(samples)
-        if source_count == 1:
-            arrays = [complex64_contiguous_vector(sample_array)]
-        else:
-            if sample_array.ndim != 2 or sample_array.shape[0] != source_count:
-                raise ValueError(
-                    "shared-U1 phase FIFO write expects sources x samples: "
-                    f"got {sample_array.shape}, sources={source_count}"
-                )
-            arrays = [
-                complex64_contiguous_vector(sample_array[index])
-                for index in range(source_count)
-            ]
+        if sample_array.ndim != 2 or sample_array.shape[0] != source_count:
+            raise ValueError(
+                "shared-U1 phase FIFO write expects sources x samples: "
+                f"got {sample_array.shape}, sources={source_count}"
+            )
+        arrays = [
+            complex64_contiguous_vector(sample_array[index])
+            for index in range(source_count)
+        ]
         if not arrays or arrays[0].size == 0:
             return True
         if any(array.size != arrays[0].size for array in arrays):
@@ -463,11 +447,7 @@ class GnssSdrBridge(
                 if len(self._fifo_source_bytes) != len(arrays):
                     self._fifo_source_bytes = [0 for _ in arrays]
                     self._fifo_max_source_lead_bytes = 0
-                stripe_samples = (
-                    arrays[0].size
-                    if len(arrays) == 1
-                    else PER_SOURCE_FIFO_STRIPE_SAMPLES
-                )
+                stripe_samples = PER_SOURCE_FIFO_STRIPE_SAMPLES
                 for start in range(0, arrays[0].size, stripe_samples):
                     stop = min(arrays[0].size, start + stripe_samples)
                     self._write_fifo_stripe_fair(
@@ -606,9 +586,13 @@ class GnssSdrBridge(
             timeout_s=timeout_s,
         )
 
-    def stop(self, reason: str = "normal stop") -> None:
+    def stop(self, reason: str = "normal stop") -> bool:
+        with self._stop_lock:
+            return self._stop_locked(reason)
+
+    def _stop_locked(self, reason: str) -> bool:
         self._monitor_stop.set()
-        self._stop_udp_monitors()
+        udp_stopped = self._stop_udp_monitors()
         self._close_tracking_state_log()
         with self._fifo_lock:
             fifo_fds = tuple(self._fifo_fds)
@@ -619,16 +603,18 @@ class GnssSdrBridge(
                 except OSError:
                     pass
 
-        if self._proc is not None:
-            pid = int(self._proc.pid)
+        process = self._proc
+        process_stopped = process is None
+        if process is not None:
+            pid = int(process.pid)
             try:
-                if self._proc.poll() is None:
+                if process.poll() is None:
                     self._terminate_process_group_or_process(pid)
                     try:
-                        self._proc.wait(timeout=5.0)
+                        process.wait(timeout=5.0)
                     except subprocess.TimeoutExpired:
                         self._kill_process_group_or_process(pid)
-                        self._proc.wait(timeout=2.0)
+                        process.wait(timeout=2.0)
                         self._log.warning(
                             "GNSS-SDR pid killed after stop timeout: pid=%d reason=%s",
                             pid,
@@ -644,14 +630,23 @@ class GnssSdrBridge(
                     self._log.info(
                         "GNSS-SDR pid already exited: pid=%d returncode=%s reason=%s",
                         pid,
-                        self._proc.returncode,
+                        process.returncode,
                         reason,
                     )
             except Exception as exc:
                 self._err_log.error("Failed to stop GNSS-SDR cleanly: %s", exc)
-            self._proc = None
+            try:
+                process_stopped = process.poll() is not None
+            except Exception as exc:
+                process_stopped = False
+                self._err_log.error(
+                    "Could not verify GNSS-SDR process exit; retaining owner: %s",
+                    exc,
+                )
+            if process_stopped and self._proc is process:
+                self._proc = None
 
-        self._stop_nmea_tty_reader()
+        nmea_stopped = self._stop_nmea_tty_reader()
         stdout_handle = self._stdout_handle
         self._stdout_handle = None
         if stdout_handle is not None:
@@ -671,23 +666,12 @@ class GnssSdrBridge(
                 "GNSS-SDR stdout monitor did not stop within 1.0 s; "
                 "retaining the live thread reference."
             )
+            stdout_stopped = False
         elif self._stdout_thread is stdout_thread:
             self._stdout_thread = None
-        glog_thread = self._glog_thread
-        if (
-            glog_thread is not None
-            and glog_thread.ident is not None
-            and glog_thread is not threading.current_thread()
-        ):
-            glog_thread.join(timeout=1.0)
-        if glog_thread is not None and glog_thread.is_alive():
-            self._err_log.error(
-                "GNSS-SDR glog monitor did not stop within 1.0 s; "
-                "retaining the live thread reference."
-            )
-        elif self._glog_thread is glog_thread:
-            self._glog_thread = None
-
+            stdout_stopped = True
+        else:
+            stdout_stopped = True
         self._archive_runtime_artifacts(config_only=False)
 
         if self._write_count > 0 or self._drop_count > 0:
@@ -709,7 +693,13 @@ class GnssSdrBridge(
                 PER_SOURCE_FIFO_STRIPE_SAMPLES if len(self._fifo_paths) > 1 else 0,
             )
 
-        self._cleanup_fifo()
+        if process_stopped:
+            self._cleanup_fifo()
+        else:
+            self._err_log.error(
+                "GNSS-SDR cleanup incomplete; retaining process and FIFO ownership for retry."
+            )
+        return bool(process_stopped and stdout_stopped and nmea_stopped and udp_stopped)
 
     def _archive_runtime_artifacts(self, *, config_only: bool) -> None:
         """Copy the exact per-process GNSS-SDR evidence into this run."""
@@ -760,18 +750,9 @@ class GnssSdrBridge(
         """Open a durable, per-run archive of GNSS tracking observables."""
 
         self._close_tracking_state_log()
-        timestamp = time.strftime(
-            "%Y%m%dT%H%M%SZ",
-            time.gmtime(self._session_epoch_s),
-        )
-        fallback_path = (
-            self._tracking_state_archive_dir / f"tracking_{timestamp}_{os.getpid()}.jsonl"
-        )
-        path = (
-            self._runtime_session_dir / "tracking_observables.jsonl"
-            if self._runtime_session_dir is not None
-            else fallback_path
-        )
+        if not self._cfg.logging_enabled or self._runtime_session_dir is None:
+            return
+        path = self._runtime_session_dir / "tracking_observables.jsonl"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._tracking_state_handle = path.open("w", encoding="utf-8", buffering=1)

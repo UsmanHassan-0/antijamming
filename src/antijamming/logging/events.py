@@ -22,8 +22,6 @@ RF_EVENTS = frozenset(
         "bladeRF_off",
         "lcmv_on",
         "lcmv_off",
-        "attenuation_db",
-        "bladeRF_gain_db",
         "expected_sources_changed",
         "stream_start",
         "stream_stop",
@@ -68,13 +66,12 @@ def record_event(
     event: str,
     *,
     source: str,
-    attenuation_db: float | None = None,
-    bladeRF_gain_db: float | None = None,
     notes: str = "",
     context: Mapping[str, object] | None = None,
     session_id: str | None = None,
     session_elapsed_s: float | None = None,
     append_current_session: bool = True,
+    persist: bool = True,
 ) -> dict[str, object]:
     """Append one event to both the stable and per-run event ledgers."""
 
@@ -95,16 +92,15 @@ def record_event(
         "source": str(source),
         "session_id": session_id,
         "session_elapsed_s": session_elapsed_s,
-        "attenuation_db": attenuation_db,
-        "bladeRF_gain_db": bladeRF_gain_db,
         "notes": str(notes),
     }
     if context:
         payload["context"] = dict(context)
 
-    root = Path(log_dir).expanduser().resolve()
-    _append_jsonl(root / "operator_events.log", payload)
-    session_dir = current_session_dir(root) if append_current_session else None
-    if session_dir is not None:
-        _append_jsonl(session_dir / "operator_events.jsonl", payload)
+    if persist:
+        root = Path(log_dir).expanduser().resolve()
+        _append_jsonl(root / "operator_events.log", payload)
+        session_dir = current_session_dir(root) if append_current_session else None
+        if session_dir is not None:
+            _append_jsonl(session_dir / "operator_events.jsonl", payload)
     return payload

@@ -1,74 +1,81 @@
 # Beamforming Algorithms
 
-The runtime beamformer convention is:
+The runtime convention is `y[n] = w^H x[n]`, implemented as
+`w.conj() @ samples`. Uniform sum uses `w = [1, 1, 1, 1]`; it remains
+the off/arming/release safety target, not a selectable LCMV algorithm.
 
-```text
-y[n] = w^H x[n]
-```
+## One measured-vector solve
 
-In Python this is `w.conj() @ samples`. For a spatial vector `v`, response is `w^H v`.
-
-Uniform sum uses `w = [1, 1, 1, 1]` and preserves the old raw four-channel sum into one GNSS-SDR stream. Uniform average would use `[0.25, 0.25, 0.25, 0.25]`; this is useful as a noise-gain reference but is not the default FIFO combiner.
-
-The product has one LCMV implementation. It uses diagonal-loaded covariance:
+The only product nulling method is `covariance_lcmv_measured_u1`:
 
 ```text
 R_loaded = R + delta I
-delta = lcmv_covariance_diagonal_loading_abs
-      + lcmv_covariance_diagonal_loading_rel * trace(R).real / N
-
+delta = loading_abs + loading_rel * trace(R).real / N
+C = [normalized_frozen_healthy_vector, normalized_current_u1]
 w = R_loaded^-1 C (C^H R_loaded^-1 C)^-1 f
 ```
 
-All constraints are checked as `C^H w ~= f`.
+The constraints preserve the uniform combiner's complex response to the frozen
+healthy vector and force zero response to current measured U1. The code checks
+`C^H w ~= f`, conditioning, finite values, and weight norm. The ideal-angle
+null solver, its public export, runtime candidate, and method ranking are
+removed. No selector or compatibility alias recreates them.
 
-The two selectable methods are thin constraint-vector choices around that same
-covariance solver:
+One accepted measured-U1 solve supplies both the common target and the shared
+GNSS protection target. Common output still has its existing transition;
+assigned PRNs may receive the shared row times a complex continuity scalar.
+Unassigned slots use the common row. This is not an independent LCMV solve per
+PRN, and a base-row model plot is not the final compensated FIFO response.
 
-- `covariance_lcmv_ideal`: product method; full covariance LCMV with the ideal steering vector at the MUSIC internal angle as its null constraint.
-- `covariance_lcmv_measured_u1`: full covariance LCMV with measured `u1` null.
+## Activation, preservation, and release
 
-The current product config uses `lcmv_test_null_method: "covariance_lcmv_ideal"`, so the jammer null uses the ideal steering vector. The preserve constraint is separate: `lcmv_preserve_constraint_mode: "realtime_bladerf_measured_u1"` tracks a stable jammer-off bladeRF angle cluster, verifies that the recent healthy-reference angle belongs to that cluster, and freezes the measured healthy U1 and covariance when the operator enables LCMV. The old ideal-angle-only bladeRF preserve mode was removed after the 2026-08-07 live test showed 7-9 dB of C/N0 loss despite near-zero mathematical constraint residuals.
+The runtime learns a stable jammer-off bladeRF angle cluster and healthy
+measured vector/covariance. Enabling LCMV freezes that reference. MUSIC still
+supplies a candidate outside the frozen desired-direction guard; missing or
+inside-guard candidates prevent a fresh solve. This retained control dependency
+does not turn the MUSIC angle into the measured null vector.
 
-Enabling LCMV first arms the runtime while the FIFO remains on uniform weights. Angular movement alone cannot activate covariance weights. Activation requires both an input-power rise and a generalized covariance-mode rise against the exact frozen arm-time baseline. Detection then latches until LCMV is disabled, so a long jammer interval cannot silently return the system to unprotected uniform weights.
+Activation requires both input-power rise and generalized-covariance rise
+against the frozen baseline (profile: 3 and 6 dB). At this rewritten cleanup
+checkpoint, detection remains latched until operator disable. The later
+bounded-release commit is replayed separately; this removal does not introduce
+its thresholds, timer, or control lock.
 
-The legacy single-FIFO path used when Shared-U1 fanout is disabled applies target weights with a one-second
-complex linear chunk ramp. The uniform and LCMV endpoints have the same complex
-response to the frozen measured bladeRF U1, so every interpolated weight has
-that same response. Repeated covariance updates do not restart an active ramp;
-the current ramp finishes before a later target can be scheduled.
+The healthy-vector equality is not a proof of preservation for every PRN.
+Desired-loss and noise-gain metrics remain diagnostics; current preflight does
+not reject solely on white-noise gain. Excessive weight norm, invalid
+constraints, or unavailable solutions reject a new update. A common uniform
+fallback is not by itself proof that every FIFO is uniform: while protection
+is active the bank can retain a previously accepted protection row.
 
-The optional shared measured-U1 GNSS fanout is deliberately different. It
-publishes every newly accepted measured-U1 covariance solution immediately so
-the spatial null can follow the live covariance. Before applying that row to a
-PRN, it multiplies the row by the exact complex scalar that keeps that PRN's
-previous response unchanged. Jammer-off recovery to the common/uniform row is
-the configured one-second ramp, and its two endpoints have the same complex
-response, so every intermediate chunk has the same response too. The fanout is
-one shared spatial beam followed by PRN-specific complex scalars; it contains
-no per-PRN covariance or LCMV solver.
+## MUSIC and LCMV graph semantics
 
-When this fanout is enabled, the GNSS FIFO protection row comes from the
-accepted `covariance_lcmv_measured_u1` candidate even if the ordinary active
-method displayed in the GUI is `covariance_lcmv_ideal`. The status log therefore
-records the FIFO path independently from the ordinary active-method label.
+MUSIC/Bartlett still use the antenna steering model for their angle scans.
+The LCMV graph has exactly one curve:
+**Measured-U1 target weights (model)**. It scans the accepted measured-U1
+target against that antenna model; the x-axis is display bearing and the
+y-axis is the absolute, unnormalized calculated response in dB.
 
-There is no desired-loss guard or desired-loss configuration threshold in the
-product path. The frozen measured bladeRF U1 is an explicit equality
-constraint, while desired/SOI loss versus the healthy reference remains a
-diagnostic only. Invalid/non-finite weights, excessive weight norm, unavailable
-covariance solutions, protected bladeRF bearings, missing/stale measured
-references, and absent jammer activation evidence retain uniform fallbacks.
+The vertical line is explicitly a **MUSIC guard candidate**, not a measured
+jammer bearing or the measured-U1 null direction. U1 need not correspond to
+one physical bearing. Obsolete runtime null-angle fields are removed rather
+than being filled from MUSIC or left empty. The graph does not show PRN scalars, intermediate
+phase-bank rows, or measured OTA suppression.
 
-Covariance-free constraint projection, the old ideal-steering shortcut, and the old ideal-angle fan have been removed from the product module and tests. The runtime schema rejects their old method names.
+A very deep calculated minimum is not a physical suppression measurement.
+The scalar compensation and transition failures in historical audits are not
+claimed repaired by deleting the ideal solver. Receiver C/N0, tracking, PVT,
+and final FIFO output still require matched hardware validation.
 
-Common live signal model:
+## Research boundary
 
-```text
-x[n] = desired/SOI + jammer + real sky GNSS + noise + multipath + receiver artifacts
-R = E{x x^H}
-```
+Measured interference subspaces avoid deriving a null solely from an assumed
+angle/manifold, but dominant U1 is not automatically a jammer. A strong desired
+bladeRF signal can dominate; multiple interference modes can require a larger
+subspace. These are limitations, not newly implemented alternatives.
 
-`R` is not jammer-only. `u1` is not always jammer. When the jammer is off, `u1` can be healthy/SOI/bladeRF-like. When the jammer is on and strong, `u1` can become jammer-like. SOI inside `R` can be damaged unless protected by a correct desired constraint. GSC is a future-work path for separating blocking/nulling from an adaptive noise canceller.
-
-The measured-u1 method is not the product default because `u1` is not always the jammer. Its desired/SOI loss must be measured against a reliable run-local healthy reference before an operator selects it.
+The GNSS subspace and distortionless-filter literature motivates measured
+constraints plus desired-signal protection, but is not an implementation or
+benchmark of this code:
+[GNSS space-time interference mitigation, Sections 3.1–3.2](https://pmc.ncbi.nlm.nih.gov/articles/PMC4507627/).
+The current implementation is spatial-only, not that paper's space-time filter.

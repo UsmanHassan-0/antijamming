@@ -13,7 +13,7 @@ from antijamming.runtime.ipc import JsonIpcClient
 
 
 class RemoteStreamWorker(QObject):
-    """Present the historical worker API while forwarding commands over IPC."""
+    """Expose the GUI worker API while forwarding commands over IPC."""
 
     data_ready = pyqtSignal(object)
     status = pyqtSignal(str)
@@ -72,8 +72,16 @@ class RemoteStreamWorker(QObject):
         except Exception:
             pass
 
-    def close(self) -> None:
-        self._client.close()
+    def close(self) -> bool:
+        stopped = self._client.close()
+        if stopped:
+            with self._lock:
+                self._backend_running = False
+                self._start_requested = False
+                self._pending_start_request_id = None
+                self._seen_running_since_start = False
+                self._stopped.set()
+        return stopped
 
     def wait(self, milliseconds: int = 0) -> bool:
         timeout_s = None if int(milliseconds) < 0 else max(0, int(milliseconds)) / 1000.0
@@ -102,16 +110,12 @@ class RemoteStreamWorker(QObject):
         self,
         event: str,
         *,
-        attenuation_db: float | None = None,
-        bladeRF_gain_db: float | None = None,
         notes: str = "",
     ) -> None:
         try:
             self._client.command(
                 "mark_rf_event",
                 event=str(event),
-                attenuation_db=attenuation_db,
-                bladeRF_gain_db=bladeRF_gain_db,
                 notes=str(notes),
                 source="gui",
             )
@@ -137,15 +141,30 @@ class RemoteStreamWorker(QObject):
             self.failed.emit(str(message.get("message", "Backend failed")))
             return
         if message_type != "state":
-            if message_type == "reply" and not bool(message.get("ok", False)):
+            if message_type == "reply":
                 request_id = str(message.get("request_id", ""))
+                result = message.get("result", {})
+                start_rejected = bool(
+                    isinstance(result, dict)
+                    and result.get("started") is False
+                )
+                protocol_error = not bool(message.get("ok", False))
+                if not protocol_error and not start_rejected:
+                    return
                 with self._lock:
                     if request_id == self._pending_start_request_id:
                         self._start_requested = False
                         self._pending_start_request_id = None
                         if not self._backend_running:
                             self._stopped.set()
-                self.failed.emit(str(message.get("error", "Backend command failed")))
+                    else:
+                        return
+                error = (
+                    message.get("error", "Backend command failed")
+                    if protocol_error
+                    else "Backend start was not accepted because a prior run is still finishing"
+                )
+                self.failed.emit(str(error))
             return
 
         running = bool(message.get("backend_running", False))

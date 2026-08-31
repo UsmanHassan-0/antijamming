@@ -15,32 +15,10 @@ measured runs, the SSH-forwarded display appeared as `DISPLAY=localhost:10.0`
 with an active `SSH_CONNECTION`, and Qt later reported a broken X11 connection
 or left the GUI process stuck while GNSS-SDR continued/cleaned up separately.
 
-For interactive operation from a laptop, use the configured GNOME RDP desktop:
-
-```text
-Protocol: RDP
-Server: 10.189.184.209:3389
-Username: qvise
-```
-
-The current workstation RDP session is configured as `antijam-gnome-safe`, which
-forces GNOME Shell and the RDP handover path to use software rendering. This is
-intentional: measured RDP login attempts using the default Ubuntu Wayland session
-crashed GNOME Shell with `signal 11` after DRI/Vulkan driver errors.
-
-The anti-jam GUI is installed as a desktop autostart entry for that RDP session.
-It waits 20 seconds for the desktop to settle, then runs:
+For interactive operation, open a terminal in the machine's local desktop,
+change to this repository root, and run:
 
 ```bash
-cd /home/qvise/antijamming
-./run_realtime.sh
-```
-
-If you need to restart the GUI manually, open a terminal inside the RDP desktop
-and run:
-
-```bash
-cd /home/qvise/antijamming
 ./run_realtime.sh
 ```
 
@@ -50,10 +28,6 @@ For non-interactive receiver diagnostics over SSH, use the offscreen Qt path:
 QT_QPA_PLATFORM=offscreen ./run_realtime.sh --auto-start --auto-stop-after-s 170 --quit-after-stop
 ```
 
-The launcher rejects SSH X11 forwarding by default. To force that old transport
-for a short test, set `ANTIJAM_ALLOW_SSH_X11=1`; expect slow or fragile GUI
-behavior. The supported operator path is the configured GNOME RDP desktop.
-
 Run phase calibration from the sibling repo:
 
 ```bash
@@ -62,12 +36,7 @@ Run phase calibration from the sibling repo:
 
 The launcher accepts diagnostic lifecycle flags such as `--auto-start`,
 `--auto-stop-after-s`, and `--quit-after-stop`; it does not accept RF/hardware
-tuning flags. Skip pre-launch USRP checks only when you need a fast local UI
-startup:
-
-```bash
-ANTIJAMMING_SKIP_USRP_PREFLIGHT=1 ./run_realtime.sh
-```
+tuning flags.
 
 The launcher intentionally does not expose hardware tuning, array geometry, GNSS-SDR
 disable flags, or low-level UHD transport flags. Those values are product runtime
@@ -130,14 +99,16 @@ The product path uses the app-rendered FIFO GNSS-SDR template:
 configs/gnss-sdr/fifo_gps_l1.conf.template
 ```
 
-The anti-jamming backend owns the USRP. With the current
-`gnss_shared_u1_phase_compensation_enabled: true` profile, it computes one
+The anti-jamming backend owns the USRP. The fixed product path computes one
 shared spatial output and fans it out through dynamically assigned per-channel
 FIFOs with PRN-specific complex continuity scalars. The configured receiver has
 ten GPS `1C` channels. These FIFO rows do not represent ten independent spatial
-LCMV solutions. If Shared-U1 mode is disabled, the bridge retains the legacy
-single-FIFO path. Direct-USRP and RTL-SDR GNSS-SDR configs are not part of the
-product runtime.
+LCMV solutions. There is no configuration-disabled legacy single-FIFO product
+mode. Direct-USRP and RTL-SDR GNSS-SDR configs are not part of the product runtime.
+
+GNSS snapshot entries always include `constellation`, `prn`, and
+`satellite_id`. Summary lists use constellation-qualified labels; the GUI does
+not consume the removed GPS-only integer-list aliases.
 
 In normal realtime mode, GNSS-SDR runs.
 

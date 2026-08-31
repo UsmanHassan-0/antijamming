@@ -51,12 +51,53 @@ class RxChunkResult:
     out_of_sequence: bool
     time_spec_s: float | None
 
-    def __iter__(self):
-        # Backwards-compatible unpacking for existing call sites:
-        # ``chunk, state = device.recv_chunk()``.
-        yield self.chunk
-        yield self.state
 
+def validate_rx_chunk_result(
+    result: object,
+    *,
+    expected_channels: int,
+) -> RxChunkResult:
+    """Validate the fc32 receive contract shared by every IQ consumer."""
+    if not isinstance(result, RxChunkResult):
+        raise TypeError(
+            "USRP recv_chunk() must return RxChunkResult, got "
+            f"{type(result).__name__}"
+        )
+    chunk = result.chunk
+    if not isinstance(chunk, np.ndarray):
+        raise TypeError(
+            "USRP RxChunkResult.chunk must be a NumPy array, got "
+            f"{type(chunk).__name__}"
+        )
+    if chunk.ndim != 2:
+        raise ValueError(
+            "USRP RxChunkResult.chunk must be two-dimensional, got "
+            f"shape={chunk.shape}"
+        )
+    channel_count = int(expected_channels)
+    if channel_count <= 0:
+        raise ValueError(
+            f"USRP expected channel count must be positive, got {channel_count}"
+        )
+    if int(chunk.shape[0]) != channel_count:
+        raise ValueError(
+            "USRP RxChunkResult channel count mismatch: "
+            f"got={chunk.shape[0]} expected={channel_count}"
+        )
+    if chunk.dtype != np.dtype(np.complex64):
+        raise TypeError(
+            "USRP RxChunkResult.chunk must use complex64 host samples, got "
+            f"dtype={chunk.dtype}"
+        )
+    got_samples = int(result.got_samples)
+    if got_samples < 0 or got_samples != int(chunk.shape[1]):
+        raise ValueError(
+            "USRP RxChunkResult sample count mismatch: "
+            f"got_samples={got_samples} chunk_samples={chunk.shape[1]}"
+        )
+    if result.state not in {"ok", "overflow", "timeout", "other"}:
+        raise ValueError(f"USRP RxChunkResult has invalid state: {result.state!r}")
+    return result
 
 # =============================================================================
 # USRP RX Runtime Device
@@ -95,8 +136,7 @@ class UsrpRxDevice:
         # Timed tuning gives all channels a common retune edge, which matters for
         # phase-coherent array processing.
         self._timed_tune_lead_s = 0.05
-        if config.twinrx_lo_sharing:
-            self._configure_twinrx_lo_sharing()
+        self._configure_twinrx_lo_sharing()
         for ch in config.channels:
             # Apply per-channel UHD settings before the shared timed tune.
             antenna = self._rx_antenna_for_channel(ch)
@@ -134,31 +174,13 @@ class UsrpRxDevice:
     # differences without hard-coding them in this device wrapper.
 
     def _rx_antenna_for_channel(self, ch: int) -> str:
-        forced = str(self._cfg.antenna).strip().upper()
-        if forced:
-            return forced
-        antennas = tuple(str(ant).strip().upper() for ant in self._cfg.rx_antennas_by_channel)
-        if not antennas:
-            return "RX2"
-        if 0 <= int(ch) < len(antennas):
-            return antennas[int(ch)]
-        return antennas[-1]
+        return str(self._cfg.rx_antennas_by_channel[int(ch)]).strip().upper()
 
     def _rx_lo_source_for_channel(self, ch: int) -> str:
-        sources = tuple(str(src).strip().lower() for src in self._cfg.rx_lo_sources_by_channel)
-        if not sources:
-            return "internal"
-        if 0 <= int(ch) < len(sources):
-            return sources[int(ch)]
-        return sources[-1]
+        return str(self._cfg.rx_lo_sources_by_channel[int(ch)]).strip().lower()
 
     def _rx_lo_export_for_channel(self, ch: int) -> bool:
-        exports = tuple(bool(value) for value in self._cfg.rx_lo_exports_by_channel)
-        if not exports:
-            return False
-        if 0 <= int(ch) < len(exports):
-            return exports[int(ch)]
-        return exports[-1]
+        return bool(self._cfg.rx_lo_exports_by_channel[int(ch)])
 
     def _configure_twinrx_lo_sharing(self) -> None:
         # Configure source/export before tuning so external/companion LO users tune coherently.
@@ -232,35 +254,44 @@ class UsrpRxDevice:
 
     def _wait_for_lo_lock(self) -> dict[int, bool]:
         start = time.monotonic()
-        timeout_s = max(0.0, float(self._cfg.lo_lock_timeout_s))
+        timeout_s = float(self._cfg.lo_lock_timeout_s)
         deadline = start + timeout_s
         state: dict[int, bool] = {}
+        unavailable: dict[int, str] = {}
         while True:
-            all_locked = True
             state = {}
+            unavailable = {}
             for ch in self._cfg.channels:
                 try:
                     sensor_names = {
                         str(name).lower() for name in self._usrp.get_rx_sensor_names(ch)
                     }
-                    if "lo_locked" not in sensor_names:
-                        continue
+                except Exception as exc:
+                    unavailable[int(ch)] = f"sensor enumeration failed: {exc}"
+                    continue
+                if "lo_locked" not in sensor_names:
+                    unavailable[int(ch)] = "lo_locked sensor not exposed"
+                    continue
+                try:
                     locked = bool(self._usrp.get_rx_sensor("lo_locked", ch).to_bool())
-                except Exception:
+                except Exception as exc:
+                    unavailable[int(ch)] = f"lo_locked query failed: {exc}"
                     continue
                 state[int(ch)] = locked
-                all_locked = all_locked and locked
             self._lo_lock_wait_elapsed_s = time.monotonic() - start
-            if all_locked:
+            if len(state) == len(self._cfg.channels) and all(state.values()):
                 return state
             if time.monotonic() >= deadline:
                 unlocked = [ch for ch, locked in sorted(state.items()) if not locked]
-                if unlocked:
-                    raise RuntimeError(
-                        "Timed out waiting for TwinRX LO lock after "
-                        f"{timeout_s:.2f}s: unlocked channels={unlocked}"
-                    )
-                return state
+                details = ", ".join(
+                    f"ch{channel}: {reason}"
+                    for channel, reason in sorted(unavailable.items())
+                )
+                raise RuntimeError(
+                    "Timed out waiting for verified TwinRX LO lock after "
+                    f"{timeout_s:.2f}s: unlocked channels={unlocked}; "
+                    f"unavailable sensors={{{details}}}"
+                )
             # Sensor polling is a control-plane operation.  Avoid hammering UHD
             # and a host CPU while TwinRX settles after the timed retune.
             time.sleep(0.05)
@@ -292,10 +323,9 @@ class UsrpRxDevice:
             f"rx_bw={self._cfg.usrp_rx_bandwidth_hz/1e6:.3f} MHz, "
             f"gain={self._cfg.gain_db:.1f} dB, "
             f"antennas={self._rx_antenna_report()}, "
-            f"twinrx_lo_sharing={self._cfg.twinrx_lo_sharing}"
+            "twinrx_lo_sharing=True"
         )
-        if self._cfg.twinrx_lo_sharing:
-            lines.append(f"TwinRX LO sharing map: {self._rx_lo_report()}")
+        lines.append(f"TwinRX LO sharing map: {self._rx_lo_report()}")
         if self._fpga_image_report:
             lines.extend(self._fpga_image_report)
         if self._lo_lock_report:
@@ -383,7 +413,7 @@ class UsrpRxDevice:
                 if isinstance(rx_info, dict):
                     dboard = rx_info.get("rx_id", "unknown")
                     serial = rx_info.get("rx_serial", "unknown")
-                    ant = rx_info.get("rx_antenna", self._cfg.antenna)
+                    ant = rx_info.get("rx_antenna", self._rx_antenna_for_channel(ch))
                     lines.append(
                         f"Ch{ch} frontend: dboard={dboard}, serial={serial}, antenna={ant}"
                     )
@@ -412,8 +442,7 @@ class UsrpRxDevice:
                 line += f", lo_source={lo_source}, lo_export={lo_export}"
             except Exception:
                 pass
-            if self._cfg.twinrx_lo_sharing:
-                lines.extend(self._rx_lo_stage_report_lines(ch))
+            lines.extend(self._rx_lo_stage_report_lines(ch))
             try:
                 rx_sensor_names = list(self._usrp.get_rx_sensor_names(ch))
                 line += f", sensors={rx_sensor_names}"
@@ -542,7 +571,12 @@ class UsrpRxDevice:
             # maximum per native call, then assemble the configured DSP chunk
             # in owned NumPy memory.  This also follows UHD's Python example,
             # which sizes recv_buffer from get_max_num_samps().
-            max_native_samps = max(1, int(self._rx_streamer.get_max_num_samps()))
+            max_native_samps = int(self._rx_streamer.get_max_num_samps())
+            if max_native_samps <= 0:
+                raise RuntimeError(
+                    "UHD RX streamer reported a nonpositive maximum packet size: "
+                    f"{max_native_samps}"
+                )
             got_total = 0
             code = _RXEC.none
             while got_total < n:
@@ -557,11 +591,15 @@ class UsrpRxDevice:
                         timeout=timeout_s,
                     )
                 )
+                if got < 0 or got > request_samps:
+                    raise RuntimeError(
+                        "UHD RX streamer returned an invalid sample count: "
+                        f"got={got} requested={request_samps}"
+                    )
                 code = self._metadata.error_code
                 if got > 0:
-                    accepted = min(got, request_samps)
-                    chunk[:, got_total : got_total + accepted] = native_chunk[:, :accepted]
-                    got_total += accepted
+                    chunk[:, got_total : got_total + got] = native_chunk[:, :got]
+                    got_total += got
                 if got <= 0 or code != _RXEC.none:
                     break
             is_overflow = code in (_RXEC.overflow, _RXEC.late)
@@ -617,6 +655,15 @@ class UsrpRxDevice:
                 out_of_sequence=out_of_sequence,
                 time_spec_s=time_spec_s,
             )
+        if code != _RXEC.none:
+            return RxChunkResult(
+                chunk=chunk[:, :got_total],
+                state="other",
+                got_samples=got_total,
+                error_code=error_code,
+                out_of_sequence=out_of_sequence,
+                time_spec_s=time_spec_s,
+            )
         return RxChunkResult(
             chunk=chunk[:, :got_total],
             state="ok",
@@ -635,13 +682,10 @@ class UsrpRxDevice:
 
     def stop(self) -> None:
         with self._stream_lock:
-            if self._stopping:
-                return
             self._stopping = True
-            self._pause_stream_locked()
-
-    def pause_stream(self) -> None:
-        with self._stream_lock:
+            # A failed native stop leaves ``_started`` true. Keep retrying on
+            # later cleanup calls instead of treating the requested-stop flag
+            # as proof that the streamer was actually stopped.
             self._pause_stream_locked()
 
     def _pause_stream_locked(self) -> None:

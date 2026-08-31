@@ -36,11 +36,11 @@ def _sat_sort_key(key: _SatKey) -> tuple[int, int]:
     return (order, prn)
 
 def _sat_public_fields(key: _SatKey) -> dict[str, object]:
-    fields: dict[str, object] = {"prn": _sat_prn(key)}
-    if _sat_constellation(key) != "gps":
-        fields["constellation"] = _sat_constellation(key)
-        fields["satellite_id"] = _sat_label(key)
-    return fields
+    return {
+        "constellation": _sat_constellation(key),
+        "prn": _sat_prn(key),
+        "satellite_id": _sat_label(key),
+    }
 
 
 @dataclass(frozen=True)

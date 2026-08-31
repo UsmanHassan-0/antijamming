@@ -6,7 +6,7 @@ import time
 import pytest
 
 from antijamming.config import default_stream_config
-from antijamming.radio.usrp import UsrpRxDevice
+from antijamming.radio.usrp import UsrpRxDevice, validate_rx_chunk_result
 
 
 @pytest.mark.usrp
@@ -33,11 +33,14 @@ def test_usrp_smoke_recv_and_stop() -> None:
         states: list[str] = []
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline and got_samples == 0:
-            chunk, state = device.recv_chunk()
-            states.append(state)
-            assert chunk.shape[0] == len(cfg.channels)
-            got_samples = int(chunk.shape[1])
-            if state == "other":
+            result = validate_rx_chunk_result(
+                device.recv_chunk(),
+                expected_channels=len(cfg.channels),
+            )
+            states.append(result.state)
+            assert result.chunk.shape[0] == len(cfg.channels)
+            got_samples = int(result.chunk.shape[1])
+            if result.state == "other":
                 pytest.fail("USRP recv returned unknown metadata state 'other'")
         assert got_samples > 0, f"No samples received from USRP (states={states})"
     finally:

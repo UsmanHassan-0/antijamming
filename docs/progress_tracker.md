@@ -11,8 +11,9 @@ links it without rewriting historical observations.
   `0672377aa6c3fa53a11e09747e0cbd300c815579`.
 - Active cleanup branch: `cleanup/no-usrp-verification-20260831`.
 - `main` and `per-prn-fifo-experimental` are outside this branch's mutations.
-- No USRP is attached. Physical TwinRX/X300/UHD timing, RF, antenna, OTA, and
-  live GNSS-SDR behavior are not verified by this cleanup.
+- Laptop verification is hardware-free. Spark inventory discovery sees an
+  X300/HG at `192.168.40.2` and one bladeRF 2.0, but the cleanup branch has not
+  yet completed an attached-runtime test at this checkpoint.
 - A passing test proves only its named inputs and exercised schedules. It does
   not prove that the repository is generally correct or race-free.
 - Architecture splitting, including `runtime/backend.py`, is deferred.
@@ -21,15 +22,75 @@ links it without rewriting historical observations.
 
 | Area | Current state | Next evidence gate |
 | --- | --- | --- |
-| Proven stale code/config | Semantic removal batch passed all hardware-free gates | Attached-runtime validation; future intent changes require a new audit |
+| Proven stale code/config | Known candidates classified and the current removal batch passes software gates | Recheck after attached-runtime findings |
 | Thread/resource ownership | Deterministic failure paths and repeated software gates passed | Unknown schedules and hardware timing remain unproven |
 | Concurrent transitions | Selected start/stop/connect/publish schedules regression-tested | Repeated stress; unknown schedules remain unproven |
 | Configuration/input boundaries | Focused and broad regressions passed | Attached-runtime validation |
 | Numerical/DSP boundaries | Focused and broad deterministic regressions passed | OTA correctness remains separate |
 | Documentation | One tracker, consecutive conceptual docs, retained audit index, and provenance map | Maintain these documents with future changes |
-| Hardware integration | Unverified: no attached USRP | Separate dated hardware run |
+| Hardware integration | Spark inventory discovered; cleanup runtime not yet exercised | Copy exact branch without GitHub push, then attached USRP/GNSS-SDR run |
 
 ## Timestamped change log
+
+### 2026-08-31T22:26:31+05:00 — strict active-contract software checkpoint
+
+- Removed the optional preserve/target selectors, configuration-disabled
+  single-FIFO path, RF-budget code, experiment overlay, old GNSS bridge facade,
+  obsolete executable/state aliases, and their test-only compatibility shapes.
+  Uniform output remains because it is the active safety state; healthy-U1
+  capture remains because the fixed measured-U1 constraint requires it. The
+  strongest eligible MUSIC peak outside the frozen bladeRF guard remains the
+  fixed ordinary target-selection algorithm, not a selectable legacy mode and
+  not physical jammer truth.
+- Normalized GNSS state through the active producer/IPC/UI contract. Internal
+  maps use `(constellation, PRN)` keys; every public record carries
+  `constellation`, `prn`, and `satellite_id`; public summary lists use labels.
+  GPS-only integer list aliases and consumer fallbacks are absent. A GPS/BeiDou
+  equal-PRN regression proves collision separation for that exercised case.
+- Traced the typed USRP receive result through the backend, hardware smoke test,
+  standalone source-count tool, and fakes. This found and removed a stale tuple
+  unpack in `tools/usrp_source_count_snapshot.py`. Constant-time validation now
+  rejects wrong result type, channel count, rank, dtype, or sample count before
+  IQ consumption. Unsupported UHD metadata is retried once at startup and is a
+  runtime failure later; its IQ is not published to DSP or GNSS queues.
+- Added deterministic regressions for the Shared-U1 submit/stop sentinel race,
+  retained handoff dependencies after a missed join, GNSS NMEA PTY startup
+  ordering, successful-protocol/failed-start IPC replies, verified per-channel
+  LO-lock sensors, and invalid UHD packet/sample metadata. Each result is
+  bounded to the injected schedule or fake interface.
+- Made diagnostic-sidecar teardown one-shot and process-group owned. Its
+  focused SIGTERM harness verifies one final manifest transition and reaping of
+  every launched monitor group; other signal schedules remain unproven.
+- The GUI and schema-version-3 full-angle record now separate the ordinary
+  common ideal-target response from the shared measured-U1 FIFO response. Both
+  are labeled computed ideal-steering scans, never measured OTA null depth. The
+  ordinary marker belongs to the strongest eligible MUSIC target only. The
+  active status calls this an interference-evidence gate, and the stale
+  `confirmed_jammer_bearing` claim is absent because no ground-truth jammer
+  bearing enters this path.
+- Full development-mode suite after these changes:
+  `397 passed, 1 skipped` with `PYTHONFAULTHANDLER=1`,
+  `PYTHONMALLOC=debug`, `PYTHONDEVMODE=1`, and `PYTHONWARNINGS=error`. The skip
+  is the explicit physical-USRP smoke test. A separate full coverage run also
+  passed at 78% aggregate project-source line coverage. Configured Ruff,
+  `compileall`, shell syntax, `git diff --check`, and Vulture review also ran;
+  the 60% Vulture reports were generated protobuf descriptor fields, UHD
+  command attributes, and a pytest-discovered fixture. Attached behavior and
+  unknown concurrency schedules remain unproven.
+
+### 2026-08-31T18:07:13+05:00 — second completion claim retracted
+
+- The 17:16 software gates remain valid for commit `9265a3c`, but they did not
+  justify describing the whole semantic cleanup as complete.
+- `uniform`/`healthy_reference` preserve modes, the
+  `strongest_music_peak` target mode, and configuration-disabled single-FIFO
+  operation remain reachable without a demonstrated current product consumer.
+- Essential uniform safety output and healthy-reference capture are separate
+  from those optional runtime modes and must not be removed with them.
+- The offline RF calculator and historical RF/expected-bearing summary parsing
+  also remain even though the product runtime no longer produces their inputs.
+- Status: semantic review is active again. The next pass must classify these
+  paths by current product intent and rerun evidence after any removal.
 
 ### 2026-08-31T17:16:54+05:00 — semantic cleanup software verification
 
@@ -186,11 +247,10 @@ Known diagnostic debt, not represented as clean:
 - `runtime/backend.py` and `ui/main_window.py` remain large. Splitting them is a
   separate architecture task because moving ownership boundaries during this
   lifecycle cleanup would make behavior comparison harder.
-- The alternative `uniform`/`healthy_reference` preserve modes and
-  `strongest_music_peak` target mode remain explicit diagnostic algorithm
-  baselines. The fixed product profile selects measured-U1 preservation and a
-  peak outside its frozen guard; these alternatives do not encode bench
-  geometry or expected physical bearings.
+- Uniform output and healthy-reference capture remain active algorithm
+  necessities, not selectable preserve modes. The ordinary target selector is
+  fixed to the strongest eligible MUSIC peak outside the frozen bladeRF guard;
+  it is not a physical-jammer classifier and has no alternate runtime selector.
 - Uniform output while measured-U1 activation evidence is unavailable remains
   an active safety state, not a stale compatibility path. It prevents applying
   unproven null weights until the live angle cluster, healthy receiver state,

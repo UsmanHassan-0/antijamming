@@ -56,3 +56,29 @@ def test_runtime_failure_before_running_releases_waiter() -> None:
     assert not worker.isRunning()
     assert worker.wait(0)
     assert worker._pending_start_request_id is None
+
+
+def test_successful_start_reply_with_started_false_releases_waiter() -> None:
+    worker = RemoteStreamWorker(Path("/unused"))
+    client = _CommandClient()
+    worker._client = client  # type: ignore[assignment]
+    failures: list[str] = []
+    worker.failed.connect(failures.append)
+    worker.start()
+    request_id = client.commands[0][1]
+
+    worker._on_message(
+        {
+            "type": "reply",
+            "request_id": request_id,
+            "ok": True,
+            "result": {"accepted": True, "started": False},
+        }
+    )
+
+    assert not worker.isRunning()
+    assert worker.wait(0)
+    assert worker._pending_start_request_id is None
+    assert failures == [
+        "Backend start was not accepted because a prior run is still finishing"
+    ]

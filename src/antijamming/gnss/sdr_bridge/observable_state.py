@@ -21,7 +21,7 @@ class ObservableStateMixin:
         return self._prefixed_synchro_fields(
             observable,
             prefix="observable",
-            aliases={
+            renames={
                 "rx_time": "observable_rx_time_s",
                 "tow_s": "observable_tow_s",
                 "carrier_doppler_hz": "observable_doppler_hz",
@@ -37,7 +37,7 @@ class ObservableStateMixin:
         return self._prefixed_synchro_fields(
             tracking,
             prefix="tracking_monitor",
-            aliases={
+            renames={
                 "prn": "tracking_monitor_prn",
                 "channel": "tracking_monitor_channel",
                 "rx_time": "tracking_monitor_rx_time_s",
@@ -57,16 +57,12 @@ class ObservableStateMixin:
         entry: dict[str, object],
         *,
         prefix: str,
-        aliases: dict[str, str],
+        renames: dict[str, str],
     ) -> dict[str, object]:
         fields: dict[str, object] = {}
         for key, value in entry.items():
             if isinstance(value, (str, int, float, bool)):
-                fields[f"{prefix}_{key}"] = value
-        for src, dest in aliases.items():
-            value = entry.get(src)
-            if isinstance(value, (str, int, float, bool)):
-                fields[dest] = value
+                fields[renames.get(key, f"{prefix}_{key}")] = value
         return fields
 
     def _public_observable_entry(

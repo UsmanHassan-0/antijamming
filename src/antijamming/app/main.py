@@ -97,6 +97,41 @@ def _reap_backend_process(
         return False
 
 
+def _cleanup_gui_owners(
+    *,
+    uhd_marker_monitor: object,
+    worker: object,
+    backend_process: subprocess.Popen,
+    loggers: dict,
+) -> bool:
+    """Attempt every GUI-owned shutdown step and report complete ownership release."""
+
+    marker_stopped = bool(uhd_marker_monitor.stop())
+    if worker.isRunning():
+        worker.stop()
+        if not worker.wait(10000):
+            loggers["errors"].error(
+                "GUI worker did not report backend stop within 10 seconds."
+            )
+    worker.shutdown_service("standalone GUI exit")
+    process_reaped = _reap_backend_process(
+        backend_process,
+        loggers,
+        initial_wait_s=18.0,
+    )
+    client_stopped = bool(worker.close())
+    complete = bool(marker_stopped and process_reaped and client_stopped)
+    if not complete:
+        loggers["errors"].error(
+            "GUI cleanup incomplete; retained owners will be retried: "
+            "uhd_monitor=%s backend_reaped=%s ipc_client=%s",
+            marker_stopped,
+            process_reaped,
+            client_stopped,
+        )
+    return complete
+
+
 def _run_gui(
     cfg: StreamConfig,
     *,
@@ -111,7 +146,7 @@ def _run_gui(
     from antijamming.runtime.remote_worker import RemoteStreamWorker
 
     app = QApplication(sys.argv[:1])
-    loggers = setup_logging(cfg.log_dir)
+    loggers = setup_logging(cfg.log_dir, enabled=cfg.logging_enabled)
     uhd_marker_monitor = UhdConsoleMarkerMonitor(
         cfg.log_dir / "uhd_console.log",
         loggers,
@@ -119,7 +154,8 @@ def _run_gui(
         channel_count=len(cfg.channels),
         samples_per_chunk=int(cfg.samples_per_chunk),
     )
-    uhd_marker_monitor.start()
+    if cfg.logging_enabled:
+        uhd_marker_monitor.start()
     numeric_pools = threadpool_info()
     loggers["app"].info(
         "Numeric thread pools limited to %d thread: %s",
@@ -160,24 +196,22 @@ def _run_gui(
         uhd_marker_monitor.stop()
         raise
     shutdown_requested = {"value": False}
+    cleanup_in_progress = {"value": False}
     cleanup_completed = {"value": False}
 
     def _cleanup_worker() -> None:
-        if cleanup_completed["value"]:
+        if cleanup_completed["value"] or cleanup_in_progress["value"]:
             return
-        cleanup_completed["value"] = True
-        uhd_marker_monitor.stop()
-        if worker.isRunning():
-            worker.stop()
-            if not worker.wait(10000):
-                loggers["errors"].error("GUI worker did not stop within 10 seconds.")
-        worker.shutdown_service("standalone GUI exit")
-        _reap_backend_process(
-            backend_process,
-            loggers,
-            initial_wait_s=18.0,
-        )
-        worker.close()
+        cleanup_in_progress["value"] = True
+        try:
+            cleanup_completed["value"] = _cleanup_gui_owners(
+                uhd_marker_monitor=uhd_marker_monitor,
+                worker=worker,
+                backend_process=backend_process,
+                loggers=loggers,
+            )
+        finally:
+            cleanup_in_progress["value"] = False
 
     try:
         win = MainWindow(cfg, worker)

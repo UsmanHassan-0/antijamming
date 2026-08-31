@@ -189,34 +189,48 @@ class SharedU1PhaseCompensationBank:
     def __init__(
         self,
         *,
-        satellites: tuple[int, ...],
+        source_count: int,
         channel_count: int,
         sample_rate_hz: float,
         samples_per_chunk: int,
         transition_s: float,
-        source_count: int | None = None,
         max_weight_norm: float = 8.0,
         min_post_onset_desired_updates: int = 3,
         max_post_onset_desired_step_deg: float = 10.0,
     ) -> None:
-        self._satellites = tuple(int(value) for value in satellites)
-        self._source_count = (
-            len(self._satellites)
-            if self._satellites
-            else max(1, int(source_count or 0))
-        )
+        self._source_count = int(source_count)
         self._channel_count = int(channel_count)
-        chunk_s = max(1, int(samples_per_chunk)) / max(1.0, float(sample_rate_hz))
+        sample_rate = float(sample_rate_hz)
+        chunk_samples = int(samples_per_chunk)
+        transition = float(transition_s)
+        weight_norm_limit = float(max_weight_norm)
+        post_onset_updates = int(min_post_onset_desired_updates)
+        post_onset_step = float(max_post_onset_desired_step_deg)
+        if self._source_count <= 0:
+            raise ValueError("shared-U1 source_count must be positive")
+        if self._channel_count <= 0:
+            raise ValueError("shared-U1 channel_count must be positive")
+        if not math.isfinite(sample_rate) or sample_rate <= 0.0:
+            raise ValueError("shared-U1 sample_rate_hz must be positive and finite")
+        if chunk_samples <= 0:
+            raise ValueError("shared-U1 samples_per_chunk must be positive")
+        if not math.isfinite(transition) or transition < 0.0:
+            raise ValueError("shared-U1 transition_s must be nonnegative and finite")
+        if not math.isfinite(weight_norm_limit) or weight_norm_limit <= 0.0:
+            raise ValueError("shared-U1 max_weight_norm must be positive and finite")
+        if post_onset_updates < 2:
+            raise ValueError("shared-U1 post-onset update count must be at least 2")
+        if not math.isfinite(post_onset_step) or not 0.0 < post_onset_step <= 90.0:
+            raise ValueError("shared-U1 post-onset step must be in (0, 90] degrees")
+        chunk_s = chunk_samples / sample_rate
         self._transition_chunks = (
             0
-            if float(transition_s) <= 0.0
-            else max(1, int(math.ceil(float(transition_s) / chunk_s)))
+            if transition == 0.0
+            else max(1, int(math.ceil(transition / chunk_s)))
         )
-        self._max_weight_norm = max(float(max_weight_norm), 1e-6)
-        self._min_post_onset_updates = max(2, int(min_post_onset_desired_updates))
-        self._max_post_onset_step_deg = max(
-            0.1, min(float(max_post_onset_desired_step_deg), 90.0)
-        )
+        self._max_weight_norm = weight_norm_limit
+        self._min_post_onset_updates = post_onset_updates
+        self._max_post_onset_step_deg = post_onset_step
         self._states: dict[int, _PhaseState] = {}
         self._enabled_previous = False
         self._activation_monotonic: float | None = None
@@ -329,6 +343,31 @@ class SharedU1PhaseCompensationBank:
             dtype=np.complex128,
         )
 
+    def applied_source_labels(
+        self,
+        source_satellites: tuple[int | None, ...] | None = None,
+    ) -> tuple[str, ...]:
+        """Describe the exact logical weight source currently used by each row."""
+
+        supplied = tuple(source_satellites or ())
+        labels: list[str] = []
+        for row_index in range(self._source_count):
+            prn = (
+                int(supplied[row_index])
+                if row_index < len(supplied) and supplied[row_index] is not None
+                else None
+            )
+            if prn is None:
+                labels.append("shared_common_waiting_for_channel_prn")
+                continue
+            state = self._states.get(row_index)
+            satellite = f"G{prn:02d}"
+            if state is None or state.satellite != satellite:
+                labels.append("shared_common_waiting_for_prn_vector")
+                continue
+            labels.append(str(state.source))
+        return tuple(labels)
+
     def advance(
         self,
         *,
@@ -372,18 +411,15 @@ class SharedU1PhaseCompensationBank:
         if protection_changed:
             self._last_shared_protection = np.array(protection, copy=True)
 
-        if self._satellites:
-            active_satellites: tuple[int | None, ...] = tuple(self._satellites)
-        else:
-            supplied = tuple(source_satellites or ())
-            active_satellites = tuple(
-                (
-                    int(supplied[index])
-                    if index < len(supplied) and supplied[index] is not None
-                    else None
-                )
-                for index in range(self._source_count)
+        supplied = tuple(source_satellites or ())
+        active_satellites = tuple(
+            (
+                int(supplied[index])
+                if index < len(supplied) and supplied[index] is not None
+                else None
             )
+            for index in range(self._source_count)
+        )
         rows = np.empty(
             (self._source_count, self._channel_count),
             dtype=np.complex128,
@@ -610,11 +646,10 @@ class SharedU1DesiredVectorMonitor:
         channel_count: int,
         phase_correction_vector: tuple[complex, ...] | None,
         tracking_snapshot: Callable[[], dict[str, object]],
-        session_dir: Path,
-        session_id: str,
+        session_dir: Path | None,
+        session_id: str | None,
         logger: logging.Logger,
-        satellites: tuple[int, ...],
-        source_count: int | None = None,
+        source_count: int,
         retention_s: float = 0.75,
         measurement_interval_s: float = 1.0,
         min_cno_db_hz: float = 30.0,
@@ -622,32 +657,48 @@ class SharedU1DesiredVectorMonitor:
     ) -> None:
         self._fs = float(sample_rate_hz)
         self._channel_count = int(channel_count)
-        correction = phase_correction_vector or tuple(
-            1.0 + 0.0j for _ in range(self._channel_count)
+        if not math.isfinite(self._fs) or self._fs <= 0.0:
+            raise ValueError("phase-vector monitor sample rate must be positive and finite")
+        if self._channel_count <= 0:
+            raise ValueError("phase-vector monitor channel count must be positive")
+        correction = (
+            tuple(1.0 + 0.0j for _ in range(self._channel_count))
+            if phase_correction_vector is None
+            else phase_correction_vector
         )
         self._correction = np.asarray(correction, dtype=np.complex64).reshape(-1)
         if self._correction.size != self._channel_count:
             raise ValueError("phase correction length does not match channel count")
         self._tracking_snapshot = tracking_snapshot
-        self._session_id = str(session_id)
+        self._session_id = str(session_id) if session_id is not None else None
         self._logger = logger
+        retention = float(retention_s)
+        measurement_interval = float(measurement_interval_s)
+        if not math.isfinite(retention) or retention < 0.1:
+            raise ValueError("phase-vector monitor retention_s must be at least 0.1")
+        if not math.isfinite(measurement_interval) or measurement_interval < 0.2:
+            raise ValueError(
+                "phase-vector monitor measurement_interval_s must be at least 0.2"
+            )
         self._retention_samples = max(
-            int(round(max(0.1, float(retention_s)) * self._fs)),
+            int(round(retention * self._fs)),
             int(round(0.02 * self._fs)),
         )
-        self._measurement_interval_s = max(0.2, float(measurement_interval_s))
+        self._measurement_interval_s = measurement_interval
         self._min_cno_db_hz = float(min_cno_db_hz)
-        self._min_quality_measurements = max(1, int(min_quality_measurements))
-        self._satellite_rows = {
-            f"G{int(prn):02d}": index for index, prn in enumerate(satellites)
-        }
-        self._dynamic_sources = not bool(self._satellite_rows)
-        self._source_count = (
-            len(self._satellite_rows)
-            if self._satellite_rows
-            else max(1, int(source_count or 0))
+        if not math.isfinite(self._min_cno_db_hz):
+            raise ValueError("phase-vector monitor minimum C/N0 must be finite")
+        self._min_quality_measurements = int(min_quality_measurements)
+        self._source_count = int(source_count)
+        if self._min_quality_measurements <= 0:
+            raise ValueError("phase-vector monitor quality measurement count must be positive")
+        if self._source_count <= 0:
+            raise ValueError("phase-vector monitor source count must be positive")
+        self._path = (
+            Path(session_dir) / "shared_u1_phase_vectors.jsonl"
+            if session_dir is not None
+            else None
         )
-        self._path = Path(session_dir) / "shared_u1_phase_vectors.jsonl"
         self._queue: queue.Queue[
             tuple[int, np.ndarray, np.ndarray] | None
         ] = queue.Queue(maxsize=256)
@@ -684,14 +735,14 @@ class SharedU1DesiredVectorMonitor:
                 return
             self._queue = queue.Queue(maxsize=256)
             self._stop.clear()
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._handle = self._path.open("a", encoding="utf-8", buffering=1)
+            if self._path is not None:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                self._handle = self._path.open("a", encoding="utf-8", buffering=1)
             self._write(
                 {
                     "event": "shared_u1_phase_vector_monitor_start",
                     "schema_version": 1,
-                    "satellites": sorted(self._satellite_rows),
-                    "dynamic_channel_prn_mapping": self._dynamic_sources,
+                    "dynamic_channel_prn_mapping": True,
                     "source_count": self._source_count,
                     "purpose": (
                         "PRN code-despread desired vectors for shared measured-U1 "
@@ -723,18 +774,21 @@ class SharedU1DesiredVectorMonitor:
         raw_chunk: np.ndarray,
         logical_weights: np.ndarray,
     ) -> None:
-        with self._lifecycle_lock:
-            if not self._accepting_samples:
-                return
         item = (
             int(sample_start),
             np.array(raw_chunk, dtype=np.complex64, copy=True, order="C"),
             np.asarray(logical_weights, dtype=np.complex128).copy(),
         )
-        try:
-            self._queue.put_nowait(item)
-        except queue.Full:
-            self._queue_drops += 1
+        # Copy before taking the lifecycle lock, then publish while holding it.
+        # stop() cannot insert its sentinel between the accepting-state check and
+        # this enqueue, so no large IQ item can be stranded behind shutdown.
+        with self._lifecycle_lock:
+            if not self._accepting_samples:
+                return
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                self._queue_drops += 1
 
     def stop(self, timeout_s: float = 3.0) -> bool:
         with self._lifecycle_lock:
@@ -876,17 +930,12 @@ class SharedU1DesiredVectorMonitor:
                 tracking_channel = int(entry.get("channel", -1))
             except (TypeError, ValueError):
                 tracking_channel = -1
-            source_index = (
-                tracking_channel
-                if self._dynamic_sources
-                else self._satellite_rows.get(satellite, -1)
-            )
+            source_index = tracking_channel
             counter = int(entry.get("tracking_sample_counter", 0) or 0)
             cno = _finite_float(entry.get("cn0_db_hz"))
             doppler = _finite_float(entry.get("carrier_doppler_hz"))
             if (
-                (not self._dynamic_sources and satellite not in self._satellite_rows)
-                or source_index < 0
+                source_index < 0
                 or source_index >= self._source_count
                 or system not in {"G", "GPS"}
                 or signal != "1C"

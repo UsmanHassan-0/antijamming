@@ -114,14 +114,38 @@ def test_headless_service_stays_idle_until_explicit_start_command(tmp_path) -> N
         "mark_rf_event",
         {
             "event": "jammer_on",
-            "attenuation_db": "50",
-            "bladeRF_gain_db": 50,
             "notes": "unit test",
             "source": "gui",
         },
     )
     assert marker["event"]["event"] == "jammer_on"
-    assert marker["event"]["attenuation_db"] == 50.0
+    assert marker["event"]["notes"] == "unit test"
+
+
+@pytest.mark.parametrize("invalid", [True, 1.0, "1", None])
+def test_headless_rejects_noninteger_source_count(tmp_path, invalid) -> None:
+    service = HeadlessRuntimeService(
+        object(),  # type: ignore[arg-type]
+        {"app": __import__("logging").getLogger("headless-source-type-test")},
+        tmp_path / "source-type.sock",
+        backend_factory=lambda **_kwargs: object(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError, match="integer 'count'"):
+        service._handle_command("set_expected_sources", {"count": invalid})
+
+
+@pytest.mark.parametrize("invalid", [0, 1, "false", None])
+def test_headless_rejects_nonboolean_lcmv_state(tmp_path, invalid) -> None:
+    service = HeadlessRuntimeService(
+        object(),  # type: ignore[arg-type]
+        {"app": __import__("logging").getLogger("headless-lcmv-type-test")},
+        tmp_path / "lcmv-type.sock",
+        backend_factory=lambda **_kwargs: object(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError, match="boolean 'enabled'"):
+        service._handle_command("set_lcmv_test_enabled", {"enabled": invalid})
 
 
 def test_headless_backend_monitor_start_failure_rolls_back_backend(
@@ -179,6 +203,40 @@ def test_headless_backend_monitor_start_failure_rolls_back_backend(
     assert service._monitor_thread is None
 
 
+def test_headless_does_not_start_while_prior_monitor_is_still_exiting(tmp_path) -> None:
+    created = []
+
+    class FakeBackend:
+        def __init__(self, **_kwargs) -> None:
+            self.starts = 0
+            created.append(self)
+
+        @staticmethod
+        def is_running() -> bool:
+            return False
+
+        def start(self) -> None:
+            self.starts += 1
+
+    service = HeadlessRuntimeService(
+        object(),  # type: ignore[arg-type]
+        {"app": __import__("logging").getLogger("headless-monitor-race-test")},
+        tmp_path / "monitor-race.sock",
+        backend_factory=FakeBackend,  # type: ignore[arg-type]
+    )
+    release = threading.Event()
+    prior_monitor = threading.Thread(target=release.wait)
+    prior_monitor.start()
+    service._monitor_thread = prior_monitor
+
+    try:
+        assert service._start_backend("racing restart") is False
+        assert created[0].starts == 0
+    finally:
+        release.set()
+        prior_monitor.join(timeout=1.0)
+
+
 def test_json_ipc_round_trip_does_not_require_backend_or_hardware(tmp_path) -> None:
     commands: list[tuple[str, dict]] = []
     messages: list[dict] = []
@@ -213,7 +271,7 @@ def test_json_ipc_round_trip_does_not_require_backend_or_hardware(tmp_path) -> N
         )
     finally:
         client.close()
-        server.close()
+        assert server.close()
 
     assert client._reader is None
 
@@ -327,7 +385,35 @@ def test_json_ipc_server_accept_thread_start_failure_rolls_back_socket(
     assert not socket_path.exists()
 
     server.start()
-    server.close()
+    assert server.close()
+
+
+def test_json_ipc_server_close_retains_live_acceptor_for_retry(tmp_path) -> None:
+    class RetryingThread:
+        ident = 1
+
+        def __init__(self) -> None:
+            self.join_calls = 0
+            self.live = True
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 1.0
+            self.join_calls += 1
+
+        def is_alive(self) -> bool:
+            return self.live
+
+    server = JsonIpcServer(tmp_path / "headless.sock", on_command=lambda _command, _args: {})
+    acceptor = RetryingThread()
+    server._accept_thread = acceptor  # type: ignore[assignment]
+
+    assert server.close() is False
+    assert server._accept_thread is acceptor
+
+    acceptor.live = False
+    assert server.close() is True
+    assert server._accept_thread is None
+    assert acceptor.join_calls == 1
 
 
 def test_json_ipc_session_sender_start_failure_does_not_kill_acceptor(

@@ -11,17 +11,7 @@ import json
 import math
 from pathlib import Path
 import re
-import sys
 from typing import Iterable
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-from antijamming.rf import compute_rf_budget
-
 
 LOG_PREFIX_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) \| "
@@ -32,7 +22,6 @@ KV_RE = re.compile(
 )
 
 CURRENT_LCMV_METHODS = {
-    "covariance_lcmv_ideal",
     "covariance_lcmv_measured_u1",
 }
 
@@ -48,7 +37,7 @@ class IntervalStats:
     noise_tail_spread_db: list[float] = field(default_factory=list)
     noise_tail_flatness_db: list[float] = field(default_factory=list)
     noise_tail_white_like: Counter[str] = field(default_factory=Counter)
-    model_null_db: list[float] = field(default_factory=list)
+    model_min_db: list[float] = field(default_factory=list)
     reduction_uniform_db: list[float] = field(default_factory=list)
     reduction_raw_avg_db: list[float] = field(default_factory=list)
     reduction_raw_sum_db: list[float] = field(default_factory=list)
@@ -59,11 +48,8 @@ class IntervalStats:
     observations: Counter[int] = field(default_factory=Counter)
     observation_values: list[float] = field(default_factory=list)
     used_prns: Counter[str] = field(default_factory=Counter)
-    music_in_jammer: Counter[str] = field(default_factory=Counter)
-    music_in_bladerf: Counter[str] = field(default_factory=Counter)
     spatial_coherence_abs: list[float] = field(default_factory=list)
     spatial_principal_angle_deg: list[float] = field(default_factory=list)
-    spatial_predicted_u1_gain_db: list[float] = field(default_factory=list)
     spatial_active_methods: Counter[str] = field(default_factory=Counter)
     spatial_active_applied_methods: Counter[str] = field(default_factory=Counter)
     spatial_candidate_valid: Counter[str] = field(default_factory=Counter)
@@ -98,15 +84,14 @@ def main() -> int:
     ]
 
     app = parse_app_log(logs / "app.log")
-    operator_events = parse_operator_events(logs / "operator_events.log")
+    operator_event_path = logs / "operator_events.jsonl"
+    if not operator_event_path.is_file():
+        operator_event_path = logs / "operator_events.log"
+    operator_events = parse_operator_events(operator_event_path)
     for ts, payload in operator_events:
         event = str(payload.get("event", ""))
         if event in {"lcmv_on", "lcmv_off"}:
             app.setdefault("toggles", []).append((ts, event == "lcmv_on"))
-    manifest, rf_budget = parse_manifest_budget(logs)
-    marked_rf_budget, marked_rf_basis = operator_marked_rf_budget(
-        manifest, operator_events
-    )
     usrp = parse_usrp_config(logs / "usrp_hardware.log")
     timeline = parse_timeline(logs)
     spatial_events = parse_spatial_events(logs)
@@ -132,20 +117,6 @@ def main() -> int:
         "channels",
     ):
         print(f"  {key}: {usrp.get(key, '--')}")
-    print()
-    print("Experiment manifest")
-    print_json_summary(manifest)
-    print()
-    print("RF budget")
-    print_json_summary(rf_budget)
-    print_js_summary(rf_budget)
-    print_metadata_warnings(manifest)
-    if marked_rf_budget:
-        print()
-        print("Operator-marked RF budget")
-        print(f"  basis: {marked_rf_basis}")
-        print_json_summary(marked_rf_budget)
-        print_js_summary(marked_rf_budget)
     print()
     print("Operator events")
     print_operator_events(operator_events)
@@ -194,20 +165,6 @@ def parse_app_log(path: Path) -> dict[str, object]:
             enabled = "lcmv_test_enabled=True" in msg
             result.setdefault("toggles", []).append((ts, enabled))
     return result
-
-
-def parse_manifest_budget(logs: Path) -> tuple[dict[str, object], dict[str, object]]:
-    manifest: dict[str, object] = {}
-    budget: dict[str, object] = {}
-    for path in (logs / "app.log", logs / "analysis.log", logs / "lcmv.log"):
-        for _ts, msg in iter_log(path):
-            if msg.startswith("experiment_manifest "):
-                manifest = parse_json_after(msg, "experiment_manifest ") or manifest
-            elif msg.startswith("rf_budget "):
-                budget = parse_json_after(msg, "rf_budget ") or budget
-        if manifest and budget:
-            break
-    return manifest, budget
 
 
 def parse_usrp_config(path: Path) -> dict[str, object]:
@@ -272,9 +229,7 @@ def parse_timeline(logs: Path) -> list[tuple[datetime, str, dict[str, object]]]:
         if not payload:
             continue
         event = str(payload.get("event", ""))
-        if event == "lcmv_model_response_absolute":
-            events.append((ts, "lcmv_pattern", payload))
-        elif event == "full_angle_analysis":
+        if event == "full_angle_analysis":
             events.append((ts, "analysis", payload))
     for ts, msg in iter_log(logs / "lcmv_pattern_absolute.jsonl"):
         payload = parse_json_line(msg)
@@ -285,20 +240,9 @@ def parse_timeline(logs: Path) -> list[tuple[datetime, str, dict[str, object]]]:
 
 def parse_spatial_events(logs: Path) -> list[tuple[datetime, dict[str, object]]]:
     events: list[tuple[datetime, dict[str, object]]] = []
-    seen: set[tuple[object, object, object]] = set()
-    for path in (logs / "analysis.log", logs / "spatial_vector_diagnostics.jsonl"):
-        for ts, msg in iter_log(path):
-            payload = parse_json_line(msg)
-            if not payload or payload.get("event") != "spatial_vector_diagnostics":
-                continue
-            key = (
-                payload.get("sequence"),
-                payload.get("music_internal_angle_deg"),
-                payload.get("sample_count"),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
+    for ts, msg in iter_log(logs / "spatial_vector_diagnostics.jsonl"):
+        payload = parse_json_line(msg)
+        if payload and payload.get("event") == "spatial_vector_diagnostics":
             events.append((ts, payload))
     return sorted(events, key=lambda item: item[0])
 
@@ -306,20 +250,14 @@ def parse_spatial_events(logs: Path) -> list[tuple[datetime, dict[str, object]]]
 def parse_calibration_logs(logs: Path) -> dict[str, object]:
     manifests: list[dict[str, object]] = []
     phase_diags: list[dict[str, object]] = []
-    for path in (logs / "app.log", logs / "analysis.log"):
-        for _ts, msg in iter_log(path):
-            payload = parse_json_after(msg, "calibration_manifest ")
-            if payload:
-                manifests.append(payload)
-    for path in (
-        logs / "phase_alignment.log",
-        logs / "stream_health.log",
-        logs / "analysis.log",
-    ):
-        for _ts, msg in iter_log(path):
-            payload = parse_json_after(msg, "phase_channel_diagnostics ")
-            if payload:
-                phase_diags.append(payload)
+    for _ts, msg in iter_log(logs / "app.log"):
+        payload = parse_json_after(msg, "calibration_manifest ")
+        if payload:
+            manifests.append(payload)
+    for _ts, msg in iter_log(logs / "phase_alignment.log"):
+        payload = parse_json_after(msg, "phase_channel_diagnostics ")
+        if payload:
+            phase_diags.append(payload)
     return {"manifests": manifests, "phase_diags": phase_diags}
 
 
@@ -422,7 +360,7 @@ def assign_metrics_to_intervals(
             append_float(interval.cal_spread_db, data.get("cal_power_spread_db"))
         elif kind == "lcmv_pattern":
             append_float(
-                interval.model_null_db, data.get("model_response_at_selected_null_db")
+                interval.model_min_db, data.get("model_min_response_db")
             )
             out = data.get("output_metrics", {})
             if isinstance(out, dict):
@@ -439,23 +377,13 @@ def assign_metrics_to_intervals(
                     out.get("measured_output_reduction_vs_raw_sum_channels_db"),
                 )
         elif kind == "analysis":
-            hints = data.get("classification_hints", {})
-            if isinstance(hints, dict):
-                counter_bool(
-                    interval.music_in_jammer,
-                    hints.get("primary_peak_inside_expected_jammer_range"),
-                )
-                counter_bool(
-                    interval.music_in_bladerf,
-                    hints.get("primary_peak_inside_expected_bladeRF_range"),
-                )
             lcmv = data.get("lcmv", {})
             if isinstance(lcmv, dict):
                 summary = lcmv.get("lcmv_model_summary", {})
                 if isinstance(summary, dict):
                     append_float(
-                        interval.model_null_db,
-                        summary.get("model_response_at_selected_null_db"),
+                        interval.model_min_db,
+                        summary.get("model_min_response_db"),
                     )
         elif kind == "spatial":
             append_float(
@@ -464,10 +392,6 @@ def assign_metrics_to_intervals(
             append_float(
                 interval.spatial_principal_angle_deg,
                 data.get("ideal_measured_principal_angle_deg"),
-            )
-            append_float(
-                interval.spatial_predicted_u1_gain_db,
-                data.get("predicted_u1_lcmv_output_gain_over_ideal_lcmv_db"),
             )
             method = str(data.get("active_lcmv_null_method", "--"))
             interval.spatial_active_methods[method] += 1
@@ -609,13 +533,6 @@ def increment_int(counter: Counter[int], value: object) -> None:
         return
 
 
-def counter_bool(counter: Counter[str], value: object) -> None:
-    if value is None:
-        counter["unknown"] += 1
-    else:
-        counter[str(bool(value))] += 1
-
-
 def int_or_zero(value: object) -> int:
     try:
         return int(value)
@@ -688,84 +605,6 @@ def mean_or_none(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
-def print_json_summary(payload: dict[str, object]) -> None:
-    if not payload:
-        print("  --")
-        return
-    for key in sorted(payload):
-        value = payload[key]
-        if isinstance(value, float):
-            value = f"{value:.3f}"
-        print(f"  {key}: {value}")
-
-
-def print_metadata_warnings(manifest: dict[str, object]) -> None:
-    required = (
-        "bladeRF_tx_gain_db",
-        "bladeRF_tx_power_dbm_est",
-        "jammer_attenuation_db",
-        "jammer_l1_4mhz_avg_dbm",
-        "bladeRF_distance_m",
-        "jammer_distance_m",
-        "usrp_rx_gain_db",
-        "center_freq_hz",
-        "sample_rate_sps",
-        "rx_bandwidth_hz",
-    )
-    missing = [key for key in required if manifest.get(key) in (None, "", "unknown")]
-    if missing:
-        print(f"  metadata warning: missing/unknown {', '.join(missing)}")
-    else:
-        print("  metadata warning: none")
-
-
-def operator_marked_rf_budget(
-    manifest: dict[str, object],
-    operator_events: list[tuple[datetime, dict[str, object]]],
-) -> tuple[dict[str, object], str]:
-    """Recompute RF levels from the latest explicit attenuation marker."""
-
-    attenuation_db: float | None = None
-    marker_event = ""
-    marker_time: datetime | None = None
-    for ts, payload in operator_events:
-        event = str(payload.get("event", ""))
-        if event not in {"attenuation_db", "jammer_on"}:
-            continue
-        candidate = numeric_or_none(payload.get("attenuation_db"))
-        if candidate is None:
-            continue
-        attenuation_db = candidate
-        marker_event = event
-        marker_time = ts
-    if attenuation_db is None:
-        return {}, ""
-    marked_manifest = dict(manifest)
-    marked_manifest["jammer_attenuation_db"] = attenuation_db
-    basis = (
-        f"explicit {marker_event} marker at {format_ts(marker_time)} with "
-        f"attenuation_db={attenuation_db:.2f}"
-    )
-    return compute_rf_budget(marked_manifest), basis
-
-
-def print_js_summary(rf_budget: dict[str, object]) -> None:
-    jammer = numeric_or_none(rf_budget.get("jammer_avg_usrp_rf_input_ideal_dbm"))
-    jammer_peak = numeric_or_none(rf_budget.get("jammer_peak_usrp_rf_input_ideal_dbm"))
-    desired = numeric_or_none(rf_budget.get("bladeRF_usrp_rf_input_ideal_dbm"))
-    if jammer is None or desired is None:
-        print("  expected J/S vs bladeRF at USRP RF input: --")
-        return
-    print(
-        f"  expected average J/S vs bladeRF at USRP RF input: {jammer - desired:.2f} dB"
-    )
-    if jammer_peak is not None:
-        print(
-            "  expected peak J/S vs bladeRF at USRP RF input: "
-            f"{jammer_peak - desired:.2f} dB"
-        )
-
-
 def print_operator_events(events: list[tuple[datetime, dict[str, object]]]) -> None:
     if not events:
         print("  No explicit operator event markers found.")
@@ -777,8 +616,6 @@ def print_operator_events(events: list[tuple[datetime, dict[str, object]]]) -> N
     for ts, payload in events:
         print(
             f"  {format_ts(ts)} event={payload.get('event', '--')} "
-            f"attenuation_db={payload.get('attenuation_db', '--')} "
-            f"bladeRF_gain_db={payload.get('bladeRF_gain_db', '--')} "
             f"notes={payload.get('notes', '') or '--'}"
         )
 
@@ -879,72 +716,9 @@ def estimate_jammer_only_suppression(
             "jammer_before_power_linear": mean_before,
             "jammer_after_power_linear": mean_after,
         }
-
-    baseline_off: list[float] = []
-    jammer_on_lcmv_off: list[float] = []
-    jammer_on_lcmv_on_excess: list[float] = []
-    marker_index = 0
-    jammer_on: bool | None = None
-    for ts, payload in spatial_events:
-        while (
-            marker_index < len(jammer_markers) and jammer_markers[marker_index][0] <= ts
-        ):
-            jammer_on = jammer_markers[marker_index][1]
-            marker_index += 1
-        if jammer_on is None:
-            continue
-        total = numeric_or_none(payload.get("active_total_output_power_from_R"))
-        if total is None:
-            continue
-        applied = str(payload.get("active_method_applied", ""))
-        lcmv_on = applied in CURRENT_LCMV_METHODS
-        if not jammer_on and not lcmv_on:
-            baseline_off.append(total)
-        elif jammer_on and not lcmv_on:
-            jammer_on_lcmv_off.append(total)
-        elif jammer_on and lcmv_on:
-            adjusted_baseline = numeric_or_none(
-                payload.get("active_healthy_baseline_output_power_from_R")
-            )
-            if adjusted_baseline is not None and total > adjusted_baseline:
-                jammer_on_lcmv_on_excess.append(total - adjusted_baseline)
-
-    missing: list[str] = []
-    if not baseline_off:
-        missing.append("jammer-off/LCMV-off baseline")
-    if not jammer_on_lcmv_off:
-        missing.append("jammer-on/LCMV-off window")
-    if not jammer_on_lcmv_on_excess:
-        missing.append("positive jammer-on/LCMV-on baseline-adjusted window")
-    if missing:
-        return {"available": False, "reason": "missing " + ", ".join(missing)}
-
-    baseline_power = mean_or_none(baseline_off)
-    jammer_before_total = mean_or_none(jammer_on_lcmv_off)
-    jammer_after = mean_or_none(jammer_on_lcmv_on_excess)
-    jammer_before = (
-        jammer_before_total - baseline_power
-        if jammer_before_total is not None and baseline_power is not None
-        else None
-    )
-    if (
-        jammer_before is None
-        or jammer_after is None
-        or jammer_before <= 0.0
-        or jammer_after <= 0.0
-    ):
-        return {
-            "available": False,
-            "reason": "non-positive power after jammer-off baseline subtraction",
-        }
     return {
-        "available": True,
-        "method": "matched marked windows with healthy-baseline subtraction",
-        "sample_count": len(jammer_on_lcmv_on_excess),
-        "suppression_db": 10.0 * math.log10(jammer_before / jammer_after),
-        "jammer_before_power_linear": jammer_before,
-        "jammer_after_power_linear": jammer_after,
-        "baseline_power_linear": baseline_power,
+        "available": False,
+        "reason": "no current same-covariance jammer-only samples in marked window",
     }
 
 
@@ -980,8 +754,6 @@ def print_diagnostic_coverage(
     spatial_events: list[tuple[datetime, dict[str, object]]],
 ) -> None:
     checks = {
-        "experiment_manifest": contains_text(logs / "app.log", "experiment_manifest "),
-        "rf_budget": contains_text(logs / "app.log", "rf_budget "),
         "array_geometry_manifest": contains_text(
             logs / "app.log", "array_geometry_manifest "
         ),
@@ -1002,13 +774,11 @@ def print_diagnostic_coverage(
             "fifo_output_power_linear",
         )
         or contains_text(logs / "stream_health.log", "fifo_output_power_linear"),
-        "calibration_manifest": contains_text(logs / "app.log", "calibration_manifest ")
-        or contains_text(logs / "analysis.log", "calibration_manifest "),
+        "calibration_manifest": contains_text(logs / "app.log", "calibration_manifest "),
         "calibration_gain_effect_ch0_db": contains_text(
             logs / "phase_alignment.log",
             "calibration_gain_effect_ch0_db",
         )
-        or contains_text(logs / "stream_health.log", "calibration_gain_effect_ch0_db"),
     }
     for key, value in checks.items():
         print(f"  {key}: {'yes' if value else 'no'}")
@@ -1045,8 +815,6 @@ def print_calibration_summary(calibration: dict[str, object]) -> None:
         "  complex_gain_vector_available: "
         f"{latest.get('complex_gain_vector_available', '--')}"
     )
-    print(f"  fallback_used: {latest.get('fallback_used', '--')}")
-    print(f"  fallback_reason: {latest.get('fallback_reason', '--') or '--'}")
     print(
         "  applied_correction_magnitudes: "
         f"{format_list(latest.get('applied_correction_magnitudes'))}"
@@ -1077,16 +845,11 @@ def print_calibration_effect_summary(
 ) -> None:
     coherence: list[float] = []
     principal: list[float] = []
-    u1_gain: list[float] = []
     reduction_uniform: list[float] = []
     reduction_raw_avg: list[float] = []
     for _ts, payload in spatial_events:
         append_float(coherence, payload.get("ideal_measured_coherence_abs"))
         append_float(principal, payload.get("ideal_measured_principal_angle_deg"))
-        append_float(
-            u1_gain,
-            payload.get("predicted_u1_lcmv_output_gain_over_ideal_lcmv_db"),
-        )
     for interval in intervals:
         reduction_uniform.extend(interval.reduction_uniform_db)
         reduction_raw_avg.extend(interval.reduction_raw_avg_db)
@@ -1096,33 +859,24 @@ def print_calibration_effect_summary(
     print(
         f"  measured_output_reduction_vs_raw_avg_channel_db: {stat(reduction_raw_avg)}"
     )
-    print(f"  predicted_u1_lcmv_output_gain_over_ideal_lcmv_db: {stat(u1_gain)}")
 
 
 def print_spatial_summary(events: list[tuple[datetime, dict[str, object]]]) -> None:
+    """Report measured-vector evidence without recommending retired methods."""
     if not events:
         print("  --")
         return
-    coherence: list[float] = []
-    principal: list[float] = []
-    mismatch_db: list[float] = []
-    ideal_reduction: list[float] = []
-    u1_reduction: list[float] = []
-    u1_gain: list[float] = []
-    ideal_to_u1_suppression: list[float] = []
-    u1_to_u1_suppression: list[float] = []
+    print(f"  events: {len(events)}")
+    print("  warning: R is not jammer-only; u1 is not always jammer")
+    print("  warning: total output reduction is not jammer-only suppression")
+    print("  warning: desired-response and receiver evidence are required")
     methods: Counter[str] = Counter()
-    applied_methods: Counter[str] = Counter()
-    candidates: Counter[str] = Counter()
-    candidate_valid: Counter[str] = Counter()
-    candidate_rejected: Counter[str] = Counter()
+    valid: Counter[str] = Counter()
+    rejected: Counter[str] = Counter()
     run_states: Counter[str] = Counter()
-    healthy_reference_available: Counter[str] = Counter()
-    jammer_only_available: Counter[str] = Counter()
-    jammer_only_unavailable_reasons: Counter[str] = Counter()
-    candidate_metric_names = (
+    prefix = "candidate_covariance_lcmv_measured_u1"
+    metric_names = (
         "u1_component_reduction_vs_reference_db",
-        "ideal_component_reduction_vs_reference_db",
         "total_output_reduction_vs_reference_db",
         "desired_loss_vs_reference_db",
         "white_noise_gain_db",
@@ -1130,218 +884,39 @@ def print_spatial_summary(events: list[tuple[datetime, dict[str, object]]]) -> N
         "effective_js_improvement_u1_db",
         "effective_receiver_improvement_u1_db",
     )
-    candidate_stats: dict[str, dict[str, list[float]]] = defaultdict(
-        lambda: {name: [] for name in candidate_metric_names}
-    )
-    candidate_valid_by_method: dict[str, Counter[str]] = defaultdict(Counter)
-    candidate_rejection_reasons: dict[str, Counter[str]] = defaultdict(Counter)
-    prefix_by_method = {
-        "covariance_lcmv_ideal": "candidate_covariance_lcmv_ideal",
-        "covariance_lcmv_measured_u1": "candidate_covariance_lcmv_measured_u1",
+    stats: dict[str, list[float]] = {name: [] for name in metric_names}
+    diagnostics: dict[str, list[float]] = {
+        name: [] for name in (
+            "ideal_measured_coherence_abs",
+            "ideal_measured_principal_angle_deg",
+            "ideal_measured_mismatch_db",
+            "measured_covariance_reduction_uniform_to_active_lcmv_db",
+            "active_lcmv_to_u1_suppression_db",
+        )
     }
     for _ts, payload in events:
-        append_float(coherence, payload.get("ideal_measured_coherence_abs"))
-        append_float(principal, payload.get("ideal_measured_principal_angle_deg"))
-        append_float(mismatch_db, payload.get("ideal_measured_mismatch_db"))
-        append_float(
-            ideal_reduction,
-            payload.get("measured_covariance_reduction_uniform_to_ideal_lcmv_db"),
-        )
-        append_float(
-            u1_reduction,
-            payload.get("measured_covariance_reduction_uniform_to_u1_lcmv_db"),
-        )
-        append_float(
-            u1_gain,
-            payload.get("predicted_u1_lcmv_output_gain_over_ideal_lcmv_db"),
-        )
-        append_float(
-            ideal_to_u1_suppression,
-            payload.get("ideal_lcmv_to_u1_suppression_db"),
-        )
-        append_float(
-            u1_to_u1_suppression,
-            payload.get("u1_lcmv_to_u1_suppression_db"),
-        )
-        methods[str(payload.get("active_lcmv_null_method", "--"))] += 1
-        applied_methods[
-            str(
-                payload.get(
-                    "active_lcmv_method", payload.get("active_lcmv_null_method", "--")
-                )
-            )
-        ] += 1
-        candidates[str(bool(payload.get("candidate_u1_lcmv_available", False)))] += 1
-        valid = payload.get("candidate_methods_valid", [])
-        if isinstance(valid, list):
-            for candidate in valid:
-                if str(candidate) in CURRENT_LCMV_METHODS:
-                    candidate_valid[str(candidate)] += 1
-        rejected = payload.get("candidate_methods_rejected", {})
-        if isinstance(rejected, dict):
-            for candidate in rejected:
-                if str(candidate) in CURRENT_LCMV_METHODS:
-                    candidate_rejected[str(candidate)] += 1
+        methods[str(payload.get("active_lcmv_method", "--"))] += 1
         run_states[str(payload.get("run_state_label", "--"))] += 1
-        healthy_reference_available[
-            str(bool(payload.get("healthy_reference_available", False)))
-        ] += 1
-        jammer_only_available[
-            str(bool(payload.get("jammer_only_suppression_estimate_available", False)))
-        ] += 1
-        jammer_only_reason = payload.get("jammer_only_suppression_unavailable_reason")
-        if jammer_only_reason:
-            jammer_only_unavailable_reasons[str(jammer_only_reason)] += 1
-        for method, prefix in prefix_by_method.items():
-            stats = candidate_stats[method]
-            for metric_name in candidate_metric_names:
-                append_float(stats[metric_name], payload.get(f"{prefix}_{metric_name}"))
-            if f"{prefix}_valid" in payload:
-                candidate_valid_by_method[method][
-                    str(bool(payload.get(f"{prefix}_valid")))
-                ] += 1
-            reason = payload.get(f"{prefix}_rejected_reason")
-            if reason:
-                candidate_rejection_reasons[method][str(reason)] += 1
-    print(f"  events: {len(events)}")
-    print(
-        "  signal_model: x[n]=desired/SOI + jammer + real sky GNSS + noise + "
-        "multipath + receiver artifacts"
-    )
-    print("  warning: R is not jammer-only; u1 is not always jammer")
-    print(
-        "  warning: Dominant-vector suppression is not automatically jammer-only suppression"
-    )
-    print(
-        "  warning: u1 suppression means jammer-like suppression only during "
-        "jammer-like windows"
-    )
-    print(
-        "  warning: during healthy/no-jammer windows, u1 suppression may represent "
-        "desired/SOI suppression"
-    )
-    print("  warning: total output reduction is not jammer-only suppression")
-    print("  warning: Desired-loss metrics require healthy_reference_available=true")
-    print(f"  active_lcmv_null_method distribution: {dict(methods)}")
-    print(f"  active_lcmv_method distribution: {dict(applied_methods)}")
-    print(f"  candidate_u1_lcmv_available distribution: {dict(candidates)}")
-    print(f"  candidate_methods_valid distribution: {dict(candidate_valid) or '--'}")
-    print(
-        f"  candidate_methods_rejected distribution: {dict(candidate_rejected) or '--'}"
-    )
-    print(f"  run_state_label distribution: {dict(run_states) or '--'}")
-    print(
-        "  healthy_reference_available distribution: "
-        f"{dict(healthy_reference_available) or '--'}"
-    )
-    print(
-        "  jammer_only_suppression_estimate_available distribution: "
-        f"{dict(jammer_only_available) or '--'}"
-    )
-    print(
-        "  jammer_only_suppression_unavailable_reason: "
-        f"{dict(jammer_only_unavailable_reasons) or '--'}"
-    )
-    print(f"  ideal_measured_coherence_abs: {stat(coherence)}")
-    print(f"  ideal_measured_principal_angle_deg: {stat(principal)}")
-    print(f"  ideal_measured_mismatch_db: {stat(mismatch_db)}")
-    print(
-        "  measured_covariance_reduction_uniform_to_ideal_lcmv_db: "
-        f"{stat(ideal_reduction)}"
-    )
-    print(
-        f"  measured_covariance_reduction_uniform_to_u1_lcmv_db: {stat(u1_reduction)}"
-    )
-    print(f"  predicted_u1_lcmv_output_gain_over_ideal_lcmv_db: {stat(u1_gain)}")
-    print(f"  ideal_lcmv_to_u1_suppression_db: {stat(ideal_to_u1_suppression)}")
-    print(f"  u1_lcmv_to_u1_suppression_db: {stat(u1_to_u1_suppression)}")
-
-    def ranked_rows(
-        metric_name: str,
-    ) -> list[tuple[float, str, dict[str, list[float]]]]:
-        rows: list[tuple[float, str, dict[str, list[float]]]] = []
-        for method, stats_map in candidate_stats.items():
-            avg = mean_or_none(stats_map[metric_name])
-            if avg is not None:
-                rows.append((avg, method, stats_map))
-        return sorted(rows, reverse=True)
-
-    print("  candidate_metrics_by_method:")
-    any_candidate_metrics = False
-    for method in prefix_by_method:
-        stats_map = candidate_stats[method]
-        if not any(stats_map[name] for name in candidate_metric_names):
-            continue
-        any_candidate_metrics = True
-        print(
-            f"    {method}: "
-            f"candidate_valid={dict(candidate_valid_by_method.get(method, Counter())) or '--'} "
-            f"candidate_rejection_reason={dict(candidate_rejection_reasons.get(method, Counter())) or '--'} "
-            f"u1_component_reduction_vs_reference_db={stat(stats_map['u1_component_reduction_vs_reference_db'])} "
-            f"ideal_component_reduction_vs_reference_db={stat(stats_map['ideal_component_reduction_vs_reference_db'])} "
-            f"total_output_reduction_vs_reference_db={stat(stats_map['total_output_reduction_vs_reference_db'])} "
-            f"desired_loss_vs_reference_db={stat(stats_map['desired_loss_vs_reference_db'])} "
-            f"white_noise_gain_db={stat(stats_map['white_noise_gain_db'])} "
-            f"noise_gain_vs_reference_db={stat(stats_map['noise_gain_vs_reference_db'])} "
-            f"effective_js_improvement_u1_db={stat(stats_map['effective_js_improvement_u1_db'])} "
-            f"effective_receiver_improvement_u1_db={stat(stats_map['effective_receiver_improvement_u1_db'])}"
-        )
-    if not any_candidate_metrics:
-        print("    --")
-
-    best_u1 = ranked_rows("u1_component_reduction_vs_reference_db")
-    best_total = ranked_rows("total_output_reduction_vs_reference_db")
-    best_effective = ranked_rows("effective_receiver_improvement_u1_db")
-    print(
-        "  best_by_dominant_vector_suppression: "
-        f"{best_u1[0][1]} avg={best_u1[0][0]:.2f} dB"
-        if best_u1
-        else "  best_by_dominant_vector_suppression: --"
-    )
-    print(
-        "  best_by_total_output_reduction: "
-        f"{best_total[0][1]} avg={best_total[0][0]:.2f} dB"
-        if best_total
-        else "  best_by_total_output_reduction: --"
-    )
-    print(
-        "  best_by_effective_receiver_improvement: "
-        f"{best_effective[0][1]} avg={best_effective[0][0]:.2f} dB"
-        if best_effective
-        else "  best_by_effective_receiver_improvement: -- "
-        "(effective receiver improvement unavailable because healthy reference missing)"
-    )
-    selected_active_methods = Counter(
-        {
-            method: count
-            for method, count in applied_methods.items()
-            if method in prefix_by_method
-        }
-    )
-    active_method = (
-        selected_active_methods.most_common(1)[0][0]
-        if selected_active_methods
-        else "--"
-    )
-    best_effective_method = best_effective[0][1] if best_effective else "--"
-    print(f"  active_method: {active_method}")
-    print(
-        "  active_method_was_best_by_effective_receiver_improvement: "
-        f"{active_method == best_effective_method if best_effective else '--'}"
-    )
-    print(f"  recommendation: {spatial_recommendation(coherence, u1_gain)}")
-
-
-def spatial_recommendation(coherence: list[float], u1_gain_db: list[float]) -> str:
-    avg_coherence = mean_or_none(coherence)
-    avg_gain = mean_or_none(u1_gain_db)
-    if avg_coherence is None or avg_gain is None:
-        return "insufficient spatial-vector evidence"
-    if avg_coherence >= 0.97 and avg_gain <= 1.0:
-        return "keep covariance_lcmv_ideal active; measured u1 is close to its ideal null vector"
-    if avg_coherence < 0.95 and avg_gain >= 3.0:
-        return "keep covariance_lcmv_ideal active; measured-u1 candidates need desired-loss validation before selection"
-    return "mixed evidence; inspect per-event coherence and predicted gain before changing the active method"
+        if f"{prefix}_valid" in payload:
+            valid[str(bool(payload[f"{prefix}_valid"]))] += 1
+        reason = payload.get(f"{prefix}_rejected_reason")
+        if reason:
+            rejected[str(reason)] += 1
+        for name in metric_names:
+            append_float(stats[name], payload.get(f"{prefix}_{name}"))
+        for name in diagnostics:
+            append_float(diagnostics[name], payload.get(name))
+    print(f"  active_lcmv_method distribution: {dict(methods)}")
+    print(f"  run_state_label distribution: {dict(run_states)}")
+    print(f"  measured_u1_valid distribution: {dict(valid)}")
+    print(f"  measured_u1_rejected distribution: {dict(rejected)}")
+    for name, values in diagnostics.items():
+        print(f"  {name}: {stat(values)}")
+    print("  measured_u1_metrics:")
+    for name, values in stats.items():
+        print(f"    {name}: {stat(values)}")
+    print("  No automatic method ranking: these diagnostics do not establish "
+          "physical suppression, phase continuity, or successful PVT.")
 
 
 def contains_text(path: Path, needle: str) -> bool:
@@ -1365,7 +940,7 @@ def print_interval(interval: IntervalStats) -> None:
     print(
         f"    noise_tail_white_like distribution: {dict(interval.noise_tail_white_like) or '--'}"
     )
-    print(f"    model_response_at_selected_null_db: {stat(interval.model_null_db)}")
+    print(f"    model_min_response_db: {stat(interval.model_min_db)}")
     print(
         f"    measured_output_reduction_vs_uniform_db: {stat(interval.reduction_uniform_db)}"
     )
@@ -1384,10 +959,6 @@ def print_interval(interval: IntervalStats) -> None:
     print(
         "    spatial ideal_measured_principal_angle_deg: "
         f"{stat(interval.spatial_principal_angle_deg)}"
-    )
-    print(
-        "    spatial predicted_u1_lcmv_output_gain_over_ideal_lcmv_db: "
-        f"{stat(interval.spatial_predicted_u1_gain_db)}"
     )
     print(
         f"    spatial active_lcmv_null_method: {dict(interval.spatial_active_methods) or '--'}"
@@ -1410,12 +981,6 @@ def print_interval(interval: IntervalStats) -> None:
     print(f"    observation distribution: {dict(interval.observations) or '--'}")
     print(f"    observation min/avg/max: {stat(interval.observation_values)}")
     print(f"    used PRNs top10: {dict(interval.used_prns.most_common(10)) or '--'}")
-    print(
-        f"    MUSIC primary in jammer range: {dict(interval.music_in_jammer) or '--'}"
-    )
-    print(
-        f"    MUSIC primary in bladeRF range: {dict(interval.music_in_bladerf) or '--'}"
-    )
 
 
 if __name__ == "__main__":

@@ -18,16 +18,10 @@ class ReceiverViewState:
 
     prn_entries: list[dict[str, object]]
     sky_entries: list[dict[str, object]]
-    current_tracking_prns: list[int]
     current_tracking_satellite_ids: list[str]
-    stable_prns: list[int]
     stable_satellite_ids: list[str]
-    current_used_in_pvt_prns: list[int]
     current_used_in_pvt_satellites: list[str]
-    raw_used_in_fix_prns: list[int]
     raw_used_in_fix_satellites: list[str]
-    fresh_geometry_prns: list[int]
-    tracking_without_geometry: list[int]
     pvt_current: bool
     used_for_pvt_count: int
 
@@ -47,29 +41,14 @@ class ReceiverProjection:
             gnss_snapshot.get("pvt_current", gnss_snapshot.get("pvt_output_seen", False))
         )
 
-        raw_used_in_fix_prns: set[int] = set()
         raw_used_in_fix_satellites: set[str] = set()
         if pvt_current:
-            raw_used_in_fix_prns.update(
-                prn
-                for entry in prn_entries
-                if bool(entry.get("used_in_fix", False))
-                for prn in [valid_prn(entry.get("prn"))]
-                if prn is not None
-            )
             raw_used_in_fix_satellites.update(
                 sat_id
                 for entry in prn_entries
                 if bool(entry.get("used_in_fix", False))
                 for sat_id in [satellite_id(entry)]
                 if sat_id != "--"
-            )
-            raw_used_in_fix_prns.update(
-                prn
-                for entry in raw_sky_entries
-                if isinstance(entry, dict) and bool(entry.get("used_in_fix", False))
-                for prn in [valid_prn(entry.get("prn"))]
-                if prn is not None
             )
             raw_used_in_fix_satellites.update(
                 sat_id
@@ -88,31 +67,12 @@ class ReceiverProjection:
             for sat_id in [satellite_id(entry)]
             if sat_id != "--"
         }
-        current_tracking_prns = sorted(
-            {
-                prn
-                for entry in prn_entries
-                if str(entry.get("state", "")).lower() == "tracking"
-                for prn in [valid_prn(entry.get("prn"))]
-                if prn is not None
-            }
-        )
-
         # The C/N0 chart is a measurement chart, not a channel-state chart.
         # Admit a currently tracking satellite as soon as GNSS-SDR supplies a
         # real tracking C/N0.  Stability and PVT use affect qualification and
         # colour, but must not delay the first honest C/N0 bar.  Never carry a
         # prior value through a missing sample: that produced labelled PRNs
         # with a "--" bar and made a lost or pending channel look current.
-        stable_prns = sorted(
-            {
-                prn
-                for entry in prn_entries
-                if is_stable_tracking_entry(entry)
-                for prn in [valid_prn(entry.get("prn"))]
-                if prn is not None
-            }
-        )
         stable_satellite_ids = {
             sat_id
             for entry in prn_entries
@@ -124,7 +84,6 @@ class ReceiverProjection:
             entry for entry in prn_entries if is_current_tracking_cno_entry(entry)
         ]
 
-        current_used_in_pvt_prns = set(stable_prns) & raw_used_in_fix_prns
         current_used_in_pvt_satellites = stable_satellite_ids & raw_used_in_fix_satellites
         used_for_pvt_count = len(raw_used_in_fix_satellites) if pvt_current else 0
         pvt_observation_count = valid_int(gnss_snapshot.get("pvt_observation_count"))
@@ -136,7 +95,6 @@ class ReceiverProjection:
             if prn is not None:
                 entry["used_in_fix"] = satellite_id(entry) in current_used_in_pvt_satellites
 
-        fresh_geometry_by_prn: dict[int, dict[str, object]] = {}
         fresh_geometry_by_satellite: dict[str, dict[str, object]] = {}
         for raw_entry in raw_sky_entries:
             if not isinstance(raw_entry, dict):
@@ -148,7 +106,6 @@ class ReceiverProjection:
                 continue
             if valid_float(raw_entry.get("el_deg")) is None:
                 continue
-            fresh_geometry_by_prn[prn] = dict(raw_entry)
             sat_id = satellite_id(raw_entry)
             if sat_id == "--":
                 continue
@@ -163,31 +120,22 @@ class ReceiverProjection:
             entry["used_in_fix"] = sat_id in current_used_in_pvt_satellites
             projected_sky_entries.append(entry)
 
-        fresh_geometry_prns = sorted(fresh_geometry_by_prn)
-        tracking_without_geometry = sorted(set(current_tracking_prns) - set(fresh_geometry_prns))
-
         return ReceiverViewState(
             prn_entries=tracking_cno_entries,
             sky_entries=projected_sky_entries,
-            current_tracking_prns=current_tracking_prns,
             current_tracking_satellite_ids=sorted(
                 current_tracking_satellite_ids,
                 key=satellite_sort_key,
             ),
-            stable_prns=stable_prns,
             stable_satellite_ids=sorted(stable_satellite_ids, key=satellite_sort_key),
-            current_used_in_pvt_prns=sorted(current_used_in_pvt_prns),
             current_used_in_pvt_satellites=sorted(
                 current_used_in_pvt_satellites,
                 key=satellite_sort_key,
             ),
-            raw_used_in_fix_prns=sorted(raw_used_in_fix_prns),
             raw_used_in_fix_satellites=sorted(
                 raw_used_in_fix_satellites,
                 key=satellite_sort_key,
             ),
-            fresh_geometry_prns=fresh_geometry_prns,
-            tracking_without_geometry=tracking_without_geometry,
             pvt_current=pvt_current,
             used_for_pvt_count=used_for_pvt_count,
         )
@@ -253,18 +201,15 @@ def valid_int(value: object) -> int | None:
 
 
 def satellite_id(entry: dict[str, object]) -> str:
-    explicit = entry.get("satellite_id")
-    if explicit:
-        value = str(explicit)
-        return value if satellite_label_constellation(value) is not None else "--"
+    value = str(entry.get("satellite_id") or "").strip()
+    if satellite_label_constellation(value) is None:
+        return "--"
     prn = valid_prn(entry.get("prn"))
     if prn is None:
         return "--"
-    constellation = normalize_constellation(
-        entry.get("constellation", entry.get("system", entry.get("gnss", "gps")))
-    )
-    label = satellite_label(constellation, prn) if constellation is not None else None
-    return label or "--"
+    constellation = normalize_constellation(entry.get("constellation"))
+    expected = satellite_label(constellation, prn) if constellation is not None else None
+    return value if value == expected else "--"
 
 
 def satellite_sort_key(sat_id: str) -> tuple[int, int, str]:

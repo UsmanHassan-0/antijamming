@@ -29,7 +29,7 @@ from antijamming.dsp.phase.alignment import (
     load_calibration_correction_selection,
     phase_offsets_deg,
 )
-from antijamming.radio.usrp import UsrpRxDevice
+from antijamming.radio.usrp import UsrpRxDevice, validate_rx_chunk_result
 
 
 def db10(value: np.ndarray | float, floor: float = 1e-30) -> np.ndarray | float:
@@ -73,7 +73,12 @@ def top_music_peaks(
     return peaks
 
 
-def receive_snapshot(device: UsrpRxDevice, chunks: int) -> tuple[np.ndarray, Counter[str], float]:
+def receive_snapshot(
+    device: UsrpRxDevice,
+    chunks: int,
+    *,
+    expected_channels: int,
+) -> tuple[np.ndarray, Counter[str], float]:
     buffers: list[np.ndarray] = []
     states: Counter[str] = Counter()
     start = time.monotonic()
@@ -82,17 +87,24 @@ def receive_snapshot(device: UsrpRxDevice, chunks: int) -> tuple[np.ndarray, Cou
     while len(buffers) < int(chunks) and attempts < max_attempts:
         attempts += 1
         try:
-            result = device.recv_chunk()
+            result = validate_rx_chunk_result(
+                device.recv_chunk(),
+                expected_channels=expected_channels,
+            )
         except Exception:
             if attempts == 1:
                 device.restart_stream()
                 time.sleep(0.2)
                 continue
             raise
-        chunk, state = result
-        states[str(state)] += 1
-        if int(getattr(result, "got_samples", 0) or 0) > 0 and chunk.shape[1] > 0:
-            buffers.append(np.asarray(chunk, dtype=np.complex64))
+        states[str(result.state)] += 1
+        if result.state == "other":
+            raise RuntimeError(
+                "UHD reported unsupported RX metadata during snapshot: "
+                f"{result.error_code}"
+            )
+        if result.got_samples > 0:
+            buffers.append(result.chunk)
     elapsed = time.monotonic() - start
     if not buffers:
         raise RuntimeError(f"USRP returned no samples after {attempts} recv attempts")
@@ -173,9 +185,8 @@ def main() -> int:
     print(
         "calibration="
         f"{cal_file if cal_file is not None else 'none'} "
-        f"configured_mode={getattr(cfg, 'calibration_correction_mode', 'complex_gain')} "
-        f"applied_mode={calibration_metadata.get('calibration_correction_mode_applied', 'none')} "
-        f"fallback_used={calibration_metadata.get('fallback_used', False)}"
+        f"configured_mode={cfg.calibration_correction_mode} "
+        f"applied_mode={calibration_metadata.get('calibration_correction_mode_applied', 'none')}"
     )
     if calibration_metadata:
         print(
@@ -187,7 +198,11 @@ def main() -> int:
     device: UsrpRxDevice | None = None
     try:
         device = UsrpRxDevice(cfg)
-        raw, states, elapsed = receive_snapshot(device, chunks=max(1, int(args.chunks)))
+        raw, states, elapsed = receive_snapshot(
+            device,
+            chunks=max(1, int(args.chunks)),
+            expected_channels=len(cfg.channels),
+        )
     finally:
         if device is not None:
             try:

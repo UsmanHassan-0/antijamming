@@ -151,9 +151,9 @@ class NmeaMixin:
             except ValueError:
                 continue
         with self._state_lock:
-            self._used_in_fix_prns = {
+            self._used_in_fix_sat_keys = {
                 key
-                for key in self._used_in_fix_prns
+                for key in self._used_in_fix_sat_keys
                 if _sat_constellation(key) != normalized_constellation
             } | used_prns
             self._used_in_fix_observed_monotonic_s = time.monotonic()

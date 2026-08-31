@@ -14,34 +14,32 @@ from .constants import (
 
 
 class ConfigRendererMixin:
+    def _rendered_nmea_tty_path(self) -> str:
+        if not bool(self._cfg.gnss_pvt_nmea_tty_enable):
+            return "/dev/null"
+        tty_path = getattr(self, "_nmea_tty_path", None)
+        if tty_path in {None, "", "/dev/null"}:
+            raise RuntimeError(
+                "GNSS-SDR NMEA PTY is enabled but was not prepared before config render"
+            )
+        return str(tty_path)
+
     def _render_config(self) -> str:
         template_path = self._cfg.gnss_sdr_config_template.expanduser().resolve()
         template = template_path.read_text(encoding="utf-8")
-        shared_phase = self._shared_u1_phase_enabled()
-        channels_1c_count = (
-            self._shared_u1_phase_source_count()
-            if shared_phase
-            else max(1, int(self._cfg.gnss_1c_channel_count))
-        )
-        channels_in_acquisition = min(
-            channels_1c_count,
-            max(1, int(self._cfg.gnss_channels_in_acquisition)),
-        )
+        channels_1c_count = self._shared_u1_phase_source_count()
+        channels_in_acquisition = int(self._cfg.gnss_channels_in_acquisition)
         return template.format(
             acquisition_bit_transition_flag=str(
                 bool(self._cfg.gnss_acquisition_bit_transition_flag)
             ).lower(),
-            acquisition_coherent_integration_ms=max(
-                1, int(self._cfg.gnss_acquisition_coherent_integration_ms)
+            acquisition_coherent_integration_ms=int(
+                self._cfg.gnss_acquisition_coherent_integration_ms
             ),
-            acquisition_doppler_max_hz=max(
-                500, int(self._cfg.gnss_acquisition_doppler_max_hz)
-            ),
-            acquisition_doppler_step_hz=max(
-                1, int(self._cfg.gnss_acquisition_doppler_step_hz)
-            ),
-            acquisition_max_dwells=max(1, int(self._cfg.gnss_acquisition_max_dwells)),
-            acquisition_pfa=max(1e-12, float(self._cfg.gnss_acquisition_pfa)),
+            acquisition_doppler_max_hz=int(self._cfg.gnss_acquisition_doppler_max_hz),
+            acquisition_doppler_step_hz=int(self._cfg.gnss_acquisition_doppler_step_hz),
+            acquisition_max_dwells=int(self._cfg.gnss_acquisition_max_dwells),
+            acquisition_pfa=float(self._cfg.gnss_acquisition_pfa),
             channels_1c_count=channels_1c_count,
             channels_in_acquisition=channels_in_acquisition,
             channel_signal_config=self._render_channel_signal_config(),
@@ -55,9 +53,7 @@ class ConfigRendererMixin:
             output_dir="outputs",
             acquisition_dump_path="./outputs/acquisition/acq_dump.dat",
             monitor_client_addresses=str(self._cfg.gnss_monitor_client_addresses),
-            monitor_decimation_factor=max(
-                1, int(self._cfg.gnss_monitor_decimation_factor)
-            ),
+            monitor_decimation_factor=int(self._cfg.gnss_monitor_decimation_factor),
             monitor_enable=str(bool(self._cfg.gnss_monitor_enable)).lower(),
             monitor_enable_protobuf=str(
                 bool(self._cfg.gnss_monitor_enable_protobuf)
@@ -73,41 +69,36 @@ class ConfigRendererMixin:
                 bool(self._cfg.gnss_pvt_monitor_enable_protobuf)
             ).lower(),
             pvt_monitor_udp_port=str(self._cfg.gnss_pvt_monitor_udp_port),
-            pvt_nmea_output_file_enable=str(
-                bool(self._cfg.gnss_pvt_nmea_output_file_enable)
-            ).lower(),
+            # Live NMEA is consumed from a PTY. The product never asks
+            # GNSS-SDR to create a second NMEA persistence path.
+            pvt_nmea_output_file_enable="false",
             pvt_nmea_path="gnss_sdr_pvt.nmea",
-            pvt_nmea_rate_ms=max(100, int(self._cfg.gnss_pvt_nmea_rate_ms)),
-            pvt_nmea_tty_devname=str(
-                getattr(self, "_nmea_tty_path", None) or "/dev/null"
-            ),
+            pvt_nmea_rate_ms=int(self._cfg.gnss_pvt_nmea_rate_ms),
+            pvt_nmea_tty_devname=self._rendered_nmea_tty_path(),
             pvt_nmea_tty_enable=str(bool(self._cfg.gnss_pvt_nmea_tty_enable)).lower(),
             pvt_positioning_mode=str(self._cfg.gnss_pvt_positioning_mode),
-            pvt_elevation_mask_deg=max(
-                -90.0, min(90.0, float(self._cfg.gnss_pvt_elevation_mask_deg))
-            ),
+            pvt_elevation_mask_deg=float(self._cfg.gnss_pvt_elevation_mask_deg),
+            pvt_log_rtklib_residuals=str(bool(self._cfg.logging_enabled)).lower(),
             sample_type=self._cfg.gnss_sdr_sample_type,
             signal_source_config=self._render_signal_source_config(),
             signal_source_dump_path="./outputs/signal_source/signal_source.dat",
             signal_conditioner_config=self._render_signal_conditioner_config(),
             telemetry_dump_prefix="./outputs/telemetry/telemetry_decoder_1C.dat",
-            tracking_1c_dll_bw_hz=max(
-                0.1, float(self._cfg.gnss_tracking_1c_dll_bw_hz)
+            tracking_1c_dll_bw_hz=float(self._cfg.gnss_tracking_1c_dll_bw_hz),
+            tracking_1c_dll_bw_narrow_hz=float(
+                self._cfg.gnss_tracking_1c_dll_bw_narrow_hz
             ),
-            tracking_1c_dll_bw_narrow_hz=max(
-                0.1, float(self._cfg.gnss_tracking_1c_dll_bw_narrow_hz)
+            tracking_1c_dll_filter_order=int(
+                self._cfg.gnss_tracking_1c_dll_filter_order
             ),
-            tracking_1c_dll_filter_order=max(
-                1, int(self._cfg.gnss_tracking_1c_dll_filter_order)
+            tracking_1c_early_late_space_chips=float(
+                self._cfg.gnss_tracking_1c_early_late_space_chips
             ),
-            tracking_1c_early_late_space_chips=max(
-                0.01, float(self._cfg.gnss_tracking_1c_early_late_space_chips)
+            tracking_1c_early_late_space_narrow_chips=float(
+                self._cfg.gnss_tracking_1c_early_late_space_narrow_chips
             ),
-            tracking_1c_early_late_space_narrow_chips=max(
-                0.01, float(self._cfg.gnss_tracking_1c_early_late_space_narrow_chips)
-            ),
-            tracking_1c_extend_correlation_symbols=max(
-                1, int(self._cfg.gnss_tracking_1c_extend_correlation_symbols)
+            tracking_1c_extend_correlation_symbols=int(
+                self._cfg.gnss_tracking_1c_extend_correlation_symbols
             ),
             tracking_1c_enable_fll_pull_in=str(
                 bool(self._cfg.gnss_tracking_1c_enable_fll_pull_in)
@@ -115,30 +106,24 @@ class ConfigRendererMixin:
             tracking_1c_enable_fll_steady_state=str(
                 bool(self._cfg.gnss_tracking_1c_enable_fll_steady_state)
             ).lower(),
-            tracking_1c_fll_bw_hz=max(
-                0.1, float(self._cfg.gnss_tracking_1c_fll_bw_hz)
+            tracking_1c_fll_bw_hz=float(self._cfg.gnss_tracking_1c_fll_bw_hz),
+            tracking_1c_pull_in_time_s=int(self._cfg.gnss_tracking_1c_pull_in_time_s),
+            tracking_1c_bit_synchronization_time_limit_s=int(
+                self._cfg.gnss_tracking_1c_bit_synchronization_time_limit_s
             ),
-            tracking_1c_pull_in_time_s=max(
-                0, int(self._cfg.gnss_tracking_1c_pull_in_time_s)
+            tracking_1c_pll_bw_hz=float(self._cfg.gnss_tracking_1c_pll_bw_hz),
+            tracking_1c_pll_bw_narrow_hz=float(
+                self._cfg.gnss_tracking_1c_pll_bw_narrow_hz
             ),
-            tracking_1c_bit_synchronization_time_limit_s=max(
-                1, int(self._cfg.gnss_tracking_1c_bit_synchronization_time_limit_s)
-            ),
-            tracking_1c_pll_bw_hz=max(
-                0.1, float(self._cfg.gnss_tracking_1c_pll_bw_hz)
-            ),
-            tracking_1c_pll_bw_narrow_hz=max(
-                0.1, float(self._cfg.gnss_tracking_1c_pll_bw_narrow_hz)
-            ),
-            tracking_1c_pll_filter_order=max(
-                2, int(self._cfg.gnss_tracking_1c_pll_filter_order)
+            tracking_1c_pll_filter_order=int(
+                self._cfg.gnss_tracking_1c_pll_filter_order
             ),
             tracking_output_prefix="./outputs/tracking/tracking_ch_",
             tracking_monitor_client_addresses=str(
                 self._cfg.gnss_tracking_monitor_client_addresses
             ),
-            tracking_monitor_decimation_factor=max(
-                1, int(self._cfg.gnss_tracking_monitor_decimation_factor)
+            tracking_monitor_decimation_factor=int(
+                self._cfg.gnss_tracking_monitor_decimation_factor
             ),
             tracking_monitor_enable=str(
                 bool(self._cfg.gnss_tracking_monitor_enable)
@@ -154,26 +139,17 @@ class ConfigRendererMixin:
             match = re.search(rf"^{re.escape(key)}=(.+)$", rendered_config, re.MULTILINE)
             return match.group(1).strip() if match else "--"
 
-        shared_phase = self._shared_u1_phase_enabled()
-        phase_satellites = self._shared_u1_phase_satellites()
-        source_count = self._shared_u1_phase_source_count() if shared_phase else 1
-        channels_1c = (
-            source_count
-            if shared_phase
-            else max(1, int(self._cfg.gnss_1c_channel_count))
-        )
-        channels_in_acquisition = min(
-            channels_1c,
-            max(1, int(self._cfg.gnss_channels_in_acquisition)),
-        )
+        source_count = self._shared_u1_phase_source_count()
+        channels_1c = source_count
+        channels_in_acquisition = int(self._cfg.gnss_channels_in_acquisition)
         summary = (
             "GNSS-SDR rendered load: "
             f"channels_1c={channels_1c} "
             f"total_channels={channels_1c} "
             f"channels_in_acquisition={channels_in_acquisition} "
             f"rf_sources={source_count} "
-            f"shared_u1_phase_compensation={shared_phase} "
-            f"pinned_prns={','.join(str(value) for value in phase_satellites) or '--'} "
+            "shared_u1_phase_compensation=True "
+            "source_mapping=dynamic_channel_to_prn "
             f"tracking_1c_dump={value_for('Tracking_1C.dump')} "
             f"pvt_dump={value_for('PVT.dump')} "
             f"observables_dump={value_for('Observables.dump')} "
@@ -201,32 +177,13 @@ class ConfigRendererMixin:
         self._handoff_log.info("%s", summary)
 
     def _render_channel_signal_config(self) -> str:
-        shared_phase = self._shared_u1_phase_enabled()
-        satellites = self._shared_u1_phase_satellites()
-        if shared_phase:
-            rows: list[str] = []
-            for idx in range(self._shared_u1_phase_source_count()):
-                rows.append(f"Channel{idx}.signal=1C")
-                if satellites:
-                    rows.append(f"Channel{idx}.satellite={satellites[idx]}")
-                rows.append(f"Channel{idx}.RF_channel_ID={idx}")
-            return "\n".join(rows)
-        gps_count = max(1, int(self._cfg.gnss_1c_channel_count))
-        return "\n".join(f"Channel{idx}.signal=1C" for idx in range(gps_count))
+        rows: list[str] = []
+        for idx in range(self._shared_u1_phase_source_count()):
+            rows.append(f"Channel{idx}.signal=1C")
+            rows.append(f"Channel{idx}.RF_channel_ID={idx}")
+        return "\n".join(rows)
 
     def _render_signal_source_config(self) -> str:
-        shared_phase = self._shared_u1_phase_enabled()
-        satellites = self._shared_u1_phase_satellites()
-        if not shared_phase:
-            return "\n".join(
-                [
-                    "SignalSource.implementation=Fifo_Signal_Source",
-                    f"SignalSource.filename={self._fifo_path}",
-                    f"SignalSource.sample_type={self._cfg.gnss_sdr_sample_type}",
-                    "SignalSource.dump=false",
-                    "SignalSource.dump_filename=./outputs/signal_source/signal_source.dat",
-                ]
-            )
         source_count = self._shared_u1_phase_source_count()
         rows = [
             f"GNSS-SDR.num_sources={source_count}",
@@ -240,9 +197,7 @@ class ConfigRendererMixin:
         ]
         for idx, path in enumerate(self._fifo_paths):
             role = f"SignalSource{idx}"
-            source_name = (
-                f"G{satellites[idx]:02d}" if satellites else f"channel_{idx:02d}"
-            )
+            source_name = f"channel_{idx:02d}"
             rows.extend(
                 [
                     f"{role}.implementation=Fifo_Signal_Source",
@@ -255,24 +210,18 @@ class ConfigRendererMixin:
         return "\n".join(rows)
 
     def _render_signal_conditioner_config(self) -> str:
-        sample_rate_hz = max(1.0, float(self._cfg.sample_rate))
+        sample_rate_hz = float(self._cfg.sample_rate)
         sample_rate_sps = int(round(sample_rate_hz))
         # Validate that the configured rate can represent the physical GPS L1
         # pass/stop edges before asking GNU Radio to derive low-pass taps.
         self._validate_input_filter_configuration()
-        shared_phase = self._shared_u1_phase_enabled()
-        satellites = self._shared_u1_phase_satellites()
-        count = self._shared_u1_phase_source_count() if shared_phase else 1
+        count = self._shared_u1_phase_source_count()
         rows: list[str] = []
         for idx in range(count):
             # Every shared-phase source is a distinct synchronized GNU Radio
             # branch, whether its PRN is pinned or acquired dynamically.
-            suffix = str(idx) if shared_phase else ""
-            output_suffix = (
-                f"_G{satellites[idx]:02d}"
-                if satellites
-                else (f"_channel_{idx:02d}" if shared_phase else "")
-            )
+            suffix = str(idx)
+            output_suffix = f"_channel_{idx:02d}"
             conditioner = f"SignalConditioner{suffix}"
             adapter = f"DataTypeAdapter{suffix}"
             input_filter = f"InputFilter{suffix}"
@@ -304,39 +253,8 @@ class ConfigRendererMixin:
             )
         return "\n".join(rows)
 
-    def _shared_u1_phase_satellites(self) -> tuple[int, ...]:
-        if not self._shared_u1_phase_enabled():
-            return ()
-        satellites = tuple(
-            int(value)
-            for value in getattr(self._cfg, "gnss_shared_u1_phase_satellites", ())
-        )
-        # An empty tuple selects dynamic source slots. GNSS-SDR acquires any
-        # available PRNs and the runtime maps each tracking channel back to its
-        # source slot. A non-empty tuple remains supported for narrow tests.
-        if satellites and len(satellites) < 4:
-            raise ValueError(
-                "shared-U1 phase PVT test requires at least four pinned GPS satellites"
-            )
-        if len(set(satellites)) != len(satellites):
-            raise ValueError("shared-U1 phase satellite list contains duplicates")
-        invalid = [value for value in satellites if value < 1 or value > 32]
-        if invalid:
-            raise ValueError(f"invalid GPS L1 C/A PRNs: {invalid}")
-        return satellites
-
-    def _shared_u1_phase_enabled(self) -> bool:
-        return bool(
-            getattr(self._cfg, "gnss_shared_u1_phase_compensation_enabled", False)
-        )
-
     def _shared_u1_phase_source_count(self) -> int:
-        if not self._shared_u1_phase_enabled():
-            return 1
-        satellites = self._shared_u1_phase_satellites()
-        if satellites:
-            return len(satellites)
-        return max(1, int(self._cfg.gnss_1c_channel_count))
+        return int(self._cfg.gnss_1c_channel_count)
 
     def _active_signal_ids(self) -> tuple[str, ...]:
         signals: list[str] = []
@@ -353,23 +271,17 @@ class ConfigRendererMixin:
 
     def _validate_input_filter_configuration(self) -> None:
         self._active_signal_ids()
-        sample_rate_hz = max(1.0, float(self._cfg.sample_rate))
+        sample_rate_hz = float(self._cfg.sample_rate)
+        center_freq_hz = float(self._cfg.center_freq_hz)
+        if abs(center_freq_hz - GPS_L1_CA_FREQ_HZ) > 1.0:
+            raise ValueError(
+                f"Configured center_freq_hz {center_freq_hz:.0f} Hz must equal the "
+                f"GPS L1 C/A carrier {GPS_L1_CA_FREQ_HZ:.0f} Hz because the rendered "
+                "GNSS-SDR conditioner uses zero IF"
+            )
         if sample_rate_hz <= GNSS_INPUT_FILTER_STOPBAND_HZ:
             raise ValueError(
                 f"Configured sample_rate {sample_rate_hz:.0f} Hz cannot place the "
                 f"GPS L1 input-filter stopband at {GNSS_INPUT_FILTER_STOPBAND_HZ:.0f} Hz "
                 "below Nyquist; increase sample_rate"
-            )
-
-    def _warn_if_gps_l1_is_outside_capture_band(self) -> None:
-        half_span_hz = 0.5 * float(self._cfg.sample_rate)
-        offset_hz = GPS_L1_CA_FREQ_HZ - float(self._cfg.center_freq_hz)
-        if abs(offset_hz) > half_span_hz:
-            self._log.warning(
-                "GPS L1 (%0.3f MHz) is outside the current capture band centered at %0.3f MHz "
-                "with %0.3f Msps complex sampling. GNSS-SDR may not lock until the USRP tune "
-                "frequency is moved closer to the GNSS band.",
-                GPS_L1_CA_FREQ_HZ / 1e6,
-                self._cfg.center_freq_hz / 1e6,
-                self._cfg.sample_rate / 1e6,
             )

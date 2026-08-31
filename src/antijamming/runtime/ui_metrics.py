@@ -25,8 +25,7 @@ class RuntimeUiMetrics:
     gnss_snapshot: dict[str, object]
 
     def to_dict(self) -> dict[str, object]:
-        # Preserve the historical metric keys used by the GUI and tests while
-        # keeping backend construction typed and centralized.
+        # These names are the current backend-to-GUI snapshot contract.
         return {
             "powers": self.powers,
             "phase_offsets_deg": self.phase_offsets_deg,

@@ -113,9 +113,14 @@ def _close_logger_handlers(logger: logging.Logger) -> None:
             pass
 
 
-def setup_logging(log_dir: Path) -> dict[str, logging.Logger]:
-    """Create named runtime loggers with stable, non-rotating file names."""
-    log_dir.mkdir(parents=True, exist_ok=True)
+def setup_logging(
+    log_dir: Path,
+    *,
+    enabled: bool = True,
+) -> dict[str, logging.Logger]:
+    """Create named runtime loggers, or silent endpoints when disabled."""
+    if enabled:
+        log_dir.mkdir(parents=True, exist_ok=True)
 
     logger_map: dict[str, logging.Logger] = {}
     for key, (logger_name, file_name) in LOGGER_DEFS.items():
@@ -126,7 +131,9 @@ def setup_logging(log_dir: Path) -> dict[str, logging.Logger]:
         logger.setLevel(logging.INFO)
         _close_logger_handlers(logger)
         logger.propagate = False
-        logger.addHandler(_build_file_handler(log_path, mode="a"))
+        logger.disabled = not enabled
+        if enabled:
+            logger.addHandler(_build_file_handler(log_path, mode="a"))
         logger_map[key] = logger
 
     return logger_map
@@ -225,7 +232,7 @@ def _copy_session_artifacts(log_dir: Path, session_dir: Path) -> list[str]:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.is_file():
             # The GNSS bridge writes the exact PID-scoped runtime files here.
-            # The stable compatibility directory can contain a previous run
+            # The stable root directory can contain a previous run
             # and must never overwrite that evidence during finalization.
             copied.append(str(destination.relative_to(session_dir)))
             continue

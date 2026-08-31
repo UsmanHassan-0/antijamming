@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 import numpy as np
 
 from antijamming.config import StreamConfig
-from antijamming.config.schemas.runtime import VALID_LCMV_METHODS
 from antijamming.gnss import (
     GnssSdrBridge,
     SharedU1DesiredVectorMonitor,
@@ -36,10 +35,13 @@ from antijamming.logging import (
 from .latest_queue import put_latest
 from .ui_metrics import RuntimeUiMetrics
 from .work_items import PhaseResult, PhaseWorkItem
-from antijamming.radio.usrp import UsrpRxDevice
+from antijamming.radio.usrp import (
+    RxChunkResult,
+    UsrpRxDevice,
+    validate_rx_chunk_result,
+)
 from antijamming.dsp.beamforming import (
     apply_beamformer,
-    covariance_lcmv_ideal_null_weights,
     covariance_lcmv_vector_null_weights,
     lcmv_model_response,
     uniform_weights,
@@ -67,9 +69,10 @@ from antijamming.dsp.doa import (
 from antijamming.dsp.models import internal_angle_to_operator_bearing_deg
 from antijamming.dsp.pipeline import (
     compute_doa_metrics,
-    compute_gnss_output_vector,
     compute_phase_metrics,
 )
+
+ACTIVE_LCMV_METHOD = "covariance_lcmv_measured_u1"
 
 _RUNTIME_POWER_AGGREGATE_KEYS = frozenset(
     {
@@ -87,8 +90,8 @@ _RUNTIME_POWER_AGGREGATE_KEYS = frozenset(
         "measured_output_reduction_vs_raw_avg_channel_db",
         "measured_output_reduction_vs_raw_sum_channels_db",
         "fifo_output_source",
-        "fifo_matches_lcmv_output",
-        "fifo_matches_uniform_output",
+        "fifo_output_sources",
+        "fifo_output_source_counts",
     }
 )
 _RUNTIME_POWER_SCALAR_KEYS = frozenset(
@@ -149,24 +152,17 @@ class BackendRuntime:
         self._operator_rf_state: dict[str, object] = {
             "jammer": "unknown",
             "bladeRF": "unknown",
-            "attenuation_db": None,
-            "bladeRF_gain_db": None,
         }
         self._running = False
+        self._stop_requested = threading.Event()
         self._lifecycle_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._angle_scan = config.angle_scan_spec()
         self._scan_angles_deg = self._angle_scan.values()
         self._expected_sources = config.expected_sources
         self._lcmv_test_enabled = bool(config.lcmv_test_enabled)
-        self._lcmv_auto_arm_after_pvt = bool(
-            getattr(config, "lcmv_auto_arm_after_pvt", True)
-        )
+        self._lcmv_auto_arm_after_pvt = bool(config.lcmv_auto_arm_after_pvt)
         self._lcmv_auto_arm_suppressed_by_operator = False
-        self._lcmv_test_null_method = self._normalized_lcmv_null_method(
-            getattr(config, "lcmv_test_null_method", "covariance_lcmv_ideal")
-        )
-        self._config.lcmv_test_null_method = self._lcmv_test_null_method
         self._doa_log_interval_s = max(0.0, float(config.doa_log_interval_s))
         # Log timestamps throttle high-rate DSP state so logs remain useful
         # during long streams.
@@ -180,13 +176,14 @@ class BackendRuntime:
         self._last_automatic_state_key: tuple[object, ...] | None = None
         self._latest_lcmv_heavy_diag_payload: dict[str, object] = {
             "heavy_diagnostics_interval_s": self._json_float(
-                getattr(config, "lcmv_heavy_diagnostics_interval_s", 1.0)
+                config.lcmv_heavy_diagnostics_interval_s
             ),
             "heavy_diagnostics_emitted": False,
             "heavy_diagnostics_skipped_due_to_throttle": False,
             "last_heavy_diagnostics_age_s": None,
         }
         self._device: UsrpRxDevice | None = None
+        self._device_cleanup_failed = False
         self._gnss_bridge: GnssSdrBridge | None = None
         self._ui_emit_interval_s = max(0.05, float(config.ui_update_interval_s))
         self._dsp_emit_interval_s = max(0.02, float(config.dsp_update_interval_s))
@@ -203,14 +200,17 @@ class BackendRuntime:
         self._last_shared_u1_phase_status_log_ts = 0.0
         self._shared_u1_desired_vectors_cache: dict[str, dict[str, object]] = {}
         self._shared_u1_source_satellites_cache: tuple[int | None, ...] = ()
+        self._latest_gnss_fifo_source_labels: tuple[str, ...] = ()
         self._shared_u1_scalar_fanout_chunks = 0
-        self._shared_u1_matrix_fallback_chunks = 0
+        self._shared_u1_matrix_fanout_chunks = 0
         self._gnss_fifo_samples_written: int = 0
         self._gnss_raw_drops: int = 0
         self._gnss_raw_q_highwater: int = 0
         self._gnss_raw_q_interval_highwater: int = 0
         self._gnss_raw_q_marks_logged: set[int] = set()
         self._gnss_failure_lock = threading.Lock()
+        self._gnss_bridge_cleanup_lock = threading.Lock()
+        self._gnss_bridge_cleanup_failed = False
         self._gnss_pipeline_failed = False
 
         # DSP stage queues are intentionally shallow and latest-only; processing
@@ -228,6 +228,7 @@ class BackendRuntime:
         self._overflow_streak = 0
         self._timeout_count = 0
         self._stop_reason = "not started"
+        self._failure_reason: str | None = None
         self._startup_overflow_count = 0
         self._startup_timeout_count = 0
         self._stream_start_ts = 0.0
@@ -271,7 +272,7 @@ class BackendRuntime:
         self._healthy_reference_cal_power_linear: float | None = None
         preserve_window = max(
             1,
-            int(getattr(config, "lcmv_realtime_preserve_window_samples", 40)),
+            int(config.lcmv_realtime_preserve_window_samples),
         )
         self._realtime_preserve_angle_history: deque[float] = deque(
             maxlen=preserve_window
@@ -356,6 +357,39 @@ class BackendRuntime:
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            live_workers = [
+                thread.name
+                for thread in (
+                    self._rx_thread,
+                    self._phase_thread,
+                    self._doa_thread,
+                    self._gnss_handoff_thread,
+                )
+                if thread is not None and thread.is_alive()
+            ]
+            if live_workers:
+                raise RuntimeError(
+                    "Cannot restart while prior worker(s) remain alive: "
+                    + ", ".join(live_workers)
+                )
+            if self._device_cleanup_failed or self._device is not None:
+                raise RuntimeError(
+                    "Cannot restart while the prior USRP owner has not been "
+                    "cleanly released. Restart the backend process."
+                )
+            if self._gnss_bridge_cleanup_failed or self._gnss_bridge is not None:
+                raise RuntimeError(
+                    "Cannot restart while the prior GNSS-SDR owner has not been "
+                    "cleanly released. Restart the backend process."
+                )
+            monitor = self._shared_u1_phase_monitor
+            if monitor is not None:
+                if not monitor.stop(timeout_s=0.0):
+                    raise RuntimeError(
+                        "Cannot restart while the prior Shared-U1 monitor remains alive."
+                    )
+                self._shared_u1_phase_monitor = None
+            self._stop_requested.clear()
             self._thread = threading.Thread(
                 target=self.run,
                 name="antijamming_backend",
@@ -381,8 +415,11 @@ class BackendRuntime:
         return bool(self._running)
 
     def run(self) -> None:
+        if self._stop_requested.is_set():
+            return
         self._running = True
         self._stop_reason = "normal stop"
+        self._failure_reason = None
         self._overflow_count = 0
         self._overflow_streak = 0
         self._timeout_count = 0
@@ -398,7 +435,7 @@ class BackendRuntime:
         self._last_automatic_state_key = None
         self._latest_lcmv_heavy_diag_payload = {
             "heavy_diagnostics_interval_s": self._json_float(
-                getattr(self._config, "lcmv_heavy_diagnostics_interval_s", 1.0)
+                self._config.lcmv_heavy_diagnostics_interval_s
             ),
             "heavy_diagnostics_emitted": False,
             "heavy_diagnostics_skipped_due_to_throttle": False,
@@ -462,11 +499,14 @@ class BackendRuntime:
         self._set_beamformer_weights(uniform_weights(len(self._config.channels)))
         self._reset_lcmv_test_for_run()
         try:
-            self._emit_status("Preparing session logs")
-            self._log_session = reset_session_logs(
-                self._config.log_dir,
-                self._loggers,
-            )
+            if self._config.logging_enabled:
+                self._emit_status("Preparing session logs")
+                self._log_session = reset_session_logs(
+                    self._config.log_dir,
+                    self._loggers,
+                )
+            else:
+                self._log_session = None
             self._stream_stop_event_recorded = False
             self._log_runtime_startup_context()
             self._record_runtime_event(
@@ -477,14 +517,21 @@ class BackendRuntime:
             self._loggers["app"].info(
                 "Runtime startup: gnss_combiner=uniform_array_sum"
             )
-            if self._device is None:
-                self._emit_status("Initializing USRP")
-                self._device = UsrpRxDevice(self._config)
-            else:
-                self._emit_status("Resuming USRP session")
-                self._loggers["stream"].info(
-                    "Reusing preserved USRP session; no MultiUSRP recreate or retune."
+            if self._device_cleanup_failed:
+                raise RuntimeError(
+                    "Previous USRP cleanup failed; refusing to reuse a device with "
+                    "unknown stream state. Restart the backend process before retrying."
                 )
+            if self._device is not None:
+                raise RuntimeError(
+                    "USRP owner unexpectedly exists at run start; refusing to reuse "
+                    "hardware with an unproven stream state."
+                )
+            self._emit_status("Initializing USRP")
+            self._device = UsrpRxDevice(self._config)
+            self._device_cleanup_failed = False
+            if self._stop_requested.is_set():
+                return
             for line in collect_host_transport_report(self._config.usrp_addr):
                 self._loggers["transport"].info(line)
                 self._loggers["hw"].info(line)
@@ -505,7 +552,10 @@ class BackendRuntime:
                         else None
                     ),
                 )
+                self._gnss_bridge_cleanup_failed = False
                 gnss_ok = self._gnss_bridge.start()
+                if self._stop_requested.is_set():
+                    return
             else:
                 self._emit_status("GNSS-SDR disabled")
                 self._loggers["gnss"].info("GNSS-SDR bridge disabled by configuration.")
@@ -548,78 +598,61 @@ class BackendRuntime:
                 self._gnss_raw_q_interval_highwater = 0
                 self._gnss_raw_q_marks_logged.clear()
                 self._gnss_fifo_samples_written = 0
-                shared_phase_fanout = self._shared_phase_fanout_enabled()
-                satellites = tuple(
-                    int(value)
-                    for value in self._config.gnss_shared_u1_phase_satellites
-                )
-                shared_phase_source_count = (
-                    len(satellites)
-                    if satellites
-                    else max(1, int(self._config.gnss_1c_channel_count))
-                )
+                shared_phase_source_count = int(self._config.gnss_1c_channel_count)
                 shared_phase_transition_s = float(
                     self._config.gnss_shared_u1_phase_transition_s
                 )
-                if shared_phase_fanout:
-                    self._shared_u1_phase_bank = SharedU1PhaseCompensationBank(
-                        satellites=satellites,
-                        channel_count=len(self._config.channels),
-                        sample_rate_hz=float(self._config.sample_rate),
-                        samples_per_chunk=int(self._config.samples_per_chunk),
-                        transition_s=shared_phase_transition_s,
-                        source_count=shared_phase_source_count,
-                        max_weight_norm=self._lcmv_weight_norm_limit(),
-                    )
-                    self._handoff_log.info(
-                        "Shared measured-U1 phase fanout enabled: mapping=%s satellites=%s "
-                        "sources=%d transition_s=%.3f min_suppression_db=%.1f "
-                        "independent_per_prn_lcmv=false",
-                        "pinned" if satellites else "dynamic_channel_to_prn",
-                        (
-                            ",".join(f"G{value:02d}" for value in satellites)
-                            if satellites
-                            else "acquired_at_runtime"
-                        ),
-                        shared_phase_source_count,
-                        shared_phase_transition_s,
-                        float(
-                            self._config.lcmv_min_predicted_jammer_suppression_db
-                        ),
-                    )
-                else:
-                    self._shared_u1_phase_bank = None
+                self._shared_u1_phase_bank = SharedU1PhaseCompensationBank(
+                    source_count=shared_phase_source_count,
+                    channel_count=len(self._config.channels),
+                    sample_rate_hz=float(self._config.sample_rate),
+                    samples_per_chunk=int(self._config.samples_per_chunk),
+                    transition_s=shared_phase_transition_s,
+                    max_weight_norm=self._lcmv_weight_norm_limit(),
+                )
+                self._handoff_log.info(
+                    "Shared measured-U1 phase fanout enabled: mapping=%s "
+                    "sources=%d transition_s=%.3f min_suppression_db=%.1f "
+                    "independent_per_prn_lcmv=false",
+                    "dynamic_channel_to_prn",
+                    shared_phase_source_count,
+                    shared_phase_transition_s,
+                    float(self._config.lcmv_min_predicted_jammer_suppression_db),
+                )
                 self._last_shared_u1_phase_status_log_ts = 0.0
                 self._shared_u1_desired_vectors_cache = {}
                 self._shared_u1_source_satellites_cache = tuple(
-                    satellites
-                    if satellites
-                    else (None for _ in range(shared_phase_source_count))
+                    None for _ in range(shared_phase_source_count)
                 )
-                self._shared_u1_scalar_fanout_chunks = 0
-                self._shared_u1_matrix_fallback_chunks = 0
-                if shared_phase_fanout:
-                    if self._log_session is None:
-                        raise RuntimeError(
-                            "shared-U1 phase monitoring requires an active log session"
-                        )
-                    self._shared_u1_phase_monitor = SharedU1DesiredVectorMonitor(
-                        sample_rate_hz=float(self._config.sample_rate),
-                        channel_count=len(self._config.channels),
-                        phase_correction_vector=self._config.phase_correction_vector,
-                        tracking_snapshot=self._gnss_bridge.snapshot,
-                        session_dir=self._log_session.session_dir,
-                        session_id=self._log_session.session_id,
-                        logger=self._handoff_log,
-                        min_quality_measurements=int(
-                            self._config.gnss_shared_u1_phase_min_quality_measurements
-                        ),
-                        satellites=satellites,
-                        source_count=shared_phase_source_count,
+                with self._beamformer_lock:
+                    self._latest_gnss_fifo_source_labels = tuple(
+                        "shared_common_waiting_for_channel_prn"
+                        for _ in range(shared_phase_source_count)
                     )
-                    self._shared_u1_phase_monitor.start()
-                else:
-                    self._shared_u1_phase_monitor = None
+                self._shared_u1_scalar_fanout_chunks = 0
+                self._shared_u1_matrix_fanout_chunks = 0
+                self._shared_u1_phase_monitor = SharedU1DesiredVectorMonitor(
+                    sample_rate_hz=float(self._config.sample_rate),
+                    channel_count=len(self._config.channels),
+                    phase_correction_vector=self._config.phase_correction_vector,
+                    tracking_snapshot=self._gnss_bridge.snapshot,
+                    session_dir=(
+                        self._log_session.session_dir
+                        if self._log_session is not None
+                        else None
+                    ),
+                    session_id=(
+                        self._log_session.session_id
+                        if self._log_session is not None
+                        else None
+                    ),
+                    logger=self._handoff_log,
+                    min_quality_measurements=int(
+                        self._config.gnss_shared_u1_phase_min_quality_measurements
+                    ),
+                    source_count=shared_phase_source_count,
+                )
+                self._shared_u1_phase_monitor.start()
                 gnss_handoff_thread = threading.Thread(
                     target=self._gnss_beamform_loop,
                     name="gnss_ordered_handoff",
@@ -688,7 +721,7 @@ class BackendRuntime:
             doa_thread.start()
             self._doa_thread = doa_thread
 
-            while self._running:
+            while self._running and not self._stop_requested.is_set():
                 now = time.monotonic()
                 if (now - self._last_ui_emit_ts) >= self._ui_emit_interval_s:
                     metrics = self._compose_metrics_for_ui()
@@ -698,39 +731,31 @@ class BackendRuntime:
                 next_emit_s = self._last_ui_emit_ts + self._ui_emit_interval_s
                 time.sleep(min(0.02, max(0.001, next_emit_s - now)))
         except Exception as exc:
-            msg = f"Backend runtime failed: {exc}"
-            self._stop_reason = f"exception: {exc}"
-            self._loggers["errors"].exception(msg)
-            self._emit_failed(msg)
+            if self._stop_requested.is_set():
+                self._loggers["app"].info(
+                    "Backend startup/runtime operation exited during requested "
+                    "shutdown: %s",
+                    exc,
+                )
+            else:
+                msg = f"Backend runtime failed: {exc}"
+                self._failure_reason = msg
+                self._set_stop_reason(f"exception: {exc}")
+                self._loggers["errors"].exception(msg)
+                self._emit_failed(msg)
         finally:
             self._running = False
+            self._stop_requested.set()
             self._emit_status("Stopping DSP and GNSS handoff")
             self._signal_dsp_shutdown()
             # recv_chunk() and FIFO writes can be blocking ownership points.
             # Stop their providers before joining the consumer threads.
             self._finalize_usrp_device()
-            with self._gnss_failure_lock:
-                bridge = self._gnss_bridge
-                self._gnss_bridge = None
-            if bridge is not None:
+            if self._gnss_bridge is not None:
                 self._emit_status("Finalizing GNSS-SDR logs")
-                bridge.stop(self._stop_reason)
+                self._finalize_gnss_bridge(self._stop_reason)
             self._join_owned_thread("_rx_thread", timeout_s=2.0)
-            rq = self._gnss_raw_queue
-            if rq is not None:
-                put_latest(rq, None)
-            handoff_stopped = self._join_owned_thread(
-                "_gnss_handoff_thread",
-                timeout_s=4.0,
-            )
-            if handoff_stopped:
-                self._gnss_raw_queue = None
-            if self._shared_u1_phase_monitor is not None:
-                if self._shared_u1_phase_monitor.stop():
-                    self._shared_u1_phase_monitor = None
-            self._shared_u1_phase_bank = None
-            self._shared_u1_desired_vectors_cache = {}
-            self._shared_u1_source_satellites_cache = ()
+            self._finalize_gnss_handoff_owners()
             if self._config.gnss_sdr_enable:
                 self._loggers["transport"].info(
                     "GNSS queue summary: raw_highwater=%d/%d raw_rejections=%d",
@@ -765,7 +790,7 @@ class BackendRuntime:
                 self._loggers,
                 stop_reason=self._stop_reason,
                 outcome=(
-                    "failed" if self._stop_reason.startswith("exception:") else "stopped"
+                    "failed" if self._failure_reason is not None else "stopped"
                 ),
             )
 
@@ -799,12 +824,50 @@ class BackendRuntime:
         )
         return False
 
+    def _finalize_gnss_handoff_owners(self) -> bool:
+        """Stop handoff owners without clearing dependencies of a live consumer."""
+
+        raw_queue = self._gnss_raw_queue
+        if raw_queue is not None:
+            put_latest(raw_queue, None)
+        handoff_stopped = self._join_owned_thread(
+            "_gnss_handoff_thread",
+            timeout_s=4.0,
+        )
+        if handoff_stopped:
+            self._gnss_raw_queue = None
+
+        monitor_stopped = True
+        monitor = self._shared_u1_phase_monitor
+        if monitor is not None:
+            monitor_stopped = monitor.stop()
+            if monitor_stopped and self._shared_u1_phase_monitor is monitor:
+                self._shared_u1_phase_monitor = None
+
+        if handoff_stopped:
+            self._shared_u1_phase_bank = None
+            self._shared_u1_desired_vectors_cache = {}
+            self._shared_u1_source_satellites_cache = ()
+        else:
+            self._loggers["errors"].error(
+                "GNSS handoff cleanup incomplete; retaining its queue, phase bank, "
+                "and mapping caches until the consumer exits."
+            )
+        return bool(handoff_stopped and monitor_stopped)
+
     def _run_dsp_stage(self, name: str, target: Callable[[], None]) -> None:
         """Convert an uncaught DSP-stage exception into a runtime failure."""
 
         try:
             target()
         except Exception as exc:
+            if self._stop_requested.is_set() or not self._running:
+                self._loggers["app"].info(
+                    "DSP %s stage exited during requested shutdown: %s",
+                    name,
+                    exc,
+                )
+                return
             self._loggers["errors"].exception("DSP %s stage crashed: %s", name, exc)
             self._failed_stop(f"DSP {name} stage failed: {exc}")
 
@@ -814,25 +877,50 @@ class BackendRuntime:
         device = self._device
         if device is None:
             return
-        if bool(self._config.preserve_usrp_session_on_stop):
-            try:
-                device.pause_stream()
-            except Exception:
-                pass
-            self._loggers["stream"].info(
-                "USRP session preserved after stop; next start can reuse current LO/tune state."
-            )
-            return
         try:
             # stop() is idempotent at the device boundary.  Calling it here is
             # required for exceptions that bypass BackendRuntime.stop().
             device.stop()
-        except Exception:
-            pass
-        finally:
+        except Exception as exc:
+            self._device_cleanup_failed = True
+            self._loggers["errors"].exception(
+                "USRP stop failed; retaining the device owner and blocking unsafe reuse: %s",
+                exc,
+            )
+        else:
+            self._device_cleanup_failed = False
             self._device = None
 
+    def _finalize_gnss_bridge(self, reason: str) -> bool:
+        """Stop GNSS-SDR and retain its owner until every resource is closed."""
+
+        with self._gnss_bridge_cleanup_lock:
+            bridge = self._gnss_bridge
+            if bridge is None:
+                return True
+            try:
+                stopped = bridge.stop(reason)
+            except Exception as exc:
+                stopped = False
+                self._loggers["errors"].exception(
+                    "GNSS-SDR stop failed; retaining owner for retry: %s",
+                    exc,
+                )
+            if not stopped:
+                self._gnss_bridge_cleanup_failed = True
+                self._loggers["errors"].error(
+                    "GNSS-SDR cleanup incomplete; blocking unsafe backend reuse."
+                )
+                return False
+            with self._gnss_failure_lock:
+                if self._gnss_bridge is bridge:
+                    self._gnss_bridge = None
+            self._gnss_bridge_cleanup_failed = False
+            return True
+
     def _log_runtime_startup_context(self) -> None:
+        if not self._config.logging_enabled:
+            return
         for logger in (
             self._loggers["app"],
             self._lcmv_log,
@@ -880,18 +968,6 @@ class BackendRuntime:
                 ),
             )
 
-        calibration_manifest = self._calibration_manifest_payload()
-        if bool(calibration_manifest.get("fallback_used", False)):
-            warning = (
-                "calibration_manifest warning=fallback_used "
-                f"configured={calibration_manifest.get('calibration_correction_mode_configured')} "
-                f"applied={calibration_manifest.get('calibration_correction_mode_applied')} "
-                f"reason={calibration_manifest.get('fallback_reason')!r}"
-            )
-            self._loggers["app"].warning("%s", warning)
-            self._analysis_log.warning("%s", warning)
-            self._loggers["health"].warning("%s", warning)
-
     def _array_geometry_manifest(self) -> dict[str, object]:
         spacing = float(self._config.array_spacing_m)
         half = spacing / 2.0
@@ -930,89 +1006,68 @@ class BackendRuntime:
             "event": "lcmv_runtime_manifest",
             "lcmv_test_enabled": bool(self._lcmv_test_enabled),
             "lcmv_auto_arm_after_pvt": bool(self._lcmv_auto_arm_after_pvt),
-            "lcmv_test_null_method": self._lcmv_test_null_method,
-            "lcmv_test_null_method_allowed": sorted(VALID_LCMV_METHODS),
-            "lcmv_preserve_constraint_mode": str(
-                getattr(self._config, "lcmv_preserve_constraint_mode", "uniform")
-            ),
-            "lcmv_target_selection_mode": str(
-                getattr(self._config, "lcmv_target_selection_mode", "strongest_music_peak")
-            ),
+            "configured_common_lcmv_method": ACTIVE_LCMV_METHOD,
+            "preserve_strategy": "realtime_bladerf_measured_u1",
+            "target_selection_strategy": "realtime_non_preserve_peak",
             "lcmv_realtime_preserve_window_samples": int(
-                getattr(self._config, "lcmv_realtime_preserve_window_samples", 40)
+                self._config.lcmv_realtime_preserve_window_samples
             ),
             "lcmv_realtime_preserve_min_samples": int(
-                getattr(self._config, "lcmv_realtime_preserve_min_samples", 20)
+                self._config.lcmv_realtime_preserve_min_samples
             ),
             "lcmv_realtime_preserve_max_circular_std_deg": self._json_float(
-                getattr(
-                    self._config,
-                    "lcmv_realtime_preserve_max_circular_std_deg",
-                    15.0,
-                )
+                self._config.lcmv_realtime_preserve_max_circular_std_deg
             ),
             "lcmv_realtime_preserve_max_step_deg": self._json_float(
-                getattr(self._config, "lcmv_realtime_preserve_max_step_deg", 30.0)
+                self._config.lcmv_realtime_preserve_max_step_deg
             ),
             "lcmv_realtime_preserve_guard_deg": self._json_float(
-                getattr(self._config, "lcmv_realtime_preserve_guard_deg", 20.0)
+                self._config.lcmv_realtime_preserve_guard_deg
             ),
             "lcmv_realtime_preserve_max_reference_age_s": self._json_float(
-                getattr(
-                    self._config,
-                    "lcmv_realtime_preserve_max_reference_age_s",
-                    2.0,
-                )
+                self._config.lcmv_realtime_preserve_max_reference_age_s
             ),
             "lcmv_jammer_activation_min_input_power_jump_db": self._json_float(
-                getattr(
-                    self._config,
-                    "lcmv_jammer_activation_min_input_power_jump_db",
-                    3.0,
-                )
+                self._config.lcmv_jammer_activation_min_input_power_jump_db
             ),
             "lcmv_jammer_activation_min_generalized_gain_db": self._json_float(
-                getattr(
-                    self._config,
-                    "lcmv_jammer_activation_min_generalized_gain_db",
-                    6.0,
-                )
+                self._config.lcmv_jammer_activation_min_generalized_gain_db
             ),
             "lcmv_weight_transition_s": self._json_float(
-                getattr(self._config, "lcmv_weight_transition_s", 1.0)
+                self._config.lcmv_weight_transition_s
             ),
             "lcmv_jammer_activation_angle_only_forbidden": True,
             "lcmv_jammer_activation_latches_until_disable": True,
-            "lcmv_test_max_weight_norm": self._json_float(
-                self._config.lcmv_test_max_weight_norm
+            "lcmv_condition_number_limit": self._json_float(
+                self._config.lcmv_condition_number_limit
             ),
-            "lcmv_test_condition_number_limit": self._json_float(
-                self._config.lcmv_test_condition_number_limit
-            ),
-            "lcmv_candidate_methods_enabled": bool(
-                getattr(self._config, "lcmv_candidate_methods_enabled", True)
-            ),
+            "candidate_methods": [
+                "covariance_lcmv_measured_u1",
+            ],
             "lcmv_covariance_diagonal_loading_rel": self._json_float(
-                getattr(self._config, "lcmv_covariance_diagonal_loading_rel", 0.001)
+                self._config.lcmv_covariance_diagonal_loading_rel
             ),
             "lcmv_covariance_diagonal_loading_abs": self._json_float(
-                getattr(self._config, "lcmv_covariance_diagonal_loading_abs", 0.0)
+                self._config.lcmv_covariance_diagonal_loading_abs
             ),
             "lcmv_max_weight_norm": self._json_float(
-                getattr(self._config, "lcmv_max_weight_norm", self._config.lcmv_test_max_weight_norm)
+                self._config.lcmv_max_weight_norm
             ),
             "lcmv_max_white_noise_gain_db": self._json_float(
-                getattr(self._config, "lcmv_max_white_noise_gain_db", 15.0)
+                self._config.lcmv_max_white_noise_gain_db
             ),
             "lcmv_min_predicted_jammer_suppression_db": self._json_float(
-                getattr(self._config, "lcmv_min_predicted_jammer_suppression_db", 3.0)
+                self._config.lcmv_min_predicted_jammer_suppression_db
             ),
             "lcmv_heavy_diagnostics_interval_s": self._json_float(
-                getattr(self._config, "lcmv_heavy_diagnostics_interval_s", 1.0)
+                self._config.lcmv_heavy_diagnostics_interval_s
             ),
-            "default_active_method": self._lcmv_test_null_method,
-            "covariance_lcmv_measured_u1_is_diagnostic_by_default": (
-                self._lcmv_test_null_method != "covariance_lcmv_measured_u1"
+            "covariance_lcmv_measured_u1_role": (
+                "tracked_gnss_prn_fanout_protection_candidate"
+            ),
+            "gui_lcmv_response_scope": (
+                "two_ideal_steering_scans_common_target_and_shared_measured_u1_"
+                "neither_is_measured_ota_null_depth"
             ),
         }
 
@@ -1067,10 +1122,10 @@ class BackendRuntime:
                 else None
             ),
             "calibration_correction_mode_configured": str(
-                getattr(self._config, "calibration_correction_mode", "complex_gain")
+                self._config.calibration_correction_mode
             ),
             "calibration_correction_mode_applied": str(
-                getattr(self._config, "calibration_correction_mode", "complex_gain")
+                self._config.calibration_correction_mode
             )
             if self._config.phase_correction_vector is not None
             else "none",
@@ -1080,10 +1135,6 @@ class BackendRuntime:
             "phase_only_vector_available": (
                 "correction_vector" in self._phase_calibration_metadata
                 or "phase_offsets_deg" in self._phase_calibration_metadata
-            ),
-            "fallback_used": self._config.phase_correction_vector is None,
-            "fallback_reason": (
-                "" if self._config.phase_correction_vector is not None else "no applied correction vector"
             ),
             "reference_channel": self._calibration_reference_channel(),
             "correction_vector_length": int(correction.size),
@@ -1228,27 +1279,19 @@ class BackendRuntime:
 
     def stop(self, reason: str = "normal stop") -> None:
         self._set_stop_reason(reason)
+        self._stop_requested.set()
         # Capture the last live GNSS/LCMV/power snapshot before the bridge and
         # device are detached. The finalizer calls the same guarded helper for
         # exception paths that never enter this method.
         self._record_stream_stop_event_once(source="backend_control")
         self._running = False
         self._signal_dsp_shutdown()
-        with self._gnss_failure_lock:
-            bridge = self._gnss_bridge
-            self._gnss_bridge = None
-        if bridge is not None:
+        if self._gnss_bridge is not None:
             self._emit_status("Stopping GNSS-SDR")
-            bridge.stop(reason)
+            self._finalize_gnss_bridge(reason)
         if self._device is not None:
             self._emit_status("Stopping USRP stream")
-            try:
-                if bool(self._config.preserve_usrp_session_on_stop):
-                    self._device.pause_stream()
-                else:
-                    self._device.stop()
-            except Exception:
-                pass
+            self._finalize_usrp_device()
 
     def set_expected_sources(self, count: int) -> None:
         max_sources = max(len(self._config.channels) - 1, 1)
@@ -1267,8 +1310,6 @@ class BackendRuntime:
         self,
         event: str,
         *,
-        attenuation_db: float | None = None,
-        bladeRF_gain_db: float | None = None,
         notes: str = "",
         source: str = "operator",
     ) -> dict[str, object]:
@@ -1283,25 +1324,16 @@ class BackendRuntime:
             self._operator_rf_state["bladeRF"] = "on"
         elif normalized == "bladeRF_off":
             self._operator_rf_state["bladeRF"] = "off"
-        if attenuation_db is not None:
-            self._operator_rf_state["attenuation_db"] = float(attenuation_db)
-        if bladeRF_gain_db is not None:
-            self._operator_rf_state["bladeRF_gain_db"] = float(bladeRF_gain_db)
         payload = self._record_runtime_event(
             normalized,
             source=source,
-            attenuation_db=attenuation_db,
-            bladeRF_gain_db=bladeRF_gain_db,
             notes=notes,
         )
         self._loggers["app"].info(
-            "Operator RF marker: event=%s jammer=%s bladeRF=%s attenuation_db=%s "
-            "bladeRF_gain_db=%s source=%s notes=%s",
+            "Operator RF marker: event=%s jammer=%s bladeRF=%s source=%s notes=%s",
             normalized,
             self._operator_rf_state.get("jammer"),
             self._operator_rf_state.get("bladeRF"),
-            self._operator_rf_state.get("attenuation_db"),
-            self._operator_rf_state.get("bladeRF_gain_db"),
             source,
             notes or "--",
         )
@@ -1539,6 +1571,8 @@ class BackendRuntime:
     ) -> None:
         """Persist synchronized automatic evidence at the GUI/DSP cadence."""
 
+        if not self._config.logging_enabled:
+            return
         now = time.monotonic()
         interval_s = max(0.1, float(self._config.ui_update_interval_s))
         if (now - self._last_runtime_evidence_log_ts) < interval_s:
@@ -1609,8 +1643,6 @@ class BackendRuntime:
         event: str,
         *,
         source: str,
-        attenuation_db: float | None = None,
-        bladeRF_gain_db: float | None = None,
         notes: str = "",
     ) -> dict[str, object]:
         session = self._log_session
@@ -1618,16 +1650,19 @@ class BackendRuntime:
             self._config.log_dir,
             event,
             source=source,
-            attenuation_db=attenuation_db,
-            bladeRF_gain_db=bladeRF_gain_db,
             notes=notes,
-            context=self._event_context_snapshot(),
+            context=(
+                self._event_context_snapshot()
+                if self._config.logging_enabled
+                else None
+            ),
             session_id=session.session_id if session is not None else None,
             session_elapsed_s=session.elapsed_s() if session is not None else None,
             # Unit fixtures and pre-start backend objects have no owned session.
             # They may exercise controls, but must not append synthetic events
             # into an unrelated active hardware run.
             append_current_session=session is not None,
+            persist=self._config.logging_enabled,
         )
 
     def _record_stream_stop_event_once(self, *, source: str) -> None:
@@ -1669,7 +1704,7 @@ class BackendRuntime:
                 self._realtime_preserve_angle_history.maxlen or 0
             ),
             "realtime_bladerf_tracker_min_samples": int(
-                getattr(self._config, "lcmv_realtime_preserve_min_samples", 20)
+                self._config.lcmv_realtime_preserve_min_samples
             ),
             "realtime_bladerf_tracker_center_internal_deg": self._json_float(
                 self._realtime_preserve_center_internal_deg
@@ -1681,11 +1716,7 @@ class BackendRuntime:
                 self._realtime_preserve_circular_std_deg
             ),
             "realtime_bladerf_tracker_max_circular_std_deg": self._json_float(
-                getattr(
-                    self._config,
-                    "lcmv_realtime_preserve_max_circular_std_deg",
-                    15.0,
-                )
+                self._config.lcmv_realtime_preserve_max_circular_std_deg
             ),
             "realtime_bladerf_tracker_concentration": self._json_float(
                 self._realtime_preserve_concentration
@@ -1769,13 +1800,7 @@ class BackendRuntime:
                 step_deg = self._angle_distance_deg(selected, reference)
                 max_step = max(
                     0.0,
-                    float(
-                        getattr(
-                            self._config,
-                            "lcmv_realtime_preserve_max_step_deg",
-                            30.0,
-                        )
-                    ),
+                    float(self._config.lcmv_realtime_preserve_max_step_deg),
                 )
                 if step_deg > max_step:
                     self._realtime_preserve_rejected_streak += 1
@@ -1804,16 +1829,12 @@ class BackendRuntime:
             )
             min_samples = max(
                 1,
-                int(getattr(self._config, "lcmv_realtime_preserve_min_samples", 20)),
+                int(self._config.lcmv_realtime_preserve_min_samples),
             )
             max_std = max(
                 0.0,
                 float(
-                    getattr(
-                        self._config,
-                        "lcmv_realtime_preserve_max_circular_std_deg",
-                        15.0,
-                    )
+                    self._config.lcmv_realtime_preserve_max_circular_std_deg
                 ),
             )
             stable = len(angles) >= min_samples and circular_std <= max_std
@@ -1847,12 +1868,9 @@ class BackendRuntime:
         self._set_shared_measured_u1_protection_weights(
             uniform_weights(len(self._config.channels)), available=False
         )
-        preserve_mode = str(
-            getattr(self._config, "lcmv_preserve_constraint_mode", "uniform")
-        ).strip().lower()
         frozen_reason = ""
         with self._results_lock:
-            if active and preserve_mode == "realtime_bladerf_measured_u1":
+            if active:
                 center = self._realtime_preserve_center_internal_deg
                 healthy_vector = (
                     normalize_complex_vector(self._healthy_reference_vector)
@@ -1880,23 +1898,11 @@ class BackendRuntime:
                 )
                 max_reference_age_s = max(
                     0.0,
-                    float(
-                        getattr(
-                            self._config,
-                            "lcmv_realtime_preserve_max_reference_age_s",
-                            2.0,
-                        )
-                    ),
+                    float(self._config.lcmv_realtime_preserve_max_reference_age_s),
                 )
                 max_reference_angle_error_deg = max(
                     0.0,
-                    float(
-                        getattr(
-                            self._config,
-                            "lcmv_realtime_preserve_guard_deg",
-                            20.0,
-                        )
-                    ),
+                    float(self._config.lcmv_realtime_preserve_guard_deg),
                 )
                 reference_ready = (
                     healthy_vector.size == len(self._config.channels)
@@ -1976,7 +1982,7 @@ class BackendRuntime:
                     if self._healthy_reference_confidence < 0.8:
                         blockers.append("healthy reference confidence is below 0.8")
                     frozen_reason = "; ".join(blockers) or "bladeRF reference unavailable"
-            elif not active and preserve_mode == "realtime_bladerf_measured_u1":
+            else:
                 self._reset_realtime_preserve_tracker_locked(
                     "LCMV disabled; collecting a new jammer-off bladeRF angle cluster"
                 )
@@ -2007,19 +2013,14 @@ class BackendRuntime:
 
         self._set_beamformer_weights(uniform_weights(len(self._config.channels)))
         enable_diag: dict[str, object] = {}
-        if preserve_mode == "realtime_bladerf_measured_u1":
-            enable_diag = self._realtime_preserve_tracker_payload()
-            enable_diag["lcmv_jammer_activation_armed"] = bool(
-                enable_diag.get("realtime_bladerf_angle_frozen", False)
-            )
+        enable_diag = self._realtime_preserve_tracker_payload()
+        enable_diag["lcmv_jammer_activation_armed"] = bool(
+            enable_diag.get("realtime_bladerf_angle_frozen", False)
+        )
         self._set_lcmv_status(
             enabled=True,
             mode="fallback",
-            reason=(
-                frozen_reason
-                if preserve_mode == "realtime_bladerf_measured_u1"
-                else "waiting_for_music_peak"
-            ),
+            reason=frozen_reason,
             spatial_vector_diagnostics=enable_diag,
         )
         self._lcmv_log.info(
@@ -2084,9 +2085,18 @@ class BackendRuntime:
             raise RuntimeError("USRP RX startup probe has no device.")
         for attempt in (1, 2):
             try:
-                rx_result = device.recv_chunk()
-                chunk, rx_state = rx_result
+                rx_result = validate_rx_chunk_result(
+                    device.recv_chunk(),
+                    expected_channels=len(self._config.channels),
+                )
+                chunk = rx_result.chunk
+                rx_state = rx_result.state
                 rx_info = self._rx_result_info(rx_result)
+                if rx_state == "other":
+                    raise RuntimeError(
+                        "UHD reported unsupported RX metadata during startup: "
+                        f"{rx_info['error_code']}"
+                    )
             except Exception as exc:
                 if attempt >= 2:
                     raise RuntimeError(
@@ -2125,12 +2135,27 @@ class BackendRuntime:
         while self._running and self._device is not None:
             try:
                 recv_t0 = time.monotonic()
-                rx_result = self._device.recv_chunk()
-                chunk, rx_state = rx_result
+                rx_result = validate_rx_chunk_result(
+                    self._device.recv_chunk(),
+                    expected_channels=len(self._config.channels),
+                )
+                chunk = rx_result.chunk
+                rx_state = rx_result.state
                 rx_info = self._rx_result_info(rx_result)
+                if rx_state == "other":
+                    raise RuntimeError(
+                        "UHD reported unsupported RX metadata: "
+                        f"{rx_info['error_code']}"
+                    )
                 recv_elapsed_s = time.monotonic() - recv_t0
                 self._record_runtime_timing("rx_recv", recv_elapsed_s)
             except Exception as exc:
+                if self._stop_requested.is_set() or not self._running:
+                    self._loggers["stream"].info(
+                        "RX receive exited during requested shutdown: %s",
+                        exc,
+                    )
+                    return
                 self._loggers["errors"].exception("RX drain loop crashed: %s", exc)
                 self._failed_stop(f"RX recv failed: {exc}")
                 return
@@ -2188,11 +2213,10 @@ class BackendRuntime:
                         self._loggers["transport"].error("%s", reason)
                         self._loggers["errors"].error("%s", reason)
                         self._stop_reason = reason
+                        self._failure_reason = reason
                         self._running = False
-                        try:
-                            self._device.stop()
-                        except Exception:
-                            pass
+                        self._stop_requested.set()
+                        self._finalize_usrp_device()
                         self._emit_failed(reason)
                         return
             elif rx_state == "timeout":
@@ -2252,14 +2276,12 @@ class BackendRuntime:
                         ),
                     )
 
-    def _rx_result_info(self, rx_result: object) -> dict[str, object]:
+    def _rx_result_info(self, rx_result: RxChunkResult) -> dict[str, object]:
         return {
-            "got_samples": int(getattr(rx_result, "got_samples", 0) or 0),
-            "error_code": self._normalize_rx_error_code(
-                getattr(rx_result, "error_code", "none")
-            ),
-            "out_of_sequence": bool(getattr(rx_result, "out_of_sequence", False)),
-            "time_spec_s": getattr(rx_result, "time_spec_s", None),
+            "got_samples": int(rx_result.got_samples),
+            "error_code": self._normalize_rx_error_code(rx_result.error_code),
+            "out_of_sequence": bool(rx_result.out_of_sequence),
+            "time_spec_s": rx_result.time_spec_s,
         }
 
     def _normalize_rx_error_code(self, error_code: object) -> str:
@@ -2573,6 +2595,8 @@ class BackendRuntime:
         )
 
     def _record_runtime_timing(self, name: str, elapsed_s: float) -> None:
+        if not self._config.logging_enabled:
+            return
         elapsed = max(0.0, float(elapsed_s))
         now = time.monotonic()
         should_log = False
@@ -2680,6 +2704,8 @@ class BackendRuntime:
         }
 
     def _log_rx_transport_event_context(self, event: str, recv_elapsed_s: float) -> None:
+        if not self._config.logging_enabled:
+            return
         if event == "timeout" and self._timeout_count > 5 and self._timeout_count % 20 != 0:
             return
         qstats = self._peek_transport_queue_snapshot()
@@ -2850,7 +2876,7 @@ class BackendRuntime:
             selected = uniform_weights(len(self._config.channels))
         transition_s = max(
             0.0,
-            float(getattr(self._config, "lcmv_weight_transition_s", 0.0)),
+            float(self._config.lcmv_weight_transition_s),
         )
         with self._beamformer_lock:
             if transition_s <= 0.0:
@@ -2940,7 +2966,7 @@ class BackendRuntime:
             return {
                 "weight_transition_active": bool(active),
                 "weight_transition_duration_s": self._json_float(
-                    getattr(self._config, "lcmv_weight_transition_s", 0.0)
+                    self._config.lcmv_weight_transition_s
                 ),
                 "weight_transition_total_chunks": total,
                 "weight_transition_completed_chunks": completed,
@@ -2976,7 +3002,7 @@ class BackendRuntime:
             ),
             "weight_transition_active": bool(active),
             "weight_transition_duration_s": self._json_float(
-                getattr(self._config, "lcmv_weight_transition_s", 0.0)
+                self._config.lcmv_weight_transition_s
             ),
             "weight_transition_total_chunks": total,
             "weight_transition_completed_chunks": completed,
@@ -3037,72 +3063,13 @@ class BackendRuntime:
                 )
             return np.array(self._latest_beamformer_weights, copy=True)
 
-    def _get_gnss_effective_weights(self) -> np.ndarray:
-        with self._beamformer_lock:
-            return self._latest_gnss_effective_weights
-
-    @staticmethod
-    def _weighted_sum_complex64(source: np.ndarray, weights: np.ndarray) -> np.ndarray:
-        """Fast small-array weighted sum for the GNSS FIFO hot path."""
-        x = np.asarray(source, dtype=np.complex64)
-        w = np.asarray(weights, dtype=np.complex64).reshape(-1)
-        if x.ndim != 2 or x.shape[1] == 0 or w.size == 0:
-            return np.zeros((0,), dtype=np.complex64)
-        if x.shape[0] != w.size:
-            raise ValueError(
-                f"GNSS beamformer weight count {w.size} does not match channel count {x.shape[0]}"
-            )
-        out = np.empty((x.shape[1],), dtype=np.complex64)
-        np.multiply(x[0], w[0], out=out)
-        if x.shape[0] == 1:
-            return out
-        tmp = np.empty_like(out)
-        for idx in range(1, x.shape[0]):
-            np.multiply(x[idx], w[idx], out=tmp)
-            np.add(out, tmp, out=out)
-        return out
-
-    def _gnss_output_vector(self, chunk: np.ndarray) -> np.ndarray:
-        # The fanout bank is created only after the GNSS bridge has started.
-        # Keep the ordinary beamformer usable during construction, teardown,
-        # and failed/partial startup instead of raising from the realtime path.
-        if (
-            self._shared_phase_fanout_enabled()
-            and self._shared_u1_phase_bank is not None
-        ):
-            return self._gnss_shared_u1_phase_output_matrix(chunk)
-        return self._gnss_beamformed_output_vector(chunk)
-
-    def _shared_phase_fanout_enabled(self) -> bool:
-        return bool(
-            getattr(
-                self._config,
-                "gnss_shared_u1_phase_compensation_enabled",
-                False,
-            )
-        )
-
     def _shared_phase_source_count(self) -> int:
-        satellites = tuple(
-            int(value)
-            for value in self._config.gnss_shared_u1_phase_satellites
-        )
-        return (
-            len(satellites)
-            if satellites
-            else max(1, int(self._config.gnss_1c_channel_count))
-        )
+        return int(self._config.gnss_1c_channel_count)
 
     def _tracking_source_satellites(
         self,
         snapshot: dict[str, object],
     ) -> tuple[int | None, ...]:
-        pinned = tuple(
-            int(value)
-            for value in self._config.gnss_shared_u1_phase_satellites
-        )
-        if pinned:
-            return tuple(pinned)
         source_count = self._shared_phase_source_count()
         mapped: list[int | None] = [None] * source_count
         # ``tracking_monitor`` is an archive-like latest-by-PRN collection.  A
@@ -3184,6 +3151,9 @@ class BackendRuntime:
             now_monotonic=now,
             emit_status=emit_status,
         )
+        source_labels = bank.applied_source_labels(
+            self._shared_u1_source_satellites_cache
+        )
         # Retain the exact phase-aligned shared-beam rows.  The spatial monitor
         # must correlate each PRN through the same row GNSS-SDR received.
         with self._beamformer_lock:
@@ -3191,6 +3161,7 @@ class BackendRuntime:
                 logical,
                 copy=True,
             )
+            self._latest_gnss_fifo_source_labels = source_labels
         correction_vector = self._config.phase_correction_vector
         correction = (
             np.asarray(correction_vector, dtype=np.complex64).reshape(-1)
@@ -3207,7 +3178,7 @@ class BackendRuntime:
         if scalar_fast_path:
             self._shared_u1_scalar_fanout_chunks += 1
         else:
-            self._shared_u1_matrix_fallback_chunks += 1
+            self._shared_u1_matrix_fanout_chunks += 1
         if emit_status:
             self._last_shared_u1_phase_status_log_ts = now
             bridge_count = sum(
@@ -3235,8 +3206,8 @@ class BackendRuntime:
                         "transitioning_source_count": transitioning_count,
                         "phase_compensation": "per_prn_complex_response_continuity",
                         "scalar_fanout_chunks": self._shared_u1_scalar_fanout_chunks,
-                        "matrix_fallback_chunks": (
-                            self._shared_u1_matrix_fallback_chunks
+                        "matrix_fanout_chunks": (
+                            self._shared_u1_matrix_fanout_chunks
                         ),
                         "latest_output_path": (
                             "one_shared_beam_plus_prn_scalars"
@@ -3255,80 +3226,11 @@ class BackendRuntime:
             )
         return outputs
 
-    def _gnss_beamformed_output_vector(self, chunk: np.ndarray) -> np.ndarray:
-        self._advance_beamformer_transition()
-        if self._config.phase_correction_vector is not None:
-            source = np.asarray(chunk, dtype=np.complex64)
-            if source.ndim != 2 or source.shape[1] == 0:
-                return np.zeros((0,), dtype=np.complex64)
-            effective_weights = self._get_gnss_effective_weights()
-            if effective_weights.size != source.shape[0]:
-                weights = self._get_beamformer_weights_copy()
-                try:
-                    return compute_gnss_output_vector(
-                        buffer=chunk,
-                        beamformer_weights=weights,
-                        phase_correction_vector=self._config.phase_correction_vector,
-                    )
-                except Exception as exc:
-                    if not self._lcmv_test_enabled:
-                        raise
-                    self._activate_lcmv_test_fallback(
-                        f"GNSS output uniform fallback after phase/weight error: {exc}",
-                        music_internal_deg=None,
-                        music_bearing_deg=None,
-                    )
-                    return apply_beamformer(
-                        source.astype(np.complex128, copy=False),
-                        uniform_weights(source.shape[0]),
-                    )
-            # Static calibration lets the realtime GNSS handoff collapse:
-            #   apply_phase_calibration(chunk) -> apply_beamformer(...)
-            # into one weighted sum without allocating a full complex128
-            # corrected channel matrix for every RX chunk.
-            try:
-                return self._weighted_sum_complex64(source, effective_weights)
-            except Exception as exc:
-                if not self._lcmv_test_enabled:
-                    raise
-                self._activate_lcmv_test_fallback(
-                    f"GNSS output uniform fallback after weighted-sum error: {exc}",
-                    music_internal_deg=None,
-                    music_bearing_deg=None,
-                )
-                return apply_beamformer(
-                    source.astype(np.complex128, copy=False),
-                    uniform_weights(source.shape[0]),
-                )
-        try:
-            return compute_gnss_output_vector(
-                buffer=chunk,
-                beamformer_weights=self._get_beamformer_weights_copy(),
-                phase_correction_vector=self._config.phase_correction_vector,
-            )
-        except Exception as exc:
-            if not self._lcmv_test_enabled:
-                raise
-            source = np.asarray(chunk, dtype=np.complex128)
-            self._activate_lcmv_test_fallback(
-                f"GNSS output uniform fallback after beamformer error: {exc}",
-                music_internal_deg=None,
-                music_bearing_deg=None,
-            )
-            return apply_beamformer(source, uniform_weights(source.shape[0]))
-
     def _gnss_handoff_mode_label(self) -> str:
-        if self._shared_phase_fanout_enabled():
-            # This names the fixed transport architecture. The current
-            # uniform/measured-U1 state is recorded separately by
-            # _fifo_output_source_label().
-            return "shared_prn_phase_continuity_fanout"
-        if self._lcmv_test_enabled:
-            status = self._lcmv_status_copy()
-            if str(status.get("mode", "")).lower() == "on":
-                return "lcmv_test_nulling_continuous"
-            return "lcmv_test_uniform_fallback_continuous"
-        return "uniform_array_sum_continuous"
+        # This names the fixed transport architecture. The current
+        # uniform/measured-U1 state is recorded separately by
+        # _fifo_output_source_label().
+        return "shared_prn_phase_continuity_fanout"
 
     # -------------------------------------------------------------------------
     # Operator-Controlled LCMV Test Mode
@@ -3348,7 +3250,7 @@ class BackendRuntime:
         self._last_lcmv_heavy_diag_ts = None
         self._latest_lcmv_heavy_diag_payload = {
             "heavy_diagnostics_interval_s": self._json_float(
-                getattr(self._config, "lcmv_heavy_diagnostics_interval_s", 1.0)
+                self._config.lcmv_heavy_diagnostics_interval_s
             ),
             "heavy_diagnostics_emitted": False,
             "heavy_diagnostics_skipped_due_to_throttle": False,
@@ -3373,8 +3275,6 @@ class BackendRuntime:
         reason: str = "",
         music_internal_deg: float | None = None,
         music_bearing_deg: float | None = None,
-        null_internal_deg: float | None = None,
-        null_bearing_deg: float | None = None,
         weight_norm: float | None = None,
         max_weight_abs: float | None = None,
         condition_number: float | None = None,
@@ -3387,6 +3287,9 @@ class BackendRuntime:
         lcmv_response_power: np.ndarray | None = None,
         lcmv_response_power_db: np.ndarray | None = None,
         lcmv_model_summary: dict[str, object] | None = None,
+        gnss_fifo_measured_u1_model_response_db: np.ndarray | None = None,
+        gnss_fifo_measured_u1_model_summary: dict[str, object] | None = None,
+        gnss_fifo_measured_u1_protection_available: bool = False,
         output_metrics: dict[str, object] | None = None,
         active_lcmv_null_method: str | None = None,
         active_lcmv_weights_source: str | None = None,
@@ -3425,8 +3328,6 @@ class BackendRuntime:
             "fallback_reason": str(reason or ""),
             "music_internal_deg": self._finite_metric_float(music_internal_deg),
             "music_bearing_deg": self._finite_metric_float(music_bearing_deg),
-            "null_internal_deg": self._finite_metric_float(null_internal_deg),
-            "null_bearing_deg": self._finite_metric_float(null_bearing_deg),
             "weight_norm": self._finite_metric_float(weight_norm),
             "max_weight_abs": self._finite_metric_float(max_weight_abs),
             "condition_number": self._finite_metric_float(condition_number),
@@ -3455,15 +3356,41 @@ class BackendRuntime:
                 else np.zeros((0,), dtype=np.float64)
             ),
             "lcmv_model_summary": dict(lcmv_model_summary or {}),
+            "gnss_fifo_measured_u1_model_response_db": (
+                np.asarray(
+                    gnss_fifo_measured_u1_model_response_db,
+                    dtype=np.float64,
+                )
+                if gnss_fifo_measured_u1_model_response_db is not None
+                else np.zeros((0,), dtype=np.float64)
+            ),
+            "gnss_fifo_measured_u1_model_summary": dict(
+                gnss_fifo_measured_u1_model_summary or {}
+            ),
+            "gnss_fifo_measured_u1_protection_available": bool(
+                gnss_fifo_measured_u1_protection_available
+            ),
+            "gnss_fifo_measured_u1_response_scope": (
+                "ideal_steering_scan_of_shared_weights_not_measured_ota_null"
+            ),
             "output_metrics": dict(output_metrics or {}),
             "active_lcmv_null_method": str(
-                active_lcmv_null_method or self._lcmv_test_null_method
+                active_lcmv_null_method
+                or (ACTIVE_LCMV_METHOD if normalized_mode == "on" else "none")
             ),
-            "active_lcmv_method": str(active_lcmv_method or active_lcmv_null_method or self._lcmv_test_null_method),
+            "active_lcmv_method": str(
+                active_lcmv_method
+                or active_lcmv_null_method
+                or (
+                    ACTIVE_LCMV_METHOD
+                    if normalized_mode == "on"
+                    else "uniform_array_sum"
+                )
+            ),
             "active_lcmv_weights_source": str(
                 active_lcmv_weights_source
                 or (
-                    self._lcmv_test_null_method
+                    ACTIVE_LCMV_METHOD
                     if normalized_mode == "on"
                     else (
                         "uniform_fallback"
@@ -3529,7 +3456,7 @@ class BackendRuntime:
     def _lcmv_heavy_diagnostics_interval_s(self) -> float:
         return max(
             0.0,
-            float(getattr(self._config, "lcmv_heavy_diagnostics_interval_s", 1.0)),
+            float(self._config.lcmv_heavy_diagnostics_interval_s),
         )
 
     def _lcmv_heavy_diagnostics_decision(self) -> dict[str, object]:
@@ -3552,13 +3479,6 @@ class BackendRuntime:
         return payload
 
     @staticmethod
-    def _normalized_lcmv_null_method(value: object) -> str:
-        method = str(value or "covariance_lcmv_ideal").strip().lower()
-        if method not in VALID_LCMV_METHODS:
-            return "covariance_lcmv_ideal"
-        return method
-
-    @staticmethod
     def _finite_metric_float(value: object) -> float | None:
         try:
             number = float(value)
@@ -3569,13 +3489,7 @@ class BackendRuntime:
         return number
 
     def _lcmv_weight_norm_limit(self) -> float:
-        return float(
-            getattr(
-                self._config,
-                "lcmv_max_weight_norm",
-                getattr(self._config, "lcmv_test_max_weight_norm", 8.0),
-            )
-        )
+        return float(self._config.lcmv_max_weight_norm)
 
     @staticmethod
     def _weight_power(weights: object) -> float | None:
@@ -3606,7 +3520,7 @@ class BackendRuntime:
         weight_power = self._weight_power(weights)
         white_noise_gain_db = power_db(weight_power)
         max_wng = self._finite_metric_float(
-            getattr(self._config, "lcmv_max_white_noise_gain_db", 15.0)
+            self._config.lcmv_max_white_noise_gain_db
         )
         if (
             enforce_white_noise_gain
@@ -3616,7 +3530,7 @@ class BackendRuntime:
         ):
             return f"white_noise_gain_db {white_noise_gain_db:.2f} exceeds {max_wng:.2f}"
         min_suppression = self._finite_metric_float(
-            getattr(self._config, "lcmv_min_predicted_jammer_suppression_db", 3.0)
+            self._config.lcmv_min_predicted_jammer_suppression_db
         )
         if (
             target_suppression_db is not None
@@ -3674,7 +3588,7 @@ class BackendRuntime:
         noise_gain_vs_ref_db = ratio_db(weight_power, ref_weight_power)
         white_noise_gain_db = power_db(weight_power)
         max_wng = self._finite_metric_float(
-            getattr(self._config, "lcmv_max_white_noise_gain_db", 15.0)
+            self._config.lcmv_max_white_noise_gain_db
         )
         wng_warning = ""
         if (
@@ -3695,8 +3609,7 @@ class BackendRuntime:
             if effective_js is not None
             else None
         )
-        targets_measured_u1 = "u1" in prefix or "measured" in prefix
-        target_suppression_db = u1_reduction_db if targets_measured_u1 else ideal_reduction_db
+        target_suppression_db = u1_reduction_db
         rejection = self._method_safety_rejection_reason(
             result=result,
             target_suppression_db=target_suppression_db,
@@ -3975,26 +3888,6 @@ class BackendRuntime:
         cal_power_metrics: dict[str, object] | None = None,
         covariance_matrix: np.ndarray | None = None,
     ) -> dict[str, object]:
-        if not bool(getattr(self._config, "healthy_reference_capture_enabled", True)):
-            self._healthy_reference_freeze_reason = "disabled by config"
-            return {
-                "run_state_label": "unknown",
-                "run_state_confidence": 0.0,
-                "state_reason": "healthy reference capture disabled",
-                "run_state_reason": "healthy reference capture disabled",
-                "jammer_confidence_score": 0.0,
-                "healthy_confidence_score": 0.0,
-                "healthy_reference_updated": False,
-                "healthy_reference_update_allowed": False,
-                "healthy_reference_freeze_reason": self._healthy_reference_freeze_reason,
-                "healthy_reference_freeze_reasons": ["disabled_by_config"],
-                "lcmv_safe_baseline": False,
-                "pvt_healthy": False,
-                "cn0_healthy": False,
-                "observations_healthy": False,
-                "large_angle_jump": False,
-                "suspicious_source_structure": False,
-            }
         bridge = self._gnss_bridge
         gnss_snapshot: dict[str, object] = {}
         if bridge is not None:
@@ -4232,7 +4125,7 @@ class BackendRuntime:
         cal_power_metrics: dict[str, object] | None,
         covariance_matrix: np.ndarray | None = None,
     ) -> dict[str, object]:
-        if not bool(getattr(self._config, "one_run_segmentation_enabled", True)):
+        if not bool(self._config.one_run_segmentation_enabled):
             return {
                 "run_state_label": "unknown",
                 "run_state_confidence": 0.0,
@@ -4326,18 +4219,10 @@ class BackendRuntime:
             max(input_jump_candidates) if input_jump_candidates else None
         )
         min_input_jump_db = float(
-            getattr(
-                self._config,
-                "lcmv_jammer_activation_min_input_power_jump_db",
-                3.0,
-            )
+            self._config.lcmv_jammer_activation_min_input_power_jump_db
         )
         min_generalized_gain_db = float(
-            getattr(
-                self._config,
-                "lcmv_jammer_activation_min_generalized_gain_db",
-                6.0,
-            )
+            self._config.lcmv_jammer_activation_min_generalized_gain_db
         )
         evidence_now = bool(
             input_power_jump_db is not None
@@ -4439,7 +4324,6 @@ class BackendRuntime:
             "active_lcmv_method": "uniform_array_sum",
             "active_lcmv_null_method": "none",
             "active_lcmv_weights_source": "uniform_array_sum",
-            "active_method_requested": self._lcmv_test_null_method,
             "active_method_applied": "uniform_array_sum",
             "candidate_methods_computed": [],
             "candidate_methods_valid": [],
@@ -4510,15 +4394,6 @@ class BackendRuntime:
             not self._lcmv_auto_arm_after_pvt
             or self._lcmv_auto_arm_suppressed_by_operator
             or self._lcmv_test_enabled
-            or not self._shared_phase_fanout_enabled()
-            or str(
-                getattr(
-                    self._config,
-                    "lcmv_preserve_constraint_mode",
-                    "uniform",
-                )
-            ).strip().lower()
-            != "realtime_bladerf_measured_u1"
             or not bool(run_state.get("healthy_reference_updated", False))
             or not bool(run_state.get("pvt_healthy", False))
             or not bool(run_state.get("observations_healthy", False))
@@ -4530,23 +4405,11 @@ class BackendRuntime:
         channel_count = len(self._config.channels)
         max_age_s = max(
             0.0,
-            float(
-                getattr(
-                    self._config,
-                    "lcmv_realtime_preserve_max_reference_age_s",
-                    2.0,
-                )
-            ),
+            float(self._config.lcmv_realtime_preserve_max_reference_age_s),
         )
         max_angle_error_deg = max(
             0.0,
-            float(
-                getattr(
-                    self._config,
-                    "lcmv_realtime_preserve_guard_deg",
-                    20.0,
-                )
-            ),
+            float(self._config.lcmv_realtime_preserve_guard_deg),
         )
         with self._results_lock:
             center = self._realtime_preserve_center_internal_deg
@@ -4601,7 +4464,7 @@ class BackendRuntime:
         corrected_chunk: np.ndarray,
         music_internal_deg: float,
         music_bearing_deg: float,
-        ideal_result: object,
+        active_result: object,
         candidate_entries: dict[str, dict[str, object]] | None,
         active_weights: np.ndarray,
         active_lcmv_method: str,
@@ -4646,7 +4509,6 @@ class BackendRuntime:
         ideal_norm = normalize_complex_vector(ideal_vector)
         u1_norm = normalize_complex_vector(u1)
         uniform_w = uniform_weights(corrected.shape[0])
-        ideal_w = np.asarray(getattr(ideal_result, "weights", []), dtype=np.complex128)
         active_w = np.asarray(active_weights, dtype=np.complex128).reshape(-1)
         uniform_avg_w = uniform_w / float(max(uniform_w.size, 1))
         raw_metrics = raw_power_metrics if isinstance(raw_power_metrics, dict) else {}
@@ -4674,10 +4536,6 @@ class BackendRuntime:
             covariance=covariance,
             weights=uniform_w,
         )
-        ideal_output_power = covariance_output_power(
-            covariance=covariance,
-            weights=ideal_w,
-        )
         active_output_power = covariance_output_power(
             covariance=covariance,
             weights=active_w,
@@ -4696,10 +4554,9 @@ class BackendRuntime:
             "array_spacing_m": self._json_float(self._config.array_spacing_m),
             "music_internal_angle_deg": self._json_float(music_internal_deg),
             "music_display_bearing_deg": self._json_float(music_bearing_deg),
-            "null_internal_angle_deg": self._json_float(music_internal_deg),
-            "null_display_bearing_deg": self._json_float(music_bearing_deg),
-            "steering_vector_angle_used_internal_deg": self._json_float(music_internal_deg),
-            "steering_vector_angle_used_display_deg": self._json_float(music_bearing_deg),
+            "null_constraint_source": "measured_dominant_covariance_eigenvector",
+            "model_comparison_angle_internal_deg": self._json_float(music_internal_deg),
+            "model_comparison_angle_display_deg": self._json_float(music_bearing_deg),
             "display_bearing_formula": "(90 - internal_angle_deg) % 360",
             "active_lcmv_method": active_lcmv_method,
             "active_lcmv_null_method": active_lcmv_null_method,
@@ -4707,32 +4564,17 @@ class BackendRuntime:
             "active_lcmv_fallback_used": bool(active_lcmv_fallback_used),
             "active_lcmv_fallback_reason": active_lcmv_fallback_reason,
             **dict(heavy_diagnostics_payload or {}),
-            "active_method_requested": self._lcmv_test_null_method,
             "active_method_applied": active_lcmv_method,
             "active_method_rejected": bool(active_lcmv_fallback_used),
             "active_method_rejection_reason": active_lcmv_fallback_reason,
             "fallback_method": "uniform_array_sum" if active_lcmv_fallback_used else "",
             **dict(target_angle_policy or {}),
-            "configured_lcmv_null_method": self._lcmv_test_null_method,
-            "preserve_convention": str(
-                (target_angle_policy or {}).get(
-                    "lcmv_preserve_constraint_mode",
-                    "uniform",
-                )
-            ),
+            "preserve_convention": "realtime_bladerf_measured_u1",
             "preserve_reference": (
                 "uniform_combiner_complex_response_at_frozen_measured_bladerf_u1"
-                if str(
-                    (target_angle_policy or {}).get(
-                        "lcmv_preserve_constraint_mode",
-                        "uniform",
-                    )
-                )
-                == "realtime_bladerf_measured_u1"
-                else "uniform_combiner_complex_response"
             ),
             "active_preserve_vector": complex_vector_payload(
-                getattr(ideal_result, "preserve_vector", np.zeros((0,), dtype=np.complex128))
+                getattr(active_result, "preserve_vector", np.zeros((0,), dtype=np.complex128))
             ),
             "common_signal_model": (
                 "x[n]=desired/SOI + jammer + real sky GNSS + noise + multipath + receiver artifacts"
@@ -4767,16 +4609,11 @@ class BackendRuntime:
             "uniform_weights": complex_vector_payload(uniform_w),
             "uniform_sum_weights": complex_vector_payload(uniform_w),
             "uniform_average_weights": complex_vector_payload(uniform_avg_w),
-            "ideal_lcmv_weights": complex_vector_payload(ideal_w),
             "active_lcmv_weights": complex_vector_payload(active_w),
             "measured_covariance_output_power_uniform_linear": self._json_float(
                 uniform_output_power
             ),
             "measured_covariance_output_power_uniform_db": power_db(uniform_output_power),
-            "measured_covariance_output_power_ideal_lcmv_linear": self._json_float(
-                ideal_output_power
-            ),
-            "measured_covariance_output_power_ideal_lcmv_db": power_db(ideal_output_power),
             "measured_covariance_output_power_active_lcmv_linear": self._json_float(
                 active_output_power
             ),
@@ -4784,10 +4621,6 @@ class BackendRuntime:
             "active_total_output_power_from_R": self._json_float(active_output_power),
             "active_healthy_baseline_output_power_from_R": self._json_float(
                 active_healthy_baseline_output_power
-            ),
-            "measured_covariance_reduction_uniform_to_ideal_lcmv_db": ratio_db(
-                uniform_output_power,
-                ideal_output_power,
             ),
             "measured_covariance_reduction_uniform_to_active_lcmv_db": ratio_db(
                 uniform_output_power,
@@ -4800,7 +4633,7 @@ class BackendRuntime:
         jammer_latched = bool(
             payload.get("lcmv_jammer_detected_latched", False)
             or (target_angle_policy or {}).get(
-                "lcmv_target_confirmed_jammer_bearing",
+                "lcmv_target_activation_evidence_met",
                 False,
             )
         )
@@ -4841,14 +4674,6 @@ class BackendRuntime:
         payload["candidate_methods_computed"] = candidate_methods_computed
         payload["candidate_methods_valid"] = candidate_methods_valid
         payload["candidate_methods_rejected"] = candidate_methods_rejected
-        covariance_ideal = entries.get("covariance_lcmv_ideal", {})
-        covariance_ideal_result = covariance_ideal.get("result")
-        payload["covariance_lcmv_ideal_preserve_residual_abs"] = self._json_float(
-            abs(getattr(covariance_ideal_result, "preserve_residual", np.nan))
-        )
-        payload["covariance_lcmv_ideal_null_residual_abs"] = self._json_float(
-            abs(getattr(covariance_ideal_result, "null_residual", np.nan))
-        )
         if active_method_payload and active_method_prefix:
             for metric in (
                 "valid",
@@ -4880,14 +4705,6 @@ class BackendRuntime:
         )
         payload.update(
             self._vector_response_payload(
-                prefix="ideal_lcmv_to_ideal_steering",
-                weights=ideal_w,
-                vector=ideal_norm,
-                component_power_before=ideal_component_power,
-            )
-        )
-        payload.update(
-            self._vector_response_payload(
                 prefix="active_lcmv_to_ideal_steering",
                 weights=active_w,
                 vector=ideal_norm,
@@ -4904,14 +4721,6 @@ class BackendRuntime:
         )
         payload.update(
             self._vector_response_payload(
-                prefix="ideal_lcmv_to_u1",
-                weights=ideal_w,
-                vector=u1_norm,
-                component_power_before=lambda1,
-            )
-        )
-        payload.update(
-            self._vector_response_payload(
                 prefix="active_lcmv_to_u1",
                 weights=active_w,
                 vector=u1_norm,
@@ -4919,7 +4728,7 @@ class BackendRuntime:
             )
         )
         payload.update(
-            self._lcmv_result_payload(prefix="ideal_lcmv", result=ideal_result)
+            self._lcmv_result_payload(prefix="measured_u1_lcmv", result=active_result)
         )
         return payload
 
@@ -4965,6 +4774,8 @@ class BackendRuntime:
         }
 
     def _log_spatial_vector_diagnostics(self, payload: dict[str, object]) -> None:
+        if not self._config.logging_enabled:
+            return
         line = json.dumps(payload, separators=(",", ":"))
         self._spatial_vector_log.info("%s", line)
 
@@ -4973,9 +4784,10 @@ class BackendRuntime:
         calibrated_chunk: np.ndarray,
         music_internal_deg: float,
         music_bearing_deg: float,
+        *,
+        target_selection_source: str,
         raw_power_metrics: dict[str, object] | None = None,
         cal_power_metrics: dict[str, object] | None = None,
-        target_selection_source: str = "strongest_music_peak",
         covariance_matrix: np.ndarray | None = None,
         covariance_eigenvalues: np.ndarray | None = None,
         covariance_eigenvectors: np.ndarray | None = None,
@@ -4994,71 +4806,49 @@ class BackendRuntime:
             return
 
         target_angle_policy = self._lcmv_target_angle_policy(music_bearing)
-        preserve_mode = str(
-            getattr(self._config, "lcmv_preserve_constraint_mode", "uniform")
-        ).strip().lower()
         target_angle_policy.update(
             {
-                "lcmv_target_selection_mode": str(
-                    getattr(
-                        self._config,
-                        "lcmv_target_selection_mode",
-                        "strongest_music_peak",
-                    )
-                ),
-                "lcmv_target_selection_source": str(target_selection_source),
-                "lcmv_preserve_constraint_mode": preserve_mode,
+                "target_selection_strategy": "realtime_non_preserve_peak",
+                "target_selection_source": str(target_selection_source),
+                "preserve_strategy": "realtime_bladerf_measured_u1",
             }
         )
-        if preserve_mode == "realtime_bladerf_measured_u1":
-            tracker_payload = self._realtime_preserve_tracker_payload()
-            target_angle_policy.update(tracker_payload)
-            frozen_internal = self._finite_metric_float(
-                tracker_payload.get("realtime_bladerf_frozen_internal_deg")
-            )
-            frozen_display = self._finite_metric_float(
-                tracker_payload.get("realtime_bladerf_frozen_display_deg")
-            )
-            guard_deg = max(
-                0.0,
-                float(
-                    getattr(
-                        self._config,
-                        "lcmv_realtime_preserve_guard_deg",
-                        20.0,
-                    )
+        tracker_payload = self._realtime_preserve_tracker_payload()
+        target_angle_policy.update(tracker_payload)
+        frozen_internal = self._finite_metric_float(
+            tracker_payload.get("realtime_bladerf_frozen_internal_deg")
+        )
+        frozen_display = self._finite_metric_float(
+            tracker_payload.get("realtime_bladerf_frozen_display_deg")
+        )
+        guard_deg = max(
+            0.0,
+            float(self._config.lcmv_realtime_preserve_guard_deg),
+        )
+        separation = (
+            self._angle_distance_deg(music_internal, frozen_internal)
+            if frozen_internal is not None
+            else None
+        )
+        target_angle_policy.update(
+            {
+                "lcmv_preserve_internal_angle_deg": self._json_float(frozen_internal),
+                "lcmv_preserve_display_bearing_deg": self._json_float(frozen_display),
+                "lcmv_realtime_preserve_guard_deg": self._json_float(guard_deg),
+                "lcmv_target_separation_from_preserve_deg": self._json_float(
+                    separation
                 ),
-            )
-            separation = (
-                self._angle_distance_deg(music_internal, frozen_internal)
-                if frozen_internal is not None
-                else None
-            )
-            target_angle_policy.update(
-                {
-                    "lcmv_preserve_internal_angle_deg": self._json_float(
-                        frozen_internal
-                    ),
-                    "lcmv_preserve_display_bearing_deg": self._json_float(
-                        frozen_display
-                    ),
-                    "lcmv_realtime_preserve_guard_deg": self._json_float(guard_deg),
-                    "lcmv_target_separation_from_preserve_deg": self._json_float(
-                        separation
-                    ),
-                    "lcmv_target_classification": (
-                        "realtime_non_preserve_peak"
-                        if separation is not None and separation >= guard_deg
-                        else "realtime_preserve_guard"
-                    ),
-                    "lcmv_target_confirmed_jammer_bearing": bool(
-                        separation is not None and separation >= guard_deg
-                    ),
-                    "lcmv_target_protected_bladeRF_bearing": bool(
-                        separation is None or separation < guard_deg
-                    ),
-                }
-            )
+                "lcmv_target_classification": (
+                    "realtime_non_preserve_peak"
+                    if separation is not None and separation >= guard_deg
+                    else "realtime_preserve_guard"
+                ),
+                "lcmv_target_activation_evidence_met": False,
+                "lcmv_target_protected_bladeRF_bearing": bool(
+                    separation is None or separation < guard_deg
+                ),
+            }
+        )
         if bool(target_angle_policy.get("lcmv_target_protected_bladeRF_bearing", False)):
             self._activate_lcmv_test_fallback(
                 (
@@ -5119,252 +4909,131 @@ class BackendRuntime:
                 cal_power_metrics=cal_power_metrics,
                 covariance_matrix=covariance,
             )
-            if preserve_mode == "realtime_bladerf_measured_u1":
-                activation_payload = self._lcmv_jammer_activation_evidence(
-                    covariance=covariance,
-                    raw_power_metrics=raw_power_metrics,
-                    cal_power_metrics=cal_power_metrics,
+            activation_payload = self._lcmv_jammer_activation_evidence(
+                covariance=covariance,
+                raw_power_metrics=raw_power_metrics,
+                cal_power_metrics=cal_power_metrics,
+            )
+            run_state_payload.update(activation_payload)
+            target_angle_policy.update(activation_payload)
+            jammer_latched = bool(
+                activation_payload.get("lcmv_jammer_detected_latched", False)
+            )
+            target_angle_policy["lcmv_target_activation_evidence_met"] = jammer_latched
+            if not jammer_latched:
+                target_angle_policy["lcmv_target_classification"] = (
+                    "unconfirmed_non_preserve_peak_while_armed"
                 )
-                run_state_payload.update(activation_payload)
-                target_angle_policy.update(activation_payload)
-                jammer_latched = bool(
-                    activation_payload.get("lcmv_jammer_detected_latched", False)
+                input_jump = self._format_optional_float(
+                    activation_payload.get("lcmv_jammer_activation_input_power_jump_db")
                 )
-                target_angle_policy["lcmv_target_confirmed_jammer_bearing"] = (
-                    jammer_latched
+                generalized_gain = self._format_optional_float(
+                    activation_payload.get(
+                        "lcmv_jammer_activation_generalized_gain_db"
+                    )
                 )
-                if not jammer_latched:
-                    target_angle_policy["lcmv_target_classification"] = (
-                        "unconfirmed_non_preserve_peak_while_armed"
-                    )
-                    input_jump = self._format_optional_float(
-                        activation_payload.get(
-                            "lcmv_jammer_activation_input_power_jump_db"
-                        )
-                    )
-                    generalized_gain = self._format_optional_float(
-                        activation_payload.get(
-                            "lcmv_jammer_activation_generalized_gain_db"
-                        )
-                    )
-                    reason = (
-                        "armed with frozen measured bladeRF U1; uniform output while "
-                        "waiting for jammer evidence "
-                        f"(input_power_jump_db={input_jump}, "
-                        f"generalized_gain_db={generalized_gain})"
-                    )
-                    armed_diag = {
-                        "event": "spatial_vector_diagnostics",
-                        "sequence": int(self._spatial_diag_seq),
-                        "sample_count": int(corrected.shape[1]),
-                        "channel_count": int(corrected.shape[0]),
-                        "music_internal_angle_deg": self._json_float(music_internal),
-                        "music_display_bearing_deg": self._json_float(music_bearing),
-                        "active_lcmv_method": "uniform_array_sum",
-                        "active_lcmv_null_method": "none_armed_waiting_for_jammer",
-                        "active_lcmv_weights_source": "uniform_array_sum",
-                        "active_method_requested": self._lcmv_test_null_method,
-                        "active_method_applied": "uniform_array_sum",
-                        "active_method_rejection_reason": reason,
-                        **target_angle_policy,
-                        **self._healthy_reference_payload(u1),
-                        **run_state_payload,
-                    }
-                    self._spatial_diag_seq += 1
-                    self._activate_lcmv_test_fallback(
-                        reason,
-                        music_internal_deg=music_internal,
-                        music_bearing_deg=music_bearing,
-                        spatial_vector_diagnostics=armed_diag,
-                        run_state_label=str(
-                            run_state_payload.get("run_state_label", "armed")
-                        ),
-                        jammer_confidence_score=run_state_payload.get(
-                            "jammer_confidence_score"
-                        ),
-                        healthy_confidence_score=run_state_payload.get(
-                            "healthy_confidence_score"
-                        ),
-                    )
-                    return
+                reason = (
+                    "armed with frozen measured bladeRF U1; uniform output while "
+                    "waiting for jammer evidence "
+                    f"(input_power_jump_db={input_jump}, "
+                    f"generalized_gain_db={generalized_gain})"
+                )
+                armed_diag = {
+                    "event": "spatial_vector_diagnostics",
+                    "sequence": int(self._spatial_diag_seq),
+                    "sample_count": int(corrected.shape[1]),
+                    "channel_count": int(corrected.shape[0]),
+                    "music_internal_angle_deg": self._json_float(music_internal),
+                    "music_display_bearing_deg": self._json_float(music_bearing),
+                    "active_lcmv_method": "uniform_array_sum",
+                    "active_lcmv_null_method": "none_armed_waiting_for_jammer",
+                    "active_lcmv_weights_source": "uniform_array_sum",
+                    "active_method_applied": "uniform_array_sum",
+                    "active_method_rejection_reason": reason,
+                    **target_angle_policy,
+                    **self._healthy_reference_payload(u1),
+                    **run_state_payload,
+                }
+                self._spatial_diag_seq += 1
+                self._activate_lcmv_test_fallback(
+                    reason,
+                    music_internal_deg=music_internal,
+                    music_bearing_deg=music_bearing,
+                    spatial_vector_diagnostics=armed_diag,
+                    run_state_label=str(run_state_payload.get("run_state_label", "armed")),
+                    jammer_confidence_score=run_state_payload.get(
+                        "jammer_confidence_score"
+                    ),
+                    healthy_confidence_score=run_state_payload.get(
+                        "healthy_confidence_score"
+                    ),
+                )
+                return
             max_weight_norm = self._lcmv_weight_norm_limit()
-            condition_limit = float(self._config.lcmv_test_condition_number_limit)
+            condition_limit = float(self._config.lcmv_condition_number_limit)
             covariance_loading_rel = float(
-                getattr(self._config, "lcmv_covariance_diagonal_loading_rel", 0.001)
+                self._config.lcmv_covariance_diagonal_loading_rel
             )
             covariance_loading_abs = float(
-                getattr(self._config, "lcmv_covariance_diagonal_loading_abs", 0.0)
+                self._config.lcmv_covariance_diagonal_loading_abs
             )
-            candidate_entries: dict[str, dict[str, object]] = {}
-            candidate_methods_enabled = bool(
-                getattr(self._config, "lcmv_candidate_methods_enabled", True)
-            )
-            healthy_norm = (
-                normalize_complex_vector(self._healthy_reference_vector)
-                if self._healthy_reference_vector is not None
-                else np.zeros((0,), dtype=np.complex128)
-            )
-            if preserve_mode == "healthy_reference":
-                if healthy_norm.size != expected_channels:
-                    raise ValueError(
-                        "healthy-reference preserve constraint unavailable; "
-                        "capture a jammer-off uniform PVT baseline before enabling LCMV"
-                    )
-                preserve_vector = healthy_norm
-            elif preserve_mode == "uniform":
-                preserve_vector = np.ones((expected_channels,), dtype=np.complex128)
-            elif preserve_mode == "realtime_bladerf_measured_u1":
-                with self._results_lock:
-                    preserve_internal = self._realtime_preserve_frozen_internal_deg
-                    frozen_preserve_vector = (
-                        np.array(self._realtime_preserve_frozen_vector, copy=True)
-                        if self._realtime_preserve_frozen_vector is not None
-                        else np.zeros((0,), dtype=np.complex128)
-                    )
-                if (
-                    preserve_internal is None
-                    or frozen_preserve_vector.size != expected_channels
-                ):
-                    raise ValueError(
-                        "measured bladeRF preserve vector unavailable; keep LCMV off "
-                        "until the jammer-off angle cluster, PVT, and U1 are stable"
-                    )
-                preserve_vector = frozen_preserve_vector
-            else:
-                raise ValueError(f"unsupported LCMV preserve mode: {preserve_mode}")
+            with self._results_lock:
+                preserve_internal = self._realtime_preserve_frozen_internal_deg
+                frozen_preserve_vector = (
+                    np.array(self._realtime_preserve_frozen_vector, copy=True)
+                    if self._realtime_preserve_frozen_vector is not None
+                    else np.zeros((0,), dtype=np.complex128)
+                )
+            if (
+                preserve_internal is None
+                or frozen_preserve_vector.size != expected_channels
+            ):
+                raise ValueError(
+                    "measured bladeRF preserve vector unavailable; keep LCMV off "
+                    "until the jammer-off angle cluster, PVT, and U1 are stable"
+                )
+            preserve_vector = frozen_preserve_vector
 
-            covariance_ideal_result = None
-            covariance_ideal_error = ""
-            compute_covariance_ideal = (
-                candidate_methods_enabled
-                or self._lcmv_test_null_method == "covariance_lcmv_ideal"
+            # MUSIC still gates activation/guard policy, but never supplies
+            # the null constraint. Solve once using the measured spatial mode.
+            active_result = covariance_lcmv_vector_null_weights(
+                covariance=covariance,
+                null_vector=u1,
+                preserve_vector=preserve_vector,
+                diagonal_loading_rel=covariance_loading_rel,
+                diagonal_loading_abs=covariance_loading_abs,
+                condition_number_limit=condition_limit,
+                max_weight_norm=max_weight_norm,
             )
-            if compute_covariance_ideal:
-                try:
-                    covariance_ideal_result = covariance_lcmv_ideal_null_weights(
-                        covariance=covariance,
-                        n_channels=expected_channels,
-                        null_angle_deg=music_internal,
-                        rf_freq_hz=self._config.center_freq_hz,
-                        array_spacing_m=self._config.array_spacing_m,
-                        preserve_vector=preserve_vector,
-                        diagonal_loading_rel=covariance_loading_rel,
-                        diagonal_loading_abs=covariance_loading_abs,
-                        condition_number_limit=condition_limit,
-                        max_weight_norm=max_weight_norm,
-                    )
-                except Exception as exc:
-                    covariance_ideal_error = str(exc)
-                candidate_entries["covariance_lcmv_ideal"] = {
-                    "prefix": "candidate_covariance_lcmv_ideal",
-                    "result": covariance_ideal_result,
-                    "error": covariance_ideal_error,
-                }
-
-            covariance_u1_result = None
-            covariance_u1_error = ""
-            compute_covariance_u1 = (
-                candidate_methods_enabled
-                or self._lcmv_test_null_method == "covariance_lcmv_measured_u1"
-            )
-            if compute_covariance_u1 and u1.size:
-                try:
-                    covariance_u1_result = covariance_lcmv_vector_null_weights(
-                        covariance=covariance,
-                        null_vector=u1,
-                        preserve_vector=preserve_vector,
-                        diagonal_loading_rel=covariance_loading_rel,
-                        diagonal_loading_abs=covariance_loading_abs,
-                        condition_number_limit=condition_limit,
-                        max_weight_norm=max_weight_norm,
-                    )
-                except Exception as exc:
-                    covariance_u1_error = str(exc)
-            elif compute_covariance_u1:
-                covariance_u1_error = "dominant covariance eigenvector unavailable"
-            if compute_covariance_u1:
-                candidate_entries["covariance_lcmv_measured_u1"] = {
-                    "prefix": "candidate_covariance_lcmv_measured_u1",
-                    "result": covariance_u1_result,
-                    "error": covariance_u1_error,
-                }
-
-            ideal_vector = np.asarray(
-                steering_vector(
-                    np.asarray([music_internal], dtype=np.float64),
-                    self._config.center_freq_hz,
-                    self._config.array_spacing_m,
-                ),
-                dtype=np.complex128,
-            ).reshape(-1)
-            ideal_norm = normalize_complex_vector(ideal_vector)
+            active_weights = np.asarray(active_result.weights, dtype=np.complex128)
             u1_norm = normalize_complex_vector(u1)
             uniform_w = uniform_weights(expected_channels)
-            def _preflight_rejection(
-                method_name: str,
-                result: object | None,
-                *,
-                enforce_white_noise_gain: bool = True,
-            ) -> str:
-                weights = np.asarray(
-                    getattr(result, "weights", []),
-                    dtype=np.complex128,
-                ).reshape(-1)
-                ideal_ref_power = self._vector_response_power(uniform_w, ideal_norm)
-                ideal_method_power = self._vector_response_power(weights, ideal_norm)
-                u1_ref_power = self._vector_response_power(uniform_w, u1_norm)
-                u1_method_power = self._vector_response_power(weights, u1_norm)
-                if "u1" in method_name or "measured" in method_name:
-                    target_suppression_db = ratio_db(u1_ref_power, u1_method_power)
-                else:
-                    target_suppression_db = ratio_db(ideal_ref_power, ideal_method_power)
-                return self._method_safety_rejection_reason(
-                    result=result,
-                    target_suppression_db=target_suppression_db,
-                    enforce_white_noise_gain=enforce_white_noise_gain,
-                )
-
-            # Publish every accepted measured-U1 covariance update.  Each PRN
-            # receives this one spatial row with a scalar that preserves its
-            # previous complex response; no PRN-specific LCMV solve exists.
-            if covariance_u1_result is not None:
-                protection_rejection = _preflight_rejection(
-                    "covariance_lcmv_measured_u1",
-                    covariance_u1_result,
-                    enforce_white_noise_gain=False,
-                )
-                if not protection_rejection:
-                    self._set_shared_measured_u1_protection_weights(
-                        np.asarray(
-                            getattr(covariance_u1_result, "weights", []),
-                            dtype=np.complex128,
-                        )
-                    )
-
-            active_lcmv_null_method = self._lcmv_test_null_method
-            active_lcmv_method = self._lcmv_test_null_method
-            active_lcmv_weights_source = active_lcmv_method
-            active_lcmv_fallback_reason = ""
-            active_lcmv_fallback_used = False
-            requested_entry = candidate_entries.get(active_lcmv_method)
-            if requested_entry is not None and requested_entry.get("result") is not None:
-                active_result = requested_entry["result"]
-                active_weights = np.asarray(
-                    getattr(active_result, "weights", []),
-                    dtype=np.complex128,
-                ).reshape(-1)
-            else:
-                raise ValueError(
-                    f"active method {active_lcmv_method} unavailable: "
-                    f"{requested_entry.get('error') if requested_entry else 'unknown method'}"
-                )
-            active_safety_reason = _preflight_rejection(
-                active_lcmv_method,
-                active_result,
+            active_safety_reason = self._method_safety_rejection_reason(
+                result=active_result,
+                target_suppression_db=ratio_db(
+                    self._vector_response_power(uniform_w, u1_norm),
+                    self._vector_response_power(active_weights, u1_norm),
+                ),
                 enforce_white_noise_gain=False,
             )
             if active_safety_reason:
                 raise ValueError(f"active LCMV method rejected: {active_safety_reason}")
+
+            # Common output and PRN protection share this accepted solution.
+            # The bank still applies its existing per-PRN continuity scalars.
+            self._set_shared_measured_u1_protection_weights(active_weights)
+            active_lcmv_null_method = ACTIVE_LCMV_METHOD
+            active_lcmv_method = ACTIVE_LCMV_METHOD
+            active_lcmv_weights_source = ACTIVE_LCMV_METHOD
+            active_lcmv_fallback_reason = ""
+            active_lcmv_fallback_used = False
+            candidate_entries = {
+                ACTIVE_LCMV_METHOD: {
+                    "prefix": "candidate_covariance_lcmv_measured_u1",
+                    "result": active_result,
+                    "error": "",
+                },
+            }
 
             output_diag = self._lcmv_test_output_diagnostics(
                 corrected,
@@ -5382,13 +5051,12 @@ class BackendRuntime:
                 scan_angles_deg=self._scan_angles_deg,
                 rf_freq_hz=self._config.center_freq_hz,
                 array_spacing_m=self._config.array_spacing_m,
-                selected_null_angle_deg=music_internal,
             )
             spatial_diag = self._spatial_vector_diagnostics_payload(
                 corrected_chunk=corrected,
                 music_internal_deg=music_internal,
                 music_bearing_deg=music_bearing,
-                ideal_result=covariance_ideal_result,
+                active_result=active_result,
                 candidate_entries=candidate_entries,
                 active_weights=active_weights,
                 active_lcmv_method=active_lcmv_method,
@@ -5416,8 +5084,6 @@ class BackendRuntime:
                 reason=active_lcmv_fallback_reason,
                 music_internal_deg=music_internal,
                 music_bearing_deg=music_bearing,
-                null_internal_deg=music_internal,
-                null_bearing_deg=music_bearing,
                 weight_norm=getattr(active_result, "weight_norm", None),
                 max_weight_abs=getattr(active_result, "max_weight_abs", None),
                 condition_number=getattr(active_result, "condition_number", None),
@@ -5432,6 +5098,9 @@ class BackendRuntime:
                 lcmv_response_power=model.response_power,
                 lcmv_response_power_db=model.response_power_db,
                 lcmv_model_summary=self._lcmv_model_summary_payload(model),
+                gnss_fifo_measured_u1_model_response_db=model.response_db,
+                gnss_fifo_measured_u1_model_summary=self._lcmv_model_summary_payload(model),
+                gnss_fifo_measured_u1_protection_available=True,
                 output_metrics=output_diag,
                 active_lcmv_null_method=active_lcmv_null_method,
                 active_lcmv_weights_source=active_lcmv_weights_source,
@@ -5540,21 +5209,6 @@ class BackendRuntime:
             "response_db_epsilon": self._json_float(
                 getattr(model, "response_db_epsilon", None)
             ),
-            "closest_grid_bearing_to_selected_null_deg": self._json_float(
-                getattr(model, "closest_grid_bearing_to_selected_null_deg", None)
-            ),
-            "selected_null_grid_error_deg": self._json_float(
-                getattr(model, "selected_null_grid_error_deg", None)
-            ),
-            "model_response_at_selected_null_abs": self._json_float(
-                getattr(model, "model_response_at_selected_null_abs", None)
-            ),
-            "model_response_at_selected_null_db": self._json_float(
-                getattr(model, "model_response_at_selected_null_db", None)
-            ),
-            "model_response_power_at_selected_null_db": self._json_float(
-                getattr(model, "model_response_power_at_selected_null_db", None)
-            ),
             "model_min_response_abs": self._json_float(
                 getattr(model, "model_min_response_abs", None)
             ),
@@ -5587,21 +5241,17 @@ class BackendRuntime:
         healthy_confidence_score: float | None = None,
     ) -> None:
         if spatial_vector_diagnostics is None:
-            preserve_mode = str(
-                getattr(self._config, "lcmv_preserve_constraint_mode", "uniform")
-            ).strip().lower()
-            if preserve_mode == "realtime_bladerf_measured_u1":
-                spatial_vector_diagnostics = self._realtime_preserve_tracker_payload()
-                spatial_vector_diagnostics["lcmv_jammer_activation_armed"] = bool(
-                    spatial_vector_diagnostics.get(
-                        "realtime_bladerf_angle_frozen",
-                        False,
-                    )
-                    and not spatial_vector_diagnostics.get(
-                        "lcmv_jammer_detected_latched",
-                        False,
-                    )
+            spatial_vector_diagnostics = self._realtime_preserve_tracker_payload()
+            spatial_vector_diagnostics["lcmv_jammer_activation_armed"] = bool(
+                spatial_vector_diagnostics.get(
+                    "realtime_bladerf_angle_frozen",
+                    False,
                 )
+                and not spatial_vector_diagnostics.get(
+                    "lcmv_jammer_detected_latched",
+                    False,
+                )
+            )
         self._schedule_beamformer_weights(
             uniform_weights(len(self._config.channels)),
             reason=f"LCMV fallback to uniform: {reason}",
@@ -5650,6 +5300,8 @@ class BackendRuntime:
         active_lcmv_fallback_reason: str,
         active_lcmv_fallback_used: bool,
     ) -> None:
+        if not self._config.logging_enabled:
+            return
         now = time.monotonic()
         if (now - self._last_lcmv_log_ts) < self._doa_log_interval_s:
             return
@@ -5660,20 +5312,11 @@ class BackendRuntime:
         measured_vs_raw_avg = self._finite_metric_float(
             output_diag.get("measured_output_reduction_vs_raw_avg_channel_db")
         )
-        null_internal = self._finite_metric_float(
-            getattr(result, "null_angle_deg", music_internal_deg)
-        )
-        if null_internal is None:
-            null_internal = music_internal_deg
-        null_display = self._internal_angle_to_display(null_internal)
         coherence_abs = self._finite_metric_float(
             spatial_diag.get("ideal_measured_coherence_abs")
         )
         principal_angle = self._finite_metric_float(
             spatial_diag.get("ideal_measured_principal_angle_deg")
-        )
-        predicted_gain = self._finite_metric_float(
-            spatial_diag.get("predicted_u1_lcmv_output_gain_over_ideal_lcmv_db")
         )
         raw_spread = self._finite_metric_float(spatial_diag.get("raw_power_spread_db"))
         cal_spread = self._finite_metric_float(spatial_diag.get("cal_power_spread_db"))
@@ -5682,8 +5325,8 @@ class BackendRuntime:
         )
         applied_magnitudes = spatial_diag.get("applied_correction_magnitudes", [])
         self._lcmv_log.info(
-            "lcmv_test mode=on action=nulling_strongest_music_peak "
-            "configured_lcmv_null_method=%s active_lcmv_null_method=%s "
+            "lcmv_test mode=on action=nulling_measured_dominant_u1 "
+            "fixed_lcmv_null_method=%s active_lcmv_null_method=%s "
             "active_lcmv_method=%s active_lcmv_weights_source=%s "
             "active_lcmv_fallback_used=%s active_lcmv_fallback_reason=%s "
             "candidate_methods_computed=%s candidate_methods_valid=%s "
@@ -5696,20 +5339,17 @@ class BackendRuntime:
             "applied_correction_magnitudes=[%s] "
             "raw_power_spread_db=%s cal_power_spread_db=%s "
             "music_internal_deg=%.2f music_bearing_deg=%.2f "
-            "null_internal_deg=%.2f null_bearing_deg=%.2f "
             "ideal_measured_coherence_abs=%s "
             "ideal_measured_principal_angle_deg=%s "
-            "predicted_u1_lcmv_output_gain_over_ideal_lcmv_db=%s "
             "uniform_weights=[%s] lcmv_weights=[%s] "
             "weight_norm=%.4f max_weight_abs=%.4f cond=%.3e "
             "preserve_residual_abs=%.3e null_residual_abs=%.3e "
             "uniform_rms=%.6e lcmv_rms=%.6e "
             "measured_output_reduction_vs_uniform_db=%.2f "
             "measured_output_reduction_vs_raw_avg_channel_db=%s "
-            "model_response_at_selected_null_db=%s "
             "model_min_response_db=%s model_max_response_db=%s "
             "weight_transition=complex_linear_chunk_ramp",
-            self._lcmv_test_null_method,
+            ACTIVE_LCMV_METHOD,
             active_lcmv_null_method,
             active_lcmv_method,
             active_lcmv_weights_source,
@@ -5739,11 +5379,8 @@ class BackendRuntime:
             self._format_optional_float(cal_spread),
             music_internal_deg,
             music_bearing_deg,
-            float(null_internal),
-            float(null_display),
             self._format_optional_float(coherence_abs, 5),
             self._format_optional_float(principal_angle),
-            self._format_optional_float(predicted_gain),
             self._format_complex_vector(uniform_weights(len(self._config.channels))),
             self._format_complex_vector(result.weights),
             float(result.weight_norm),
@@ -5755,9 +5392,6 @@ class BackendRuntime:
             float(output_diag.get("lcmv_output_rms_complex") or float("nan")),
             float(measured_vs_uniform if measured_vs_uniform is not None else float("nan")),
             self._format_optional_float(measured_vs_raw_avg),
-            self._format_optional_float(
-                getattr(model, "model_response_at_selected_null_db", None)
-            ),
             self._format_optional_float(getattr(model, "model_min_response_db", None)),
             self._format_optional_float(getattr(model, "model_max_response_db", None)),
         )
@@ -5809,18 +5443,11 @@ class BackendRuntime:
             getattr(model, "response_power_db", []),
             dtype=np.float64,
         )
-        null_internal = self._finite_metric_float(
-            getattr(result, "null_angle_deg", music_internal_deg)
-        )
-        if null_internal is None:
-            null_internal = music_internal_deg
-        null_display = self._internal_angle_to_display(null_internal)
         payload: dict[str, object] = {
             "event": "lcmv_model_response_absolute",
             "lcmv_enabled": True,
             "lcmv_mode": "on",
             "null_method": active_lcmv_null_method,
-            "configured_lcmv_null_method": self._lcmv_test_null_method,
             "active_lcmv_method": active_lcmv_method,
             "active_lcmv_null_method": active_lcmv_null_method,
             "active_lcmv_weights_source": active_lcmv_weights_source,
@@ -5833,8 +5460,6 @@ class BackendRuntime:
             "candidate_methods_rejected": dict(
                 spatial_diag.get("candidate_methods_rejected", {})
             ),
-            "selected_null_internal_angle_deg": self._json_float(null_internal),
-            "selected_null_display_bearing_deg": self._json_float(null_display),
             "music_primary_internal_angle_deg": self._json_float(music_internal_deg),
             "music_primary_display_bearing_deg": self._json_float(music_bearing_deg),
             "weights": complex_vector_payload(result.weights),
@@ -5868,9 +5493,6 @@ class BackendRuntime:
             "ideal_measured_principal_angle_deg": self._json_float(
                 spatial_diag.get("ideal_measured_principal_angle_deg")
             ),
-            "predicted_u1_lcmv_output_gain_over_ideal_lcmv_db": self._json_float(
-                spatial_diag.get("predicted_u1_lcmv_output_gain_over_ideal_lcmv_db")
-            ),
             **self._lcmv_model_summary_payload(model),
         }
         return payload
@@ -5900,7 +5522,7 @@ class BackendRuntime:
                 break
             try:
                 compute_t0 = time.monotonic()
-                gnss_vector = self._gnss_output_vector(chunk)
+                gnss_vector = self._gnss_shared_u1_phase_output_matrix(chunk)
                 self._record_runtime_timing(
                     "gnss_combiner_compute",
                     time.monotonic() - compute_t0,
@@ -5918,8 +5540,12 @@ class BackendRuntime:
                     )
                     fifo_source = self._fifo_output_source_label()
                     fifo_diag["fifo_output_source"] = fifo_source
-                    fifo_diag["fifo_matches_lcmv_output"] = fifo_source == "lcmv"
-                    fifo_diag["fifo_matches_uniform_output"] = fifo_source == "uniform"
+                    fifo_sources = self._fifo_output_source_labels()
+                    fifo_diag["fifo_output_sources"] = list(fifo_sources)
+                    fifo_diag["fifo_output_source_counts"] = {
+                        source: fifo_sources.count(source)
+                        for source in sorted(set(fifo_sources))
+                    }
                     with self._results_lock:
                         self._latest_output_power_metrics = {
                             **dict(self._latest_output_power_metrics),
@@ -5959,25 +5585,29 @@ class BackendRuntime:
                 self._handle_gnss_pipeline_error(exc)
                 break
 
+    def _fifo_output_source_labels(self) -> tuple[str, ...]:
+        with self._beamformer_lock:
+            labels = tuple(self._latest_gnss_fifo_source_labels)
+        if labels:
+            return labels
+        return ("shared_common_before_gnss_fanout_start",)
+
     def _fifo_output_source_label(self) -> str:
-        if self._shared_phase_fanout_enabled():
-            if self._lcmv_test_enabled and self._lcmv_jammer_detected_latched:
-                return "shared_measured_u1_phase_compensated_prn_fanout"
-            return "shared_uniform_phase_reference_prn_fanout"
-        if bool(self._beamformer_transition_payload().get("weight_transition_active")):
-            return "weight_transition"
-        mode = self._gnss_handoff_mode_label()
-        if mode == "lcmv_test_nulling_continuous":
-            return "lcmv"
-        if mode in {"uniform_array_sum_continuous", "lcmv_test_uniform_fallback_continuous"}:
-            return "uniform"
-        return "unknown"
+        """Return the exact source of row zero, whose power is reported."""
+
+        return self._fifo_output_source_labels()[0]
 
     # -------------------------------------------------------------------------
     # Pipeline Error Handling
     # -------------------------------------------------------------------------
 
     def _handle_gnss_pipeline_error(self, exc: BaseException) -> None:
+        if self._stop_requested.is_set() or not self._running:
+            self._loggers["transport"].info(
+                "GNSS handoff exited during requested shutdown: %s",
+                exc,
+            )
+            return
         msg = f"GNSS pipeline failed: {exc}"
         status_msg = f"GNSS-SDR handoff paused; SDR stream still running ({exc})"
         with self._gnss_failure_lock:
@@ -5986,8 +5616,6 @@ class BackendRuntime:
             self._gnss_pipeline_failed = True
             raw_q = self._gnss_raw_queue
             self._gnss_raw_queue = None
-            bridge = self._gnss_bridge
-            self._gnss_bridge = None
             thread = self._gnss_handoff_thread
 
         self._loggers["errors"].error("%s", msg)
@@ -5998,8 +5626,8 @@ class BackendRuntime:
                 raw_q.put_nowait(None)
             except queue.Full:
                 pass
-        if bridge is not None:
-            bridge.stop(msg)
+        if self._gnss_bridge is not None:
+            self._finalize_gnss_bridge(msg)
         if thread is not None and thread is not threading.current_thread():
             try:
                 thread.join(timeout=0.5)
@@ -6008,14 +5636,13 @@ class BackendRuntime:
 
     def _failed_stop(self, message: str) -> None:
         self._set_stop_reason(message)
+        self._failure_reason = message
+        self._stop_requested.set()
         self._running = False
         self._signal_dsp_shutdown()
         self._emit_failed(message)
         if self._device is not None:
-            try:
-                self._device.stop()
-            except Exception:
-                pass
+            self._finalize_usrp_device()
 
     def _signal_dsp_shutdown(self) -> None:
         put_latest(self._phase_queue, None)
@@ -6130,7 +5757,10 @@ class BackendRuntime:
                     phase_metrics["complex_samples_calibrated"], dtype=np.complex64
                 )
             now = time.monotonic()
-            if (now - self._last_phase_log_ts) >= self._doa_log_interval_s:
+            if (
+                self._config.logging_enabled
+                and (now - self._last_phase_log_ts) >= self._doa_log_interval_s
+            ):
                 self._loggers["phase"].info(
                     "phase offsets raw_deg=[%s] calibrated_deg=[%s] powers_db=[%s] "
                     "static_calibration=%s calibration_file=%s estimator=%s tone_hz=%.1f",
@@ -6166,62 +5796,34 @@ class BackendRuntime:
     def _select_lcmv_target_from_doa_metrics(
         self,
         doa_metrics: dict[str, object],
-        *,
-        primary_internal_deg: float,
-        primary_display_deg: float,
     ) -> tuple[float, float, str]:
-        mode = str(
-            getattr(
-                self._config,
-                "lcmv_target_selection_mode",
-                "strongest_music_peak",
-            )
-        ).strip().lower()
-        if mode == "realtime_non_preserve_peak":
-            with self._results_lock:
-                preserve_internal = self._realtime_preserve_frozen_internal_deg
-            if preserve_internal is None:
+        with self._results_lock:
+            preserve_internal = self._realtime_preserve_frozen_internal_deg
+        if preserve_internal is None:
+            return float("nan"), float("nan"), "no_frozen_realtime_bladerf_angle"
+        guard_deg = max(
+            0.0,
+            float(self._config.lcmv_realtime_preserve_guard_deg),
+        )
+        peaks = doa_metrics.get("doa_peaks", [])
+        if isinstance(peaks, list):
+            for peak in peaks:
+                if not isinstance(peak, dict):
+                    continue
+                internal = self._finite_metric_float(peak.get("angle_deg"))
+                if internal is None:
+                    continue
+                if self._angle_distance_deg(internal, preserve_internal) < guard_deg:
+                    continue
                 return (
-                    float("nan"),
-                    float("nan"),
-                    "no_frozen_realtime_bladerf_angle",
+                    float(internal),
+                    self._internal_angle_to_display(internal),
+                    "strongest_music_peak_outside_frozen_bladerf_guard",
                 )
-            guard_deg = max(
-                0.0,
-                float(
-                    getattr(
-                        self._config,
-                        "lcmv_realtime_preserve_guard_deg",
-                        20.0,
-                    )
-                ),
-            )
-            candidates: list[tuple[float, float]] = []
-            peaks = doa_metrics.get("doa_peaks", [])
-            if isinstance(peaks, list):
-                for peak in peaks:
-                    if not isinstance(peak, dict):
-                        continue
-                    internal = self._finite_metric_float(peak.get("angle_deg"))
-                    if internal is None:
-                        continue
-                    if self._angle_distance_deg(internal, preserve_internal) < guard_deg:
-                        continue
-                    candidates.append(
-                        (float(internal), self._internal_angle_to_display(internal))
-                    )
-            if not candidates:
-                return (
-                    float("nan"),
-                    float("nan"),
-                    "no_music_peak_outside_frozen_bladerf_guard",
-                )
-            internal, display = candidates[0]
-            return internal, display, "strongest_music_peak_outside_frozen_bladerf_guard"
         return (
-            float(primary_internal_deg),
-            float(primary_display_deg),
-            "strongest_music_peak",
+            float("nan"),
+            float("nan"),
+            "no_music_peak_outside_frozen_bladerf_guard",
         )
 
     def _doa_loop(self) -> None:
@@ -6277,8 +5879,6 @@ class BackendRuntime:
             lcmv_internal_deg, lcmv_display_deg, lcmv_target_source = (
                 self._select_lcmv_target_from_doa_metrics(
                     doa_metrics,
-                    primary_internal_deg=doa_deg,
-                    primary_display_deg=doa_display_deg,
                 )
             )
             self._update_lcmv_test_from_music(
@@ -6302,7 +5902,10 @@ class BackendRuntime:
                 ),
             )
             now = time.monotonic()
-            if (now - self._last_doa_log_ts) >= self._doa_log_interval_s:
+            if (
+                self._config.logging_enabled
+                and (now - self._last_doa_log_ts) >= self._doa_log_interval_s
+            ):
                 doa_peaks = doa_metrics.get("doa_peaks", [])
                 bartlett_deg = self._finite_metric_float(doa_metrics.get("bartlett_deg"))
                 bartlett_display_deg = (
@@ -6389,6 +5992,8 @@ class BackendRuntime:
         raw_power_metrics: dict[str, object] | None = None,
         cal_power_metrics: dict[str, object] | None = None,
     ) -> None:
+        if not self._config.logging_enabled:
+            return
         scan_internal = np.asarray(self._scan_angles_deg, dtype=np.float64).reshape(-1)
         raw = np.asarray(raw_spec, dtype=np.float64).reshape(-1)
         if scan_internal.size != raw.size or raw.size == 0:
@@ -6440,6 +6045,15 @@ class BackendRuntime:
         ).reshape(-1)
         if lcmv_response_power_db.size != raw.size:
             lcmv_response_power_db = np.zeros((0,), dtype=np.float64)
+        gnss_fifo_measured_u1_response = np.asarray(
+            status.get(
+                "gnss_fifo_measured_u1_model_response_db",
+                np.zeros((0,), dtype=np.float64),
+            ),
+            dtype=np.float64,
+        ).reshape(-1)
+        if gnss_fifo_measured_u1_response.size != raw.size:
+            gnss_fifo_measured_u1_response = np.zeros((0,), dtype=np.float64)
         corrected = np.asarray(calibrated_chunk, dtype=np.complex128)
         covariance = np.asarray(
             doa_metrics.get("covariance_matrix", np.zeros((0, 0))),
@@ -6475,15 +6089,10 @@ class BackendRuntime:
             bartlett_internal = float(scan_internal[int(np.argmax(bartlett_raw))])
         bartlett_display = self._internal_angle_to_display(bartlett_internal)
         bartlett_index = self._nearest_angle_index(scan_internal, bartlett_internal)
-        null_internal = self._finite_metric_float(status.get("null_internal_deg"))
-        null_display = self._finite_metric_float(status.get("null_bearing_deg"))
-        if null_internal is None:
-            null_internal = self._finite_metric_float(status.get("music_internal_deg"))
-        if null_display is None:
-            null_display = self._finite_metric_float(status.get("music_bearing_deg"))
-        null_index = (
-            self._nearest_angle_index(scan_internal, null_internal)
-            if null_internal is not None
+        music_candidate_internal = self._finite_metric_float(status.get("music_internal_deg"))
+        comparison_index = (
+            self._nearest_angle_index(scan_internal, music_candidate_internal)
+            if music_candidate_internal is not None
             else None
         )
         raw_metrics = raw_power_metrics if isinstance(raw_power_metrics, dict) else {}
@@ -6491,7 +6100,7 @@ class BackendRuntime:
 
         payload: dict[str, object] = {
             "event": "full_angle_analysis",
-            "schema_version": 2,
+            "schema_version": 4,
             **self._calibration_context_payload(),
             "raw_power_spread_db": self._json_float(raw_metrics.get("raw_power_spread_db")),
             "cal_power_spread_db": self._json_float(cal_metrics.get("cal_power_spread_db")),
@@ -6591,13 +6200,13 @@ class BackendRuntime:
                 "enabled": bool(status.get("enabled", False)),
                 "mode": str(status.get("mode", "off")),
                 "null_method": str(
-                    status.get("active_lcmv_null_method", self._lcmv_test_null_method)
+                    status.get("active_lcmv_null_method", "none")
                 ),
                 "active_lcmv_method": str(
-                    status.get("active_lcmv_method", self._lcmv_test_null_method)
+                    status.get("active_lcmv_method", "uniform_array_sum")
                 ),
                 "active_lcmv_null_method": str(
-                    status.get("active_lcmv_null_method", self._lcmv_test_null_method)
+                    status.get("active_lcmv_null_method", "none")
                 ),
                 "active_lcmv_weights_source": str(
                     status.get("active_lcmv_weights_source", "--")
@@ -6622,8 +6231,6 @@ class BackendRuntime:
                 "healthy_confidence_score": self._json_float(
                     status.get("healthy_confidence_score")
                 ),
-                "null_internal_deg": self._json_float(null_internal),
-                "null_display_deg": self._json_float(null_display),
                 "weight_norm": self._json_float(status.get("weight_norm")),
                 "max_weight_abs": self._json_float(status.get("max_weight_abs")),
                 "condition_number": self._json_float(status.get("condition_number")),
@@ -6645,14 +6252,32 @@ class BackendRuntime:
                 "lcmv_model_summary": self._json_ready_mapping(
                     status.get("lcmv_model_summary", {})
                 ),
-                "null_match": self._lcmv_null_match_payload(
+                "common_measured_u1_target_response_scope": (
+                    "ideal_steering_scan_not_measured_ota_null_depth"
+                ),
+                "common_model_music_comparison": self._model_music_comparison_payload(
                     scan_internal=scan_internal,
                     display_scan=display_scan,
                     music_rel_db=music_rel_db,
                     music_raw=raw,
                     lcmv_response_db=lcmv_response,
-                    null_index=null_index,
+                    comparison_index=comparison_index,
                     doa_index=doa_index,
+                ),
+                "gnss_fifo_measured_u1_protection_available": bool(
+                    status.get("gnss_fifo_measured_u1_protection_available", False)
+                ),
+                "gnss_fifo_measured_u1_response_scope": str(
+                    status.get(
+                        "gnss_fifo_measured_u1_response_scope",
+                        "ideal_steering_scan_of_shared_weights_not_measured_ota_null",
+                    )
+                ),
+                "gnss_fifo_measured_u1_model_response_db": self._json_float_list(
+                    gnss_fifo_measured_u1_response
+                ),
+                "gnss_fifo_measured_u1_model_summary": self._json_ready_mapping(
+                    status.get("gnss_fifo_measured_u1_model_summary", {})
                 ),
             },
             "spatial_vector_diagnostics_sequence": self._json_float(
@@ -6663,7 +6288,7 @@ class BackendRuntime:
         }
         self._analysis_log.info("%s", json.dumps(payload, separators=(",", ":")))
 
-    def _lcmv_null_match_payload(
+    def _model_music_comparison_payload(
         self,
         *,
         scan_internal: np.ndarray,
@@ -6671,27 +6296,28 @@ class BackendRuntime:
         music_rel_db: np.ndarray,
         music_raw: np.ndarray,
         lcmv_response_db: np.ndarray,
-        null_index: int | None,
+        comparison_index: int | None,
         doa_index: int,
     ) -> dict[str, object]:
-        if null_index is None or null_index < 0 or null_index >= scan_internal.size:
+        if comparison_index is None or comparison_index < 0 or comparison_index >= scan_internal.size:
             return {
                 "available": False,
-                "reason": "no_lcmv_null_angle",
+                "reason": "no_music_guard_candidate",
                 "doa_index": int(doa_index),
             }
-        delta = self._angle_distance_deg(scan_internal[doa_index], scan_internal[null_index])
+        delta = self._angle_distance_deg(scan_internal[doa_index], scan_internal[comparison_index])
         return {
             "available": True,
             "doa_index": int(doa_index),
-            "null_index": int(null_index),
+            "music_candidate_index": int(comparison_index),
+            "scope": "model_response_at_music_guard_candidate_not_measured_null",
             "delta_deg": self._json_float(delta),
-            "internal_deg": self._json_float(scan_internal[null_index]),
-            "display_deg": self._json_float(display_scan[null_index]),
-            "music_raw_spectrum": self._json_float(music_raw[null_index]),
-            "music_rel_db": self._json_float(music_rel_db[null_index]),
+            "internal_deg": self._json_float(scan_internal[comparison_index]),
+            "display_deg": self._json_float(display_scan[comparison_index]),
+            "music_raw_spectrum": self._json_float(music_raw[comparison_index]),
+            "music_rel_db": self._json_float(music_rel_db[comparison_index]),
             "lcmv_response_db": self._json_float(
-                lcmv_response_db[null_index] if lcmv_response_db.size else None
+                lcmv_response_db[comparison_index] if lcmv_response_db.size else None
             ),
         }
 
@@ -6952,7 +6578,7 @@ class BackendRuntime:
             )
         return {
             "lcmv_target_classification": "unclassified",
-            "lcmv_target_confirmed_jammer_bearing": False,
+            "lcmv_target_activation_evidence_met": False,
             "lcmv_target_protected_bladeRF_bearing": False,
             "lcmv_target_angle_change_from_healthy_deg": self._json_float(
                 healthy_angle_change
@@ -6969,68 +6595,34 @@ class BackendRuntime:
         return f"{number:.{max(0, int(digits))}f}"
 
     @staticmethod
-    def _format_satellite_ids(labels_obj: object, fallback_prns_obj: object = None) -> str:
+    def _format_satellite_ids(labels_obj: object) -> str:
         labels: list[str] = []
         if isinstance(labels_obj, (list, tuple, set)):
             for raw_label in labels_obj:
                 label = str(raw_label).strip()
                 if label and label != "--":
                     labels.append(label)
-        if labels:
-            return ",".join(labels)
-
-        if isinstance(fallback_prns_obj, (list, tuple, set)):
-            for raw_prn in fallback_prns_obj:
-                try:
-                    prn = int(raw_prn)
-                except (TypeError, ValueError):
-                    continue
-                if prn > 0:
-                    labels.append(f"G{prn:02d}")
         return ",".join(labels) if labels else "--"
 
     @classmethod
     def _format_used_pvt_satellites(cls, gnss_snapshot: dict[str, object]) -> str:
-        labels = cls._format_satellite_ids(
-            gnss_snapshot.get("used_in_fix_satellites"),
-            gnss_snapshot.get("used_in_fix_prns"),
+        return cls._format_satellite_ids(
+            gnss_snapshot.get("used_in_fix_satellites")
         )
-        if labels != "--":
-            return labels
-
-        fallback_labels: list[str] = []
-        for entry in gnss_snapshot.get("prns", []):
-            if not isinstance(entry, dict) or not bool(entry.get("used_in_fix", False)):
-                continue
-            satellite_id = str(entry.get("satellite_id", "")).strip()
-            if satellite_id:
-                fallback_labels.append(satellite_id)
-                continue
-            try:
-                prn = int(entry.get("prn"))
-            except (TypeError, ValueError):
-                continue
-            if prn > 0:
-                fallback_labels.append(f"G{prn:02d}")
-        return ",".join(fallback_labels) if fallback_labels else "--"
 
     @staticmethod
     def _used_pvt_count(gnss_snapshot: dict[str, object]) -> int:
         try:
             return max(0, int(gnss_snapshot.get("used_in_fix_count", 0)))
         except (TypeError, ValueError):
-            return sum(
-                1
-                for entry in gnss_snapshot.get("prns", [])
-                if isinstance(entry, dict) and bool(entry.get("used_in_fix", False))
-            )
+            return 0
 
     # -------------------------------------------------------------------------
     # GNSS Snapshot Logging
     # -------------------------------------------------------------------------
 
     def _maybe_log_gnss_snapshot(self, gnss_snapshot: dict[str, object]) -> None:
-        if not gnss_snapshot:
+        if not self._config.logging_enabled or not gnss_snapshot:
             return
         self._maybe_log_gnss_pvt_transition(gnss_snapshot)
         self._maybe_log_gnss_pvt_quality_transition(gnss_snapshot)
@@ -7043,26 +6635,21 @@ class BackendRuntime:
             f"{raw_q.qsize()}/{max(1, int(raw_q.maxsize))}" if raw_q is not None else "--"
         )
         tracking_prns = self._format_satellite_ids(
-            gnss_snapshot.get("tracking_satellites"),
-            gnss_snapshot.get("tracking_prns"),
+            gnss_snapshot.get("tracking_satellites")
         )
         stable_prns = self._format_satellite_ids(
-            gnss_snapshot.get("stable_tracking_satellites"),
-            gnss_snapshot.get("stable_tracking_prns"),
+            gnss_snapshot.get("stable_tracking_satellites")
         )
         pending_prns = self._format_satellite_ids(
-            gnss_snapshot.get("pending_tracking_satellites"),
-            gnss_snapshot.get("pending_tracking_prns"),
+            gnss_snapshot.get("pending_tracking_satellites")
         )
         unstable_prns = self._format_satellite_ids(
-            gnss_snapshot.get("unstable_tracking_satellites"),
-            gnss_snapshot.get("unstable_tracking_prns"),
+            gnss_snapshot.get("unstable_tracking_satellites")
         )
         used_count = self._used_pvt_count(gnss_snapshot)
         used_prns = self._format_used_pvt_satellites(gnss_snapshot)
         acquired_prns = self._format_satellite_ids(
-            gnss_snapshot.get("acquired_satellites"),
-            gnss_snapshot.get("acquired_prns"),
+            gnss_snapshot.get("acquired_satellites")
         )
         avg_cno_db_hz = gnss_snapshot.get("avg_tracking_cno_db_hz")
         avg_cno_text = (
@@ -7089,11 +6676,9 @@ class BackendRuntime:
         self._handoff_log.info(
             "runtime->GNSS snapshot: mode=%s fifo_source=%s raw_q=%s "
             "lcmv_enabled=%s lcmv_mode=%s active_lcmv_method=%s active_lcmv_null_method=%s "
-            "active_lcmv_weights_source=%s active_lcmv_null_internal_angle_deg=%s "
-            "active_lcmv_null_display_bearing_deg=%s active_lcmv_fallback_reason=%s "
-            "selected_null_display_bearing_deg=%s music_primary_display_bearing_deg=%s "
+            "active_lcmv_weights_source=%s active_lcmv_fallback_reason=%s "
+            "music_guard_candidate_display_bearing_deg=%s "
             "latest_ideal_measured_coherence_abs=%s "
-            "latest_predicted_u1_lcmv_output_gain_over_ideal_lcmv_db=%s "
             "measured_output_reduction_vs_uniform_db=%s "
             "measured_output_reduction_vs_raw_avg_channel_db=%s "
             "raw_power_spread_db=%s cal_power_spread_db=%s "
@@ -7113,19 +6698,13 @@ class BackendRuntime:
             raw_q_text,
             bool(lcmv_status.get("enabled", False)),
             str(lcmv_status.get("mode", "off")),
-            str(lcmv_status.get("active_lcmv_method", self._lcmv_test_null_method)),
-            str(lcmv_status.get("active_lcmv_null_method", self._lcmv_test_null_method)),
+            str(lcmv_status.get("active_lcmv_method", "uniform_array_sum")),
+            str(lcmv_status.get("active_lcmv_null_method", "none")),
             str(lcmv_status.get("active_lcmv_weights_source", "--")),
-            self._format_optional_float(lcmv_status.get("null_internal_deg")),
-            self._format_optional_float(lcmv_status.get("null_bearing_deg")),
             str(lcmv_status.get("active_lcmv_fallback_reason", "") or "--"),
-            self._format_optional_float(lcmv_status.get("null_bearing_deg")),
             self._format_optional_float(lcmv_status.get("music_bearing_deg")),
             self._format_optional_float(
                 spatial_diag.get("ideal_measured_coherence_abs"), 5
-            ),
-            self._format_optional_float(
-                spatial_diag.get("predicted_u1_lcmv_output_gain_over_ideal_lcmv_db")
             ),
             self._format_optional_float(
                 output_metrics.get("measured_output_reduction_vs_uniform_db")

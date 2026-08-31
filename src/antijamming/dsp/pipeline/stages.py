@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from antijamming.dsp.beamforming import apply_beamformer
 from antijamming.dsp.doa.music import (
     bartlett_spectrum_from_covariance,
     covariance_eigendecomposition_from_matrix,
@@ -307,24 +306,6 @@ def compute_doa_metrics(
         "covariance_eigenvectors": eigenvectors,
         **source_diagnostics,
     }
-
-
-def compute_gnss_output_vector(
-    buffer: np.ndarray,
-    beamformer_weights: np.ndarray,
-    phase_correction_vector: np.ndarray | None = None,
-) -> np.ndarray:
-    """Render the calibrated, uniform-combined one-channel stream handed to GNSS-SDR."""
-    source = np.asarray(buffer, dtype=np.complex128)
-    if source.ndim != 2 or source.shape[1] == 0:
-        return np.zeros((0,), dtype=np.complex64)
-    corrected = apply_phase_calibration(
-        source,
-        correction_vector=phase_correction_vector,
-    )
-    return apply_beamformer(
-        corrected, np.asarray(beamformer_weights, dtype=np.complex128)
-    )
 
 
 # =============================================================================

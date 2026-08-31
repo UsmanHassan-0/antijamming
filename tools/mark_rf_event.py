@@ -16,34 +16,20 @@ if str(SRC_DIR) not in sys.path:
 from antijamming.logging import RF_EVENTS, record_event  # noqa: E402
 
 
-EVENTS = tuple(sorted(RF_EVENTS | {
-    "bladerf_on",
-    "bladerf_off",
-    "bladerf_gain_db",
-}))
-
-EVENT_ALIASES = {
-    "bladerf_on": "bladeRF_on",
-    "bladerf_off": "bladeRF_off",
-    "bladerf_gain_db": "bladeRF_gain_db",
-}
+EVENTS = tuple(sorted(RF_EVENTS))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event", required=True, choices=EVENTS)
-    parser.add_argument("--attenuation-db", type=float)
-    parser.add_argument("--bladerf-gain-db", type=float)
     parser.add_argument("--notes", default="")
     parser.add_argument("--logs", type=Path, default=Path("logs"))
     args = parser.parse_args()
 
     payload = record_event(
         args.logs,
-        EVENT_ALIASES.get(args.event, args.event),
+        args.event,
         source="cli",
-        attenuation_db=args.attenuation_db,
-        bladeRF_gain_db=args.bladerf_gain_db,
         notes=str(args.notes),
     )
     print(json.dumps(payload, sort_keys=True))

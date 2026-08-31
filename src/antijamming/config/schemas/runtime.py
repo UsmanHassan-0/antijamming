@@ -27,24 +27,6 @@ from antijamming.dsp.models import AngleScanSpec
 # Default product profile used by the realtime X300 application.
 DEFAULT_RUNTIME_CONFIG_PATH = REPO_ROOT / "configs/antijamming/x300_realtime.json"
 
-VALID_LCMV_METHODS = frozenset(
-    {
-        "covariance_lcmv_ideal",
-        "covariance_lcmv_measured_u1",
-    }
-)
-
-VALID_LCMV_PRESERVE_MODES = frozenset(
-    {"uniform", "healthy_reference", "realtime_bladerf_measured_u1"}
-)
-VALID_LCMV_TARGET_MODES = frozenset(
-    {
-        "strongest_music_peak",
-        "realtime_non_preserve_peak",
-    }
-)
-
-
 # =============================================================================
 # Stream Runtime Schema
 # =============================================================================
@@ -133,10 +115,6 @@ class StreamConfig:
     # elsewhere by the runtime.
     gain_db: float
 
-    # Empty string means use rx_antennas_by_channel.
-    # Set to "RX1" or "RX2" to force the same antenna port on every channel.
-    antenna: str
-
     # -------------------------------------------------------------------------
     # TwinRX Coherent LO Configuration
     # -------------------------------------------------------------------------
@@ -144,9 +122,6 @@ class StreamConfig:
     # TwinRX physical input mapping on this X300:
     # Ch0/Ch2 use RX1, Ch1/Ch3 use RX2.
     rx_antennas_by_channel: tuple[str, str, str, str]
-
-    # Requires physical TwinRX LO-sharing MMCX cables between daughterboards.
-    twinrx_lo_sharing: bool
 
     # Validated two-board coherent LO map for this X310 + 2x TwinRX setup:
     # - Ch0 is the A-board master/export source.
@@ -203,11 +178,13 @@ class StreamConfig:
     rx_clipping_component_threshold: float
     rx_clipping_fraction_threshold: float
 
+    # One persistence switch for anti-jamming and GNSS-SDR diagnostic files.
+    # Operational UDP/NMEA/stdout parsing remains active because receiver state
+    # and safe control do not depend on writing those records to disk.
+    logging_enabled: bool
+
     # Root log directory for realtime run artifacts.
     log_dir: Path
-
-    # When true, shutdown avoids aggressively tearing down the USRP session.
-    preserve_usrp_session_on_stop: bool
 
     # -------------------------------------------------------------------------
     # GUI History and Phase Calibration
@@ -247,15 +224,12 @@ class StreamConfig:
     # remain CCW; operator display bearings use top as 0 deg and increase clockwise.
     expected_sources: int
 
-    # Manual test mode only. When enabled by the operator, the runtime uses the
-    # strongest MUSIC peak as one LCMV null direction and falls back to uniform on
+    # When armed, the runtime selects the strongest MUSIC peak outside the
+    # frozen healthy-signal guard. It applies no null until independent power
+    # and covariance evidence latches the jammer, and falls back to uniform on
     # any invalid condition.
     lcmv_test_enabled: bool
-    lcmv_test_max_weight_norm: float
-    lcmv_test_condition_number_limit: float
-    lcmv_test_null_method: str
-    lcmv_preserve_constraint_mode: str
-    lcmv_target_selection_mode: str
+    lcmv_condition_number_limit: float
     lcmv_realtime_preserve_window_samples: int
     lcmv_realtime_preserve_min_samples: int
     lcmv_realtime_preserve_max_circular_std_deg: float
@@ -265,7 +239,6 @@ class StreamConfig:
     lcmv_jammer_activation_min_input_power_jump_db: float
     lcmv_jammer_activation_min_generalized_gain_db: float
     lcmv_weight_transition_s: float
-    lcmv_candidate_methods_enabled: bool
     lcmv_covariance_diagonal_loading_rel: float
     lcmv_covariance_diagonal_loading_abs: float
     lcmv_max_weight_norm: float
@@ -273,7 +246,6 @@ class StreamConfig:
     lcmv_min_predicted_jammer_suppression_db: float
     lcmv_heavy_diagnostics_interval_s: float
     one_run_segmentation_enabled: bool
-    healthy_reference_capture_enabled: bool
     # Production lifecycle: collect a uniform healthy reference first, then
     # arm LCMV automatically. Arming does not apply null weights by itself.
     lcmv_auto_arm_after_pvt: bool
@@ -283,9 +255,8 @@ class StreamConfig:
     # -------------------------------------------------------------------------
 
     # GNSS-SDR launcher and executable resolution.
-    # Enable GNSS-SDR runtime integration and optional local-build enforcement.
+    # Product runs require the repository-owned receiver build when enabled.
     gnss_sdr_enable: bool
-    gnss_sdr_require_local: bool
 
     # Optional explicit GNSS-SDR executable path. None lets runtime resolve it.
     gnss_sdr_executable: Path | None
@@ -299,11 +270,6 @@ class StreamConfig:
     # logs tree, even if the GNSS-SDR source/build/install repo lives elsewhere.
     gnss_sdr_runtime_dir: Path
     gnss_sdr_log_dir: Path
-
-    # Optional live terminal echo for GNSS-SDR's clean console stream. Product
-    # GUI runs keep this quiet by default; clean receiver status is captured in
-    # runtime/console.log and GNSS-SDR diagnostics in gnss_sdr_log_dir/receiver.log.
-    gnss_sdr_echo_stdout: bool
 
     # Maximum time to wait for GNSS-SDR to construct its flowgraph and open the
     # IQ FIFO. Zero or a negative value waits as long as the child process is
@@ -346,10 +312,9 @@ class StreamConfig:
     # Sample representation expected by the GNSS-SDR SignalSource.
     gnss_sdr_sample_type: str
 
-    # Every pinned PRN receives one shared measured-U1 covariance-LCMV spatial
-    # solution. Only a complex response-continuity scalar differs by PRN.
-    gnss_shared_u1_phase_compensation_enabled: bool
-    gnss_shared_u1_phase_satellites: tuple[int, ...]
+    # Every dynamic GNSS-SDR source slot receives one shared measured-U1
+    # covariance-LCMV spatial solution. Only a complex response-continuity
+    # scalar differs for the PRN currently tracked in that slot.
     gnss_shared_u1_phase_transition_s: float
     gnss_shared_u1_phase_min_quality_measurements: int
 
@@ -381,7 +346,6 @@ class StreamConfig:
     # but the per-satellite used-in-fix list comes from GSA sentences. Keep NMEA
     # on a PTY so realtime runs do not poll or grow NMEA files.
     gnss_pvt_nmea_tty_enable: bool
-    gnss_pvt_nmea_output_file_enable: bool
     gnss_pvt_nmea_rate_ms: int
 
     # Acquisition settings tuned for robust lab/realtime GPS L1 C/A startup.
@@ -439,4 +403,4 @@ class StreamConfig:
             points=int(self.doa_points),
         )
 
-__all__ = ["DEFAULT_RUNTIME_CONFIG_PATH", "StreamConfig", "VALID_LCMV_METHODS"]
+__all__ = ["DEFAULT_RUNTIME_CONFIG_PATH", "StreamConfig"]

@@ -8,7 +8,7 @@ def test_fifo_gnss_sdr_template_uses_ppp_static_pvt() -> None:
 
     assert "PVT.implementation=RTKLIB_PVT" in template
     assert "PVT.positioning_mode={pvt_positioning_mode}" in template
-    assert "PVT.log_rtklib_residuals=true" in template
+    assert "PVT.log_rtklib_residuals={pvt_log_rtklib_residuals}" in template
     assert "PVT.rtklib_residual_log_period_ms=1000" in template
     assert "PVT.dump=false" in template
     assert "PVT.dump_mat=false" in template

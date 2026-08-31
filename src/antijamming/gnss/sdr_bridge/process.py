@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -45,6 +44,10 @@ class ProcessMixin:
             str(exe_path),
             f"--config_file={self._config_path}",
             "--logtostderr=1",
+            # GNSS-SDR output is an operational input as well as optional
+            # persisted evidence: the bridge parses receiver time, channel
+            # assignment, acquisition, tracking, and loss events from this PTY.
+            # Keep emission invariant when file logging is disabled.
             "--minloglevel=1",
         ]
         stdbuf = shutil.which("stdbuf")
@@ -131,13 +134,6 @@ class ProcessMixin:
 
     def _owned_gnss_sdr_session_paths(self) -> tuple[set[Path], set[Path]]:
         runtime_dirs = {self._runtime_dir}
-        repo_runtime_dir = (
-            self._cfg.gnss_sdr_repo_dir.expanduser().resolve()
-            / "logs"
-            / "runtime"
-            / "fifo-x300"
-        )
-        runtime_dirs.add(repo_runtime_dir)
         config_paths = {runtime_dir / "fifo_gps_l1.conf" for runtime_dir in runtime_dirs}
         config_paths.add(self._config_path)
         return config_paths, runtime_dirs
@@ -214,36 +210,9 @@ class ProcessMixin:
         return False
 
     def _reset_runtime_dir(self) -> None:
-        configured_runtime_dir = self._runtime_dir
-        configured_log_dir = self._log_dir
-        try:
-            self._clear_dir(configured_runtime_dir)
-            if configured_log_dir != configured_runtime_dir:
-                self._clear_dir(configured_log_dir)
-            return
-        except PermissionError as exc:
-            fallback_runtime_dir = self._runtime_fallback_dir()
-            fallback_log_dir = fallback_runtime_dir / "glog"
-            self._log.warning(
-                "GNSS-SDR runtime path is not writable (%s: %s); "
-                "using per-user fallback runtime=%s log_dir=%s",
-                exc.filename or configured_runtime_dir,
-                exc,
-                fallback_runtime_dir,
-                fallback_log_dir,
-            )
-            self._set_session_paths(fallback_runtime_dir, fallback_log_dir)
-            self._clear_dir(self._runtime_dir)
-            if self._log_dir != self._runtime_dir:
-                self._clear_dir(self._log_dir)
-
-    def _runtime_fallback_dir(self) -> Path:
-        uid = getattr(os, "getuid", lambda: "user")()
-        return (
-            Path(tempfile.gettempdir())
-            / f"antijamming-{uid}"
-            / f"gnss-sdr-runtime-{os.getpid()}"
-        )
+        self._clear_dir(self._runtime_dir)
+        if self._log_dir != self._runtime_dir:
+            self._clear_dir(self._log_dir)
 
     def _clear_dir(self, base_dir: Path) -> None:
         base_dir.mkdir(parents=True, exist_ok=True)

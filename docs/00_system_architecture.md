@@ -9,7 +9,13 @@ USRP.
 
 The hardware stream is four coherent IQ channels from the X300. The configured order in `configs/antijamming/x300_realtime.json` is preserved and must not be changed for algorithm experiments. Runtime calibration is applied before MUSIC/Bartlett, spatial-vector diagnostics, LCMV candidate evaluation, and the GNSS-SDR FIFO combiner. The calibration loader in `src/antijamming/dsp/phase/alignment.py` supports both `phase_only` and `complex_gain`; the product default is `calibration_correction_mode: "complex_gain"`.
 
-The DSP path estimates DoA with MUSIC and keeps Bartlett diagnostics. Candidate beamformers are computed in `src/antijamming/dsp/beamforming/lcmv.py` and selected by `lcmv_test_null_method`. The current product config selects `covariance_lcmv_ideal`. Only one active spatial solution feeds GNSS-SDR at a time; other candidate methods are diagnostic unless selected. With the product's Shared-U1 mode enabled, that shared spatial solution is multiplied by a PRN-specific complex continuity scalar and fanned out to dynamically assigned GNSS-SDR channel FIFOs. This is not an independent LCMV solve per PRN.
+The DSP path estimates DoA with MUSIC and keeps Bartlett diagnostics. The only nulling method in `src/antijamming/dsp/beamforming/lcmv.py` is `covariance_lcmv_measured_u1`. One accepted measured-vector solve supplies the common target and Shared-U1 protection target. A PRN-specific complex continuity scalar and the existing transitions precede dynamically assigned GNSS-SDR FIFOs; this is not an independent LCMV solve per PRN. The ideal-null solver and its public export are absent.
+
+MUSIC supplies a covariance-spectrum estimate. Its strongest eligible peak
+outside the frozen bladeRF guard remains a control prerequisite, but does not
+supply the null constraint. Weights activate only after power and covariance
+evidence. The GUI has one calculated steering-model scan of the measured-U1
+target; its marker is labelled MUSIC guard candidate, not measured null bearing.
 
 The repository contains a customized, vendored GNSS-SDR tree under
 `gnss-sdr/`; it is not an untouched external system package. The Python bridge
@@ -20,4 +26,10 @@ configured `1C` channels), then reads GNSS-SDR feedback through
 PVT/NMEA/tracking monitor snapshots. Those health fields feed one-run
 segmentation and healthy-reference tracking.
 
-Logs live under `logs/`. The key files for this work are `analysis.log`, `lcmv.log`, `lcmv_pattern_absolute.jsonl`, `spatial_vector_diagnostics.jsonl`, `phase_alignment.log`, `gnss_handoff.log`, and `stream_health.log`. `lcmv_heavy_diagnostics_interval_s` throttles the full LCMV JSON diagnostics. `tools/summarize_lcmv_run.py` reads the logs and prints calibration state, RF budget, active LCMV method, candidate rankings, and run-state summaries.
+GNSS bridge maps use one internal satellite key shape:
+`(normalized_constellation, PRN)`. Every public per-satellite record carries
+`constellation`, numeric `prn`, and a constellation-qualified `satellite_id`;
+summary lists contain only labels such as `G05`, `C05`, or `R03`. GPS-only
+integer summary aliases are not part of the current IPC/UI contract.
+
+Logs live under `logs/`. The key files are `analysis.log`, `lcmv.log`, `lcmv_pattern_absolute.jsonl`, `spatial_vector_diagnostics.jsonl`, `phase_alignment.log`, `gnss_handoff.log`, and `stream_health.log`. `lcmv_heavy_diagnostics_interval_s` throttles full diagnostics. `tools/summarize_lcmv_run.py` reports calibration, measured-U1 metrics, and run state without ranking retired methods. RF-link-budget calculation is outside the product runtime and its analysis tools.

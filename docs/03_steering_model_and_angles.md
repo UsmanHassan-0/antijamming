@@ -39,4 +39,10 @@ display 170 = internal 280
 display 290 = internal 160
 ```
 
-`steering_vector()` in `src/antijamming/dsp/doa/music.py` uses internal angle only. The UI/operator sees display bearing. LCMV null steering and MUSIC scan values are internal-angle operations. Logs include both internal and display fields: `music_internal_angle_deg`, `music_display_bearing_deg`, `null_internal_angle_deg`, `null_display_bearing_deg`, `steering_vector_angle_used_internal_deg`, and `steering_vector_angle_used_display_deg`.
+`steering_vector()` in `src/antijamming/dsp/doa/music.py` uses internal angles
+for MUSIC/Bartlett and calculated response scans. The operator sees display
+bearings. The LCMV null constraint uses measured U1 directly, not an angle.
+Logs retain `music_internal_angle_deg`, `music_display_bearing_deg`, and
+`model_comparison_angle_internal_deg` / `model_comparison_angle_display_deg`.
+Retired null-angle and angle-used-to-create-null fields are removed rather
+than filled with a MUSIC bearing or left permanently empty.

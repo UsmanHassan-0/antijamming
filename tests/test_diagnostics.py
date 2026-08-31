@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from antijamming.dsp.beamforming import (
-    covariance_lcmv_ideal_null_weights,
     covariance_lcmv_vector_null_weights,
     lcmv_model_response,
 )
@@ -76,12 +75,9 @@ def test_output_reduction_metrics_use_explicit_power_ratios() -> None:
 
 def test_lcmv_model_response_arrays_are_absolute_not_normalized() -> None:
     scan = np.linspace(0.0, 359.0, 721)
-    result = covariance_lcmv_ideal_null_weights(
+    result = covariance_lcmv_vector_null_weights(
         covariance=np.eye(4, dtype=np.complex128),
-        n_channels=4,
-        null_angle_deg=72.0,
-        rf_freq_hz=1.57542e9,
-        array_spacing_m=0.07,
+        null_vector=np.array([1.0, 0.7j, -0.4 + 0.2j, 0.2 - 0.9j]),
     )
 
     model = lcmv_model_response(
@@ -89,7 +85,6 @@ def test_lcmv_model_response_arrays_are_absolute_not_normalized() -> None:
         scan_angles_deg=scan,
         rf_freq_hz=1.57542e9,
         array_spacing_m=0.07,
-        selected_null_angle_deg=result.null_angle_deg,
     )
 
     assert model.response_abs.shape == scan.shape
@@ -98,8 +93,7 @@ def test_lcmv_model_response_arrays_are_absolute_not_normalized() -> None:
     assert model.response_power_db.shape == scan.shape
     assert np.all(np.isfinite(model.response_abs))
     assert np.all(np.isfinite(model.response_db))
-    assert model.model_response_at_selected_null_db is not None
-    assert model.model_response_at_selected_null_db < -40.0
+    assert not hasattr(model, "model_response_at_selected_null_db")
     assert float(np.max(model.response_db)) != pytest.approx(0.0)
 
 

@@ -15,6 +15,7 @@ class _ErrorCodes:
     overflow = object()
     late = object()
     timeout = object()
+    other = object()
 
 
 class _StreamMode:
@@ -97,6 +98,25 @@ class _PacketStreamer:
         raise AssertionError("already-started test device must not issue a stream command")
 
 
+class _InvalidPacketSizeStreamer(_PacketStreamer):
+    @staticmethod
+    def get_max_num_samps() -> int:
+        return 0
+
+
+class _OverreportingPacketStreamer(_PacketStreamer):
+    def recv(self, chunk, metadata, *, timeout: float) -> int:
+        super().recv(chunk, metadata, timeout=timeout)
+        return int(chunk.shape[1]) + 1
+
+
+class _UnknownMetadataPacketStreamer(_PacketStreamer):
+    def recv(self, chunk, metadata, *, timeout: float) -> int:
+        count = super().recv(chunk, metadata, timeout=timeout)
+        metadata.error_code = _ErrorCodes.other
+        return count
+
+
 def _device(monkeypatch, streamer: _BlockingStreamer, *, started: bool = True):
     fake_uhd = SimpleNamespace(
         types=SimpleNamespace(StreamCMD=_StreamCmd, StreamMode=_StreamMode),
@@ -144,6 +164,52 @@ def test_recv_assembles_dsp_chunk_from_uhd_advertised_packet_size(monkeypatch) -
     assert result.chunk.shape == (2, 10)
     assert streamer.requests == [(2, 4), (2, 4), (2, 2)]
     np.testing.assert_array_equal(result.chunk[0].real, np.arange(10))
+
+
+def test_recv_rejects_nonpositive_uhd_packet_size(monkeypatch) -> None:
+    metadata = SimpleNamespace(
+        error_code=_ErrorCodes.none,
+        out_of_sequence=False,
+        has_time_spec=False,
+    )
+    receiver = _device(monkeypatch, _InvalidPacketSizeStreamer(metadata))
+
+    try:
+        receiver.recv_chunk()
+    except RuntimeError as exc:
+        assert "nonpositive maximum packet size" in str(exc)
+    else:
+        raise AssertionError("invalid UHD packet size should be rejected")
+
+
+def test_recv_rejects_uhd_sample_count_larger_than_requested(monkeypatch) -> None:
+    metadata = SimpleNamespace(
+        error_code=_ErrorCodes.none,
+        out_of_sequence=False,
+        has_time_spec=False,
+    )
+    receiver = _device(monkeypatch, _OverreportingPacketStreamer(metadata))
+
+    try:
+        receiver.recv_chunk()
+    except RuntimeError as exc:
+        assert "invalid sample count" in str(exc)
+    else:
+        raise AssertionError("overreported UHD sample count should be rejected")
+
+
+def test_recv_does_not_label_unknown_uhd_error_with_samples_as_ok(monkeypatch) -> None:
+    metadata = SimpleNamespace(
+        error_code=_ErrorCodes.none,
+        out_of_sequence=False,
+        has_time_spec=False,
+    )
+    receiver = _device(monkeypatch, _UnknownMetadataPacketStreamer(metadata))
+
+    result = receiver.recv_chunk()
+
+    assert result.state == "other"
+    assert result.got_samples > 0
 
 
 def _join(thread: threading.Thread) -> None:
@@ -221,10 +287,42 @@ def test_recv_after_stop_is_empty_and_does_not_reenter_uhd(monkeypatch) -> None:
     receiver.stop()
     result = receiver.recv_chunk()
     receiver.stop()
-    receiver.pause_stream()
 
     assert result.state == "timeout"
     assert result.error_code == "stopping"
     assert result.chunk.shape == (2, 0)
     assert streamer.recv_calls == 0
+    assert streamer.commands == ["stop"]
+
+
+def test_failed_native_stop_is_retried_before_owner_can_be_released(monkeypatch) -> None:
+    class FailsFirstStopStreamer(_BlockingStreamer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_attempts = 0
+
+        def issue_stream_cmd(self, command: _StreamCmd) -> None:
+            if command.mode == "stop":
+                self.stop_attempts += 1
+                if self.stop_attempts == 1:
+                    raise OSError("synthetic native stop failure")
+            super().issue_stream_cmd(command)
+
+    streamer = FailsFirstStopStreamer()
+    receiver = _device(monkeypatch, streamer)
+
+    try:
+        receiver.stop()
+    except OSError as exc:
+        assert "synthetic native stop failure" in str(exc)
+    else:
+        raise AssertionError("first native stop should fail")
+
+    assert receiver._stopping is True
+    assert receiver._started is True
+
+    receiver.stop()
+
+    assert receiver._started is False
+    assert streamer.stop_attempts == 2
     assert streamer.commands == ["stop"]

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT="${ROOT:-/home/qvise/antijamming}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "${ROOT}"
 
 PY_PID="${1:-}"
 IFACE="${IFACE:-}"
 INTERVAL="${INTERVAL:-1}"
-GNSS_MATCH="${GNSS_MATCH:-${ROOT}/gnss-sdr/*/gnss-sdr --config_file=*fifo_gps_l1.conf}"
 
 runtime_usrp_ip() {
   python3 - <<'PY'
@@ -72,6 +72,7 @@ printf '%s\n' "${SIDE}" > logs/sidecar/LATEST
 CHILD_PIDS=()
 GNSS_PID=""
 BACKEND_PID=""
+CLEANUP_STARTED=0
 
 discover_backend_pid() {
   ps -eo pid=,ppid=,args= | awk -v gui_pid="${PY_PID}" '
@@ -97,17 +98,6 @@ discover_gnss_pid() {
   '
 }
 
-pid_list_now() {
-  local backend
-  local gnss
-  backend="$(discover_backend_pid)"
-  gnss="$(discover_gnss_pid)"
-  local pids="${PY_PID}"
-  [[ -n "${backend}" ]] && pids="${pids},${backend}"
-  [[ -n "${gnss}" ]] && pids="${pids},${gnss}"
-  printf '%s\n' "${pids}"
-}
-
 write_manifest_start() {
   {
     printf 'sidecar_started_utc=%s\n' "$(date -u --iso-8601=ns)"
@@ -117,7 +107,6 @@ write_manifest_start() {
     printf 'gui_python_pid=%s\n' "${PY_PID}"
     printf 'backend_python_pid_initial=%s\n' "${BACKEND_PID:-missing}"
     printf 'gnss_sdr_pid_initial=%s\n' "${GNSS_PID:-missing}"
-    printf 'gnss_match=%s\n' "${GNSS_MATCH}"
     printf 'iface=%s\n' "${IFACE}"
     printf 'interval_s=%s\n' "${INTERVAL}"
     printf 'sidecar_pid=%s\n' "$$"
@@ -142,7 +131,9 @@ snapshot_processes() {
 launch() {
   local name="$1"
   shift
-  "$@" > "${SIDE}/${name}.log" 2>&1 &
+  # Each monitor owns a separate process group so shutdown also reaches any
+  # command it is currently waiting for (for example sleep, ps, or ethtool).
+  setsid "$@" > "${SIDE}/${name}.log" 2>&1 &
   local pid="$!"
   CHILD_PIDS+=("${pid}")
   printf '%s\n' "${pid}" > "${SIDE}/${name}.pid"
@@ -280,6 +271,12 @@ done
 ' "${IFACE}" "${INTERVAL}"
 
 cleanup() {
+  if (( CLEANUP_STARTED )); then
+    return
+  fi
+  CLEANUP_STARTED=1
+  trap '' INT TERM
+
   {
     printf 'sidecar_stopping_utc=%s\n' "$(date -u --iso-8601=ns)"
     printf 'sidecar_stopping_local=%s\n' "$(date --iso-8601=ns)"
@@ -288,11 +285,16 @@ cleanup() {
   } >> "${SIDE}/manifest.txt"
 
   for pid in "${CHILD_PIDS[@]}"; do
-    kill "${pid}" 2>/dev/null || true
+    kill -TERM -- "-${pid}" 2>/dev/null || true
   done
   sleep 0.5
   for pid in "${CHILD_PIDS[@]}"; do
-    kill -9 "${pid}" 2>/dev/null || true
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill -KILL -- "-${pid}" 2>/dev/null || true
+    fi
+  done
+  for pid in "${CHILD_PIDS[@]}"; do
+    wait "${pid}" 2>/dev/null || true
   done
 
   free -h > "${SIDE}/free_end.txt" 2>&1 || true
@@ -308,7 +310,9 @@ cleanup() {
   } >> "${SIDE}/manifest.txt"
 }
 
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 while kill -0 "${PY_PID}" 2>/dev/null; do
   sleep 1

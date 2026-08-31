@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from antijamming.config import StreamConfig
-from antijamming.gnss import GnssSdrBridge
+from antijamming.gnss import GnssSdrBridge, SharedU1PhaseCompensationBank
 from antijamming.gnss.sdr_bridge.bridge import GnssFifoWriteStall
 from antijamming.gnss.sdr_bridge.fifo import PER_SOURCE_FIFO_STRIPE_SAMPLES
 from antijamming.gnss.sdr_bridge import (
@@ -32,6 +32,7 @@ from antijamming.gnss.sdr_bridge import (
     _GnssSdrProcessInfo,
 )
 from antijamming.gnss.sdr_bridge.protobuf import gnss_synchro_pb2, monitor_pvt_pb2
+from antijamming.radio.usrp import RxChunkResult, validate_rx_chunk_result
 from antijamming.runtime import BackendRuntime
 
 
@@ -57,6 +58,12 @@ def _runtime_loggers() -> dict[str, logging.Logger]:
 
 def _fifo_runtime_dir(tmp_path: Path) -> Path:
     return tmp_path / "gnss-sdr" / "logs" / "runtime" / "fifo-x300"
+
+
+def _render_config_for_test(bridge: GnssSdrBridge) -> str:
+    if bridge._cfg.gnss_pvt_nmea_tty_enable:
+        bridge._nmea_tty_path = "/dev/pts/test"
+    return bridge._render_config()
 
 
 def _pipe_backed_bridge(
@@ -133,6 +140,17 @@ def test_fifo_fair_poll_writes_each_source_without_serial_blocking(
                 np.frombuffer(received[index], dtype=np.complex64),
                 samples[index],
             )
+    finally:
+        _close_pipe_fds(write_fds, read_fds)
+
+
+def test_fifo_write_rejects_legacy_one_dimensional_input_even_for_one_source(
+    tmp_path: Path,
+) -> None:
+    bridge, read_fds, write_fds = _pipe_backed_bridge(tmp_path, source_count=1)
+    try:
+        with pytest.raises(ValueError, match="expects sources x samples"):
+            bridge.write(np.ones((16,), dtype=np.complex64))
     finally:
         _close_pipe_fds(write_fds, read_fds)
 
@@ -516,7 +534,6 @@ def _make_tracking_bridge(tmp_path: Path) -> GnssSdrBridge:
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
     )
     bridge = GnssSdrBridge(cfg, _loggers())
-    bridge._session_epoch_s = 1.0
     bridge._tracking_outputs_dir.mkdir(parents=True, exist_ok=True)
     return bridge
 
@@ -598,6 +615,33 @@ def test_bridge_prefers_product_local_executable(tmp_path: Path) -> None:
     assert bridge._resolve_local_executable() == exe_path.resolve()
 
 
+def test_bridge_rejects_missing_repo_owned_receiver_instead_of_running_degraded(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    bridge = GnssSdrBridge(
+        StreamConfig(
+            gnss_sdr_repo_dir=tmp_path / "gnss-sdr",
+            gnss_sdr_build_dir=tmp_path / "gnss-sdr/build-antijamming",
+            gnss_sdr_install_dir=tmp_path / "gnss-sdr/install",
+            gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+            gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
+        ),
+        _loggers(),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_system_gnss_sdr_path",
+        lambda: Path("/usr/bin/gnss-sdr"),
+    )
+
+    with pytest.raises(FileNotFoundError, match="Repo-local GNSS-SDR executable not found"):
+        bridge.start()
+
+    assert bridge._proc is None
+    assert bridge._fifo_fds == []
+
+
 def test_bridge_popen_failure_rolls_back_owned_fds_threads_and_fifos(
     tmp_path: Path,
     monkeypatch,
@@ -633,7 +677,6 @@ def test_bridge_popen_failure_rolls_back_owned_fds_threads_and_fifos(
     assert bridge._fifo_fds == []
     assert bridge._stdout_handle is None
     assert bridge._stdout_thread is None
-    assert bridge._glog_thread is None
     assert bridge._nmea_master_fd is None
     assert bridge._nmea_slave_fd is None
     assert bridge._nmea_thread is None
@@ -647,7 +690,6 @@ def test_bridge_product_profile_uses_udp_and_has_no_dump_parsers(tmp_path: Path)
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
-        gnss_sdr_echo_stdout=False,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
 
@@ -655,17 +697,139 @@ def test_bridge_product_profile_uses_udp_and_has_no_dump_parsers(tmp_path: Path)
     assert bridge._cfg.gnss_monitor_enable is True
     assert bridge._cfg.gnss_tracking_monitor_enable is True
     assert bridge._cfg.gnss_pvt_nmea_tty_enable is True
-    assert bridge._cfg.gnss_pvt_nmea_output_file_enable is False
     assert bridge._cfg.gnss_pvt_nmea_rate_ms == 1000
     assert not hasattr(bridge, "_refresh_pvt_output_state")
     assert not hasattr(bridge, "_refresh_observables_output_state")
+
+
+def test_required_udp_monitor_bind_failure_rolls_back_partial_startup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sockets = []
+
+    class FakeSocket:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.closed = threading.Event()
+            self.port: int | None = None
+            sockets.append(self)
+
+        def setsockopt(self, *_args) -> None:
+            return None
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def bind(self, address) -> None:
+            self.port = int(address[1])
+            if self.port == 1112:
+                raise OSError("synthetic occupied port")
+
+        def recvfrom(self, _size: int):
+            assert self.closed.wait(2.0)
+            raise OSError("closed")
+
+        def close(self) -> None:
+            self.closed.set()
+
+    cfg = StreamConfig(
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+        gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+    monkeypatch.setattr(
+        "antijamming.gnss.sdr_bridge.udp_monitor.socket.socket",
+        FakeSocket,
+    )
+
+    with pytest.raises(RuntimeError, match="required GNSS-SDR UDP observables"):
+        bridge._start_udp_monitors()
+
+    assert [sock.port for sock in sockets] == [1111, 1112]
+    assert all(sock.closed.is_set() for sock in sockets)
+    assert bridge._udp_monitor_sockets == []
+    assert bridge._udp_monitor_threads == []
+
+
+def test_required_nmea_pty_creation_failure_is_not_silently_disabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    bridge = GnssSdrBridge(
+        StreamConfig(
+            gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+            gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
+        ),
+        _loggers(),
+    )
+    monkeypatch.setattr(
+        "antijamming.gnss.sdr_bridge.output_monitor.pty.openpty",
+        lambda: (_ for _ in ()).throw(OSError("synthetic PTY failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="required GNSS-SDR NMEA PTY"):
+        bridge._prepare_nmea_tty()
+
+    assert bridge._nmea_master_fd is None
+    assert bridge._nmea_slave_fd is None
+    assert bridge._nmea_tty_path == "/dev/null"
+
+
+def test_enabled_nmea_config_cannot_render_before_required_pty_exists(
+    tmp_path: Path,
+) -> None:
+    bridge = GnssSdrBridge(
+        StreamConfig(
+            gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+            gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
+        ),
+        _loggers(),
+    )
+
+    with pytest.raises(RuntimeError, match="was not prepared before config render"):
+        bridge._render_config()
+
+
+def test_bridge_active_requires_every_operational_monitor(tmp_path: Path) -> None:
+    class LiveProcess:
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class MonitorThread:
+        def __init__(self, live: bool = True) -> None:
+            self.live = live
+
+        def is_alive(self) -> bool:
+            return self.live
+
+    bridge = GnssSdrBridge(
+        StreamConfig(
+            gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+            gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
+        ),
+        _loggers(),
+    )
+    bridge._fifo_fds = [100 + index for index in range(len(bridge._fifo_paths))]
+    bridge._proc = LiveProcess()  # type: ignore[assignment]
+    bridge._stdout_thread = MonitorThread()  # type: ignore[assignment]
+    bridge._nmea_thread = MonitorThread()  # type: ignore[assignment]
+    bridge._udp_monitor_threads = [
+        MonitorThread(),
+        MonitorThread(),
+        MonitorThread(),
+    ]  # type: ignore[list-item]
+
+    assert bridge.active is True
+
+    bridge._udp_monitor_threads[1].live = False  # type: ignore[attr-defined]
+    assert bridge.active is False
 
 
 def test_bridge_launch_args_capture_gnss_sdr_logs_on_stable_console(tmp_path: Path) -> None:
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
-        gnss_sdr_echo_stdout=False,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
 
@@ -682,6 +846,45 @@ def test_bridge_launch_args_capture_gnss_sdr_logs_on_stable_console(tmp_path: Pa
     assert "antijamming.gnss.sdr_bridge.parent_guard" in args
     assert "--parent-pid" in args
     assert args[-len(command_args):] == command_args
+
+
+def test_bridge_master_logging_switch_disables_persistence_not_live_receiver_state(
+    tmp_path: Path,
+) -> None:
+    cfg = StreamConfig(
+        logging_enabled=False,
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+        gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    command_args = bridge._gnss_sdr_command_args(Path("/local/gnss-sdr"))
+    rendered = _render_config_for_test(bridge)
+    bridge._runtime_dir.mkdir(parents=True, exist_ok=True)
+    bridge._proc = object()  # type: ignore[assignment]
+    bridge._stdout_handle = io.StringIO(
+        "Current receiver time: 17 s\n"
+        "Pull-in: Number of samples between Acquisition and Tracking = 1303 "
+        "( 0.00032575 s)for satellite GPS PRN 9 (Block III) in channel 0\n"
+    )
+    bridge._drain_stdout()
+    bridge._handle_nmea_line("$GPGSV,1,1,01,09,45,120,39*00")
+    bridge._handle_observables_message(
+        _tracking_monitor_message(cno_db_hz=41.75, prn=9, channel=0),
+        source="tracking",
+    )
+    snapshot = bridge.snapshot()
+
+    assert "--minloglevel=1" in command_args
+    assert "PVT.log_rtklib_residuals=false" in rendered
+    assert snapshot["receiver_time_s"] == 17
+    assert snapshot["tracking_satellites"] == ["G09"]
+    assert snapshot["tracking_monitor_count"] == 1
+    assert snapshot["prns"][0]["cno_db_hz"] == pytest.approx(41.75)
+    assert snapshot["sky_geometry_count"] == 1
+    assert [entry["prn"] for entry in snapshot["sky_prns"]] == [9]
+    assert not bridge._console_log_path.exists()
+    assert not bridge._receiver_log_path.exists()
 
 
 def test_fifo_startup_without_deadline_waits_while_process_is_alive(
@@ -822,23 +1025,23 @@ def test_bridge_detects_only_matching_gnss_sdr_runtime_processes(tmp_path: Path)
     matching_runtime = str(bridge._runtime_dir)
 
     assert bridge._cmdline_matches_runtime(
-        ("/home/qvise/antijamming/gnss-sdr/install/gnss-sdr", f"--config_file={matching_config}")
+        ("/repo/antijamming/gnss-sdr/install/gnss-sdr", f"--config_file={matching_config}")
     )
     assert bridge._cmdline_matches_runtime(
-        ("/home/qvise/antijamming/gnss-sdr/install/gnss-sdr", f"--log_dir={matching_runtime}/glog")
+        ("/repo/antijamming/gnss-sdr/install/gnss-sdr", f"--log_dir={matching_runtime}/glog")
     )
-    legacy_config = (
+    obsolete_config = (
         cfg.gnss_sdr_repo_dir.expanduser().resolve()
         / "logs"
         / "runtime"
         / "fifo-x300"
         / "fifo_gps_l1.conf"
     )
-    assert bridge._cmdline_matches_runtime(
-        ("/home/qvise/antijamming/gnss-sdr/install/gnss-sdr", f"--config_file={legacy_config}")
+    assert not bridge._cmdline_matches_runtime(
+        ("/repo/antijamming/gnss-sdr/install/gnss-sdr", f"--config_file={obsolete_config}")
     )
     assert not bridge._cmdline_matches_runtime(
-        ("/home/qvise/other/gnss-sdr", "--config_file=/home/qvise/other/fifo_gps_l1.conf")
+        ("/repo/other/gnss-sdr", "--config_file=/repo/other/fifo_gps_l1.conf")
     )
     assert not bridge._cmdline_matches_runtime(
         ("/usr/bin/python", f"--config_file={matching_config}")
@@ -850,11 +1053,11 @@ def test_bridge_stale_cleanup_targets_only_matching_processes(tmp_path: Path, mo
     bridge = GnssSdrBridge(cfg, _loggers())
     matching = _GnssSdrProcessInfo(
         pid=101,
-        cmdline=("/home/qvise/antijamming/gnss-sdr/install/gnss-sdr", f"--config_file={bridge._config_path}"),
+        cmdline=("/repo/antijamming/gnss-sdr/install/gnss-sdr", f"--config_file={bridge._config_path}"),
     )
     unrelated = _GnssSdrProcessInfo(
         pid=202,
-        cmdline=("/home/qvise/other/gnss-sdr", "--config_file=/home/qvise/other/fifo.conf"),
+        cmdline=("/repo/other/gnss-sdr", "--config_file=/repo/other/fifo.conf"),
     )
     terminated: list[int] = []
 
@@ -878,7 +1081,6 @@ def test_bridge_drain_stdout_writes_clean_console_log_parses_and_stays_quiet_by_
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
-        gnss_sdr_echo_stdout=False,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
     bridge._runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -895,30 +1097,6 @@ def test_bridge_drain_stdout_writes_clean_console_log_parses_and_stays_quiet_by_
     assert capsys.readouterr().out == ""
 
 
-def test_bridge_drain_stdout_can_echo_clean_console_lines(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    cfg = StreamConfig(
-        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
-        gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
-        gnss_sdr_echo_stdout=True,
-    )
-    bridge = GnssSdrBridge(cfg, _loggers())
-    bridge._runtime_dir.mkdir(parents=True, exist_ok=True)
-    bridge._proc = object()  # type: ignore[assignment]
-    bridge._stdout_handle = io.StringIO("Current receiver time: 13 s\n")
-
-    bridge._drain_stdout()
-
-    assert bridge._console_log_path.read_text(encoding="utf-8") == (
-        "Current receiver time: 13 s\n"
-    )
-    assert bridge._receiver_log_path.read_text(encoding="utf-8") == ""
-    assert bridge.snapshot()["receiver_time_s"] == 13
-    assert capsys.readouterr().out == "Current receiver time: 13 s\n"
-
-
 def test_bridge_drain_stdout_normalizes_carriage_return_console_records(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -926,7 +1104,6 @@ def test_bridge_drain_stdout_normalizes_carriage_return_console_records(
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
-        gnss_sdr_echo_stdout=True,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
     bridge._runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -944,10 +1121,10 @@ def test_bridge_drain_stdout_normalizes_carriage_return_console_records(
     )
     assert bridge._console_log_path.read_text(encoding="utf-8") == expected
     assert bridge._receiver_log_path.read_text(encoding="utf-8") == ""
-    assert capsys.readouterr().out == expected
+    assert capsys.readouterr().out == ""
     snapshot = bridge.snapshot()
     assert snapshot["receiver_time_s"] == 14
-    assert snapshot["tracking_prns"] == [13]
+    assert snapshot["tracking_satellites"] == ["G13"]
 
 
 def test_bridge_drain_stdout_routes_glog_diagnostics_to_receiver_log(
@@ -961,7 +1138,6 @@ def test_bridge_drain_stdout_routes_glog_diagnostics_to_receiver_log(
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
-        gnss_sdr_echo_stdout=True,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
     bridge._runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -983,7 +1159,6 @@ def test_bridge_routes_solver_diagnostics_and_fragments_out_of_console_log(
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
-        gnss_sdr_echo_stdout=True,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
     bridge._runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1005,7 +1180,7 @@ def test_bridge_routes_solver_diagnostics_and_fragments_out_of_console_log(
     assert "5)\n" in receiver_log
     assert "RTKLIB_PVT_RESIDUAL_SUMMARY tow_s=123.000" in receiver_log
     assert bridge.snapshot()["receiver_time_s"] == 350
-    assert capsys.readouterr().out == "Current receiver time: 5 min 50 s\n"
+    assert capsys.readouterr().out == ""
 
 
 def test_bridge_parses_receiver_time_after_one_hour(tmp_path: Path) -> None:
@@ -1031,14 +1206,13 @@ def test_bridge_renders_fifo_config_with_runtime_paths(tmp_path: Path) -> None:
 
     cfg = StreamConfig(
         sample_rate=8e6,
-        gnss_shared_u1_phase_compensation_enabled=False,
         gnss_sdr_config_template=template_path,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
     )
     bridge = GnssSdrBridge(cfg, _loggers())
-    rendered = bridge._render_config()
+    rendered = _render_config_for_test(bridge)
 
-    assert str(cfg.gnss_sdr_runtime_dir / "gnss_iq.fifo") in rendered
+    assert str(cfg.gnss_sdr_runtime_dir / "gnss_iq_channel_00.fifo") in rendered
     assert "GNSS-SDR.internal_fs_sps=8000000" in rendered
     assert "PVT.dump_filename=outputs/PVT" in rendered
     assert f"SignalSource.sample_type={cfg.gnss_sdr_sample_type}" in rendered
@@ -1047,29 +1221,29 @@ def test_bridge_renders_fifo_config_with_runtime_paths(tmp_path: Path) -> None:
 def test_bridge_fifo_config_derives_gps_l1_filter_at_4mhz(tmp_path: Path) -> None:
     cfg = StreamConfig(
         sample_rate=4e6,
-        gnss_shared_u1_phase_compensation_enabled=False,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
     )
     bridge = GnssSdrBridge(cfg, _loggers())
 
-    rendered = bridge._render_config()
+    rendered = _render_config_for_test(bridge)
 
-    assert "SignalSource.implementation=Fifo_Signal_Source" in rendered
-    assert "SignalSource.dump_filename=./outputs/signal_source/signal_source.dat" in rendered
+    assert "SignalSource0.implementation=Fifo_Signal_Source" in rendered
+    assert "GNSS-SDR.num_sources=10" in rendered
+    assert "SignalSource0.dump_filename=./outputs/signal_source/signal_source_channel_00.dat" in rendered
     assert "GNSS-SDR.internal_fs_sps=4000000" in rendered
-    assert "SignalConditioner.implementation=Signal_Conditioner" in rendered
-    assert "DataTypeAdapter.implementation=Pass_Through" in rendered
-    assert "DataTypeAdapter.item_type=gr_complex" in rendered
-    assert "InputFilter.implementation=Freq_Xlating_Fir_Filter" in rendered
-    assert "InputFilter.number_of_taps=" not in rendered
-    assert "InputFilter.dump_filename=./outputs/signal_conditioner/input_filter.dat" in rendered
-    assert "InputFilter.filter_type=lowpass" in rendered
-    assert "InputFilter.bw=1385000" in rendered
-    assert "InputFilter.tw=175000" in rendered
-    assert "InputFilter.IF=0" in rendered
-    assert "InputFilter.decimation_factor=1" in rendered
-    assert "Resampler.sample_freq_in=4000000" in rendered
-    assert "Resampler.dump_filename=./outputs/signal_conditioner/resampler.dat" in rendered
+    assert "SignalConditioner0.implementation=Signal_Conditioner" in rendered
+    assert "DataTypeAdapter0.implementation=Pass_Through" in rendered
+    assert "DataTypeAdapter0.item_type=gr_complex" in rendered
+    assert "InputFilter0.implementation=Freq_Xlating_Fir_Filter" in rendered
+    assert "InputFilter0.number_of_taps=" not in rendered
+    assert "InputFilter0.dump_filename=./outputs/signal_conditioner/input_filter_channel_00.dat" in rendered
+    assert "InputFilter0.filter_type=lowpass" in rendered
+    assert "InputFilter0.bw=1385000" in rendered
+    assert "InputFilter0.tw=175000" in rendered
+    assert "InputFilter0.IF=0" in rendered
+    assert "InputFilter0.decimation_factor=1" in rendered
+    assert "Resampler0.sample_freq_in=4000000" in rendered
+    assert "Resampler0.dump_filename=./outputs/signal_conditioner/resampler_channel_00.dat" in rendered
     assert "PVT.output_path=./outputs/pvt" in rendered
     assert "PVT.dump_filename=pvt" in rendered
     assert bridge.input_filter_bandwidth_hz == 2_600_000.0
@@ -1115,16 +1289,15 @@ def test_bridge_archives_exact_pid_scoped_gnss_runtime_artifacts(tmp_path: Path)
 def test_bridge_gps_l1_filter_keeps_physical_bandwidth_when_rate_changes(tmp_path: Path) -> None:
     cfg = StreamConfig(
         sample_rate=8e6,
-        gnss_shared_u1_phase_compensation_enabled=False,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
     )
     bridge = GnssSdrBridge(cfg, _loggers())
 
-    rendered = bridge._render_config()
+    rendered = _render_config_for_test(bridge)
 
-    assert "InputFilter.number_of_taps=" not in rendered
-    assert "InputFilter.bw=1385000" in rendered
-    assert "InputFilter.tw=175000" in rendered
+    assert "InputFilter0.number_of_taps=" not in rendered
+    assert "InputFilter0.bw=1385000" in rendered
+    assert "InputFilter0.tw=175000" in rendered
     assert bridge.input_filter_bandwidth_hz == 2_600_000.0
 
 
@@ -1136,7 +1309,18 @@ def test_bridge_gps_l1_filter_rejects_rate_below_stopband(tmp_path: Path) -> Non
     bridge = GnssSdrBridge(cfg, _loggers())
 
     with pytest.raises(ValueError, match="cannot place the GPS L1 input-filter stopband"):
-        bridge._render_config()
+        _render_config_for_test(bridge)
+
+
+def test_bridge_rejects_non_l1_center_for_zero_if_receiver(tmp_path: Path) -> None:
+    cfg = StreamConfig(
+        center_freq_hz=1_585_000_000.0,
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    with pytest.raises(ValueError, match="must equal the GPS L1 C/A carrier"):
+        _render_config_for_test(bridge)
 
 
 def test_bridge_gps_l1_filter_auto_design_meets_response_limits() -> None:
@@ -1182,7 +1366,7 @@ def test_bridge_renders_default_gps_l1_baseline_settings(tmp_path: Path) -> None
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_1c_channel_count=10,
-        gnss_channels_in_acquisition=30,
+        gnss_channels_in_acquisition=10,
         gnss_acquisition_pfa=0.01,
         gnss_acquisition_doppler_max_hz=5000,
         gnss_acquisition_doppler_step_hz=500,
@@ -1265,7 +1449,7 @@ def test_bridge_forces_gnss_sdr_dumps_off(tmp_path: Path) -> None:
     cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
     bridge = GnssSdrBridge(cfg, _loggers())
 
-    rendered = bridge._render_config()
+    rendered = _render_config_for_test(bridge)
 
     assert "Tracking_1C.dump=false" in rendered
     assert "PVT.dump=false" in rendered
@@ -1308,7 +1492,6 @@ def test_bridge_tracks_gps_and_beidou_prns_without_number_collision(tmp_path: Pa
     assert beidou["constellation"] == "beidou"
     assert beidou["used_in_fix"] is True
     assert snapshot["prns"][1]["cno_db_hz"] == 39.5
-    assert snapshot["used_in_fix_prns"] == [12]
     assert snapshot["used_in_fix_satellites"] == ["C12"]
 
 
@@ -1328,8 +1511,17 @@ def test_bridge_reports_constellation_labels_for_duplicate_used_pvt_prns(tmp_pat
     snapshot = bridge.snapshot()
 
     assert snapshot["used_in_fix_count"] == 2
-    assert snapshot["used_in_fix_prns"] == [5, 5]
     assert snapshot["used_in_fix_satellites"] == ["G05", "C05"]
+    assert {
+        "tracking_prns",
+        "stable_tracking_prns",
+        "pending_tracking_prns",
+        "unstable_tracking_prns",
+        "acquired_prns",
+        "assigned_prns",
+        "lost_prns",
+        "used_in_fix_prns",
+    }.isdisjoint(snapshot)
     assert [
         (entry.get("satellite_id", f"G{entry['prn']:02d}"), entry["used_in_fix"])
         for entry in snapshot["prns"]
@@ -1410,7 +1602,14 @@ def test_bridge_snapshot_tracks_prn_states_from_gnss_sdr_lines(tmp_path: Path) -
     assert snapshot["lost_count"] == 1
     assert snapshot["receiver_time_s"] == 12
     assert snapshot["prns"] == [
-        {"prn": 14, "channel": 0, "state": "lost", "used_in_fix": False}
+        {
+            "constellation": "gps",
+            "prn": 14,
+            "satellite_id": "G14",
+            "channel": 0,
+            "state": "lost",
+            "used_in_fix": False,
+        }
     ]
 
 
@@ -1436,15 +1635,15 @@ def test_bridge_console_tracking_start_keeps_cno_visible_after_pvt_lock(tmp_path
     prn = snapshot["prns"][0]
 
     assert snapshot["pvt_current"] is True
-    assert snapshot["tracking_prns"] == [8]
+    assert snapshot["tracking_satellites"] == ["G08"]
     assert prn["state"] == "tracking"
     assert prn["used_in_fix"] is True
     assert prn["cno_db_hz"] == pytest.approx(38.0)
     assert prn["cno_stable"] is True
     assert prn["cno_unstable_reason"] == ""
-    assert snapshot["stable_tracking_prns"] == [8]
-    assert snapshot["pending_tracking_prns"] == []
-    assert snapshot["unstable_tracking_prns"] == []
+    assert snapshot["stable_tracking_satellites"] == ["G08"]
+    assert snapshot["pending_tracking_satellites"] == []
+    assert snapshot["unstable_tracking_satellites"] == []
 
 
 def test_bridge_parses_bit_sync_lock_as_tracking_state(tmp_path: Path) -> None:
@@ -1458,10 +1657,12 @@ def test_bridge_parses_bit_sync_lock_as_tracking_state(tmp_path: Path) -> None:
 
     snapshot = bridge.snapshot()
 
-    assert snapshot["tracking_prns"] == [25]
+    assert snapshot["tracking_satellites"] == ["G25"]
     assert snapshot["prns"] == [
         {
+            "constellation": "gps",
             "prn": 25,
+            "satellite_id": "G25",
             "channel": 7,
             "state": "tracking",
             "cno_smoothed_db_hz": None,
@@ -1479,7 +1680,7 @@ def test_bridge_parses_bit_sync_lock_as_tracking_state(tmp_path: Path) -> None:
             "used_in_fix": False,
         }
     ]
-    assert snapshot["pending_tracking_prns"] == [25]
+    assert snapshot["pending_tracking_satellites"] == ["G25"]
 
 
 def test_bridge_parses_nav_message_cn0_as_current_tracking_sample(tmp_path: Path) -> None:
@@ -1494,7 +1695,7 @@ def test_bridge_parses_nav_message_cn0_as_current_tracking_sample(tmp_path: Path
     snapshot = bridge.snapshot()
     prn = snapshot["prns"][0]
 
-    assert snapshot["tracking_prns"] == [29]
+    assert snapshot["tracking_satellites"] == ["G29"]
     assert prn["state"] == "tracking"
     assert prn["channel"] == 3
     assert prn["cno_db_hz"] == pytest.approx(38.73)
@@ -1504,8 +1705,8 @@ def test_bridge_parses_nav_message_cn0_as_current_tracking_sample(tmp_path: Path
     assert prn["cno_history_stable"] is False
     assert prn["cno_stable"] is False
     assert prn["cno_unstable_reason"] == "too_few_samples"
-    assert snapshot["stable_tracking_prns"] == []
-    assert snapshot["pending_tracking_prns"] == [29]
+    assert snapshot["stable_tracking_satellites"] == []
+    assert snapshot["pending_tracking_satellites"] == ["G29"]
 
 
 def test_bridge_marks_console_position_lines_as_current_pvt(tmp_path: Path) -> None:
@@ -1544,7 +1745,9 @@ def test_bridge_surfaces_negative_acquisition_decisions_as_searched_prns(tmp_pat
 
     assert snapshot["prns"] == [
         {
+            "constellation": "gps",
             "prn": 9,
+            "satellite_id": "G09",
             "channel": -1,
             "state": "searched",
             "acq_test_statistic": 21.874,
@@ -1552,7 +1755,9 @@ def test_bridge_surfaces_negative_acquisition_decisions_as_searched_prns(tmp_pat
             "used_in_fix": False,
         },
         {
+            "constellation": "gps",
             "prn": 15,
+            "satellite_id": "G15",
             "channel": -1,
             "state": "acquired",
             "acq_test_statistic": 41.2,
@@ -1560,7 +1765,7 @@ def test_bridge_surfaces_negative_acquisition_decisions_as_searched_prns(tmp_pat
             "used_in_fix": False,
         },
     ]
-    assert snapshot["acquired_prns"] == [15]
+    assert snapshot["acquired_satellites"] == ["G15"]
 
 
 def test_bridge_keeps_gsv_snr_separate_from_tracking_cno(tmp_path: Path) -> None:
@@ -1574,7 +1779,9 @@ def test_bridge_keeps_gsv_snr_separate_from_tracking_cno(tmp_path: Path) -> None
 
     assert snapshot["sky_prns"] == [
         {
+            "constellation": "gps",
             "prn": 11,
+            "satellite_id": "G11",
             "az_deg": 10.0,
             "el_deg": 30.0,
             "snr_db_hz": 37.0,
@@ -1585,7 +1792,9 @@ def test_bridge_keeps_gsv_snr_separate_from_tracking_cno(tmp_path: Path) -> None
     ]
     assert snapshot["prns"] == [
         {
+            "constellation": "gps",
             "prn": 11,
+            "satellite_id": "G11",
             "channel": 0,
             "state": "assigned",
             "az_deg": 10.0,
@@ -1671,7 +1880,7 @@ def test_bridge_does_not_create_sky_geometry_for_tracking_only_prn(tmp_path: Pat
     )
     snapshot = bridge.snapshot()
 
-    assert snapshot["tracking_prns"] == [12]
+    assert snapshot["tracking_satellites"] == ["G12"]
     assert snapshot["sky_prns"] == []
     assert snapshot["sky_geometry_count"] == 0
 
@@ -1821,8 +2030,8 @@ def test_bridge_marks_tracking_cno_unstable_until_window_is_full(tmp_path: Path)
     assert prn["telemetry_confirmed"] is False
     assert prn["cno_stable"] is False
     assert prn["cno_unstable_reason"] == "too_few_samples"
-    assert snapshot["stable_tracking_prns"] == []
-    assert snapshot["pending_tracking_prns"] == [8]
+    assert snapshot["stable_tracking_satellites"] == []
+    assert snapshot["pending_tracking_satellites"] == ["G08"]
 
 
 def test_bridge_smooth_tracking_cno_waits_for_decoded_nav_message(tmp_path: Path) -> None:
@@ -1847,8 +2056,8 @@ def test_bridge_smooth_tracking_cno_waits_for_decoded_nav_message(tmp_path: Path
     assert prn["telemetry_confirmed"] is False
     assert prn["cno_stable"] is False
     assert prn["cno_unstable_reason"] == "awaiting_nav"
-    assert snapshot["pending_tracking_prns"] == [8]
-    assert snapshot["stable_tracking_prns"] == []
+    assert snapshot["pending_tracking_satellites"] == ["G08"]
+    assert snapshot["stable_tracking_satellites"] == []
 
 
 def test_bridge_marks_tracking_cno_stable_after_required_close_windows(tmp_path: Path) -> None:
@@ -1902,8 +2111,8 @@ def test_bridge_keeps_cno_qualified_prn_visible_when_nav_is_confirmed(tmp_path: 
     assert prn["carrier_lock_threshold"] == PRN_CARRIER_LOCK_THRESHOLD
     assert prn["cno_stable"] is True
     assert prn["cno_unstable_reason"] == ""
-    assert snapshot["unstable_tracking_prns"] == []
-    assert snapshot["stable_tracking_prns"] == [8]
+    assert snapshot["unstable_tracking_satellites"] == []
+    assert snapshot["stable_tracking_satellites"] == ["G08"]
 
 
 def test_bridge_rejects_tracking_cno_below_twenty_five_db_hz(tmp_path: Path) -> None:
@@ -1925,8 +2134,8 @@ def test_bridge_rejects_tracking_cno_below_twenty_five_db_hz(tmp_path: Path) -> 
     assert prn["carrier_lock_test"] is None
     assert prn["cno_stable"] is False
     assert prn["cno_unstable_reason"] == "low_cno"
-    assert snapshot["unstable_tracking_prns"] == [8]
-    assert snapshot["stable_tracking_prns"] == []
+    assert snapshot["unstable_tracking_satellites"] == ["G08"]
+    assert snapshot["stable_tracking_satellites"] == []
 
 
 def test_bridge_keeps_pvt_used_prn_visible_when_latest_cno_dips(tmp_path: Path) -> None:
@@ -1959,8 +2168,8 @@ def test_bridge_keeps_pvt_used_prn_visible_when_latest_cno_dips(tmp_path: Path) 
     assert prn["carrier_lock_test"] is None
     assert prn["cno_stable"] is True
     assert prn["cno_unstable_reason"] == ""
-    assert snapshot["stable_tracking_prns"] == [8]
-    assert snapshot["unstable_tracking_prns"] == []
+    assert snapshot["stable_tracking_satellites"] == ["G08"]
+    assert snapshot["unstable_tracking_satellites"] == []
 
 
 def test_bridge_rejects_high_variance_tracking_cno(tmp_path: Path) -> None:
@@ -1981,8 +2190,8 @@ def test_bridge_rejects_high_variance_tracking_cno(tmp_path: Path) -> None:
     assert prn["carrier_lock_test"] is None
     assert prn["cno_stable"] is False
     assert prn["cno_unstable_reason"] == "high_variance"
-    assert snapshot["unstable_tracking_prns"] == [8]
-    assert snapshot["stable_tracking_prns"] == []
+    assert snapshot["unstable_tracking_satellites"] == ["G08"]
+    assert snapshot["stable_tracking_satellites"] == []
 
 
 def test_bridge_rejects_high_peak_to_peak_tracking_cno(tmp_path: Path) -> None:
@@ -2003,8 +2212,8 @@ def test_bridge_rejects_high_peak_to_peak_tracking_cno(tmp_path: Path) -> None:
     assert prn["carrier_lock_test"] is None
     assert prn["cno_stable"] is False
     assert prn["cno_unstable_reason"] == "high_variance"
-    assert snapshot["unstable_tracking_prns"] == [8]
-    assert snapshot["stable_tracking_prns"] == []
+    assert snapshot["unstable_tracking_satellites"] == ["G08"]
+    assert snapshot["stable_tracking_satellites"] == []
 
 
 def test_bridge_loss_of_lock_clears_tracking_cno_stability(tmp_path: Path) -> None:
@@ -2058,7 +2267,6 @@ def test_bridge_tracking_monitor_prn_moves_channel_assignment(tmp_path: Path) ->
 def test_bridge_pvt_output_seen_requires_pvt_monitor_udp(tmp_path: Path) -> None:
     cfg = StreamConfig(gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path))
     bridge = GnssSdrBridge(cfg, _loggers())
-    bridge._session_epoch_s = 1.0
     bridge._tracking_outputs_dir.mkdir(parents=True, exist_ok=True)
     bridge._pvt_outputs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2092,7 +2300,6 @@ def test_bridge_reads_pvt_monitor_udp_for_accuracy_and_valid_sat_count(tmp_path:
         gnss_truth_static_alt_m=540.0,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
-    bridge._session_epoch_s = 1.0
     bridge._handle_monitor_pvt_message(
         _monitor_pvt_message(
             lat_deg=33.684405,
@@ -2159,7 +2366,6 @@ def test_bridge_reads_observables_monitor_udp_into_snapshot_and_prn_fields(tmp_p
         gnss_1c_channel_count=1,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
-    bridge._session_epoch_s = 1.0
     bridge._handle_runtime_line(
         "Pull-in: Number of samples between Acquisition and Tracking = 1303 "
         "( 0.00032575 s)for satellite GPS PRN 9 (Block III) in channel 0"
@@ -2181,7 +2387,7 @@ def test_bridge_reads_observables_monitor_udp_into_snapshot_and_prn_fields(tmp_p
     assert snapshot["valid_observables_count"] == 1
     assert snapshot["avg_observable_cno_db_hz"] == pytest.approx(43.25)
     assert snapshot["avg_tracking_cno_db_hz"] is None
-    assert snapshot["stable_tracking_prns"] == []
+    assert snapshot["stable_tracking_satellites"] == []
     observable = snapshot["observables"][0]
     assert observable["satellite_id"] == "G09"
     assert observable["channel_id"] == 0
@@ -2339,64 +2545,29 @@ def test_bridge_reset_runtime_dir_clears_runtime_and_separate_glog_dir(tmp_path:
     assert list(log_dir.iterdir()) == []
 
 
-def test_bridge_reset_runtime_dir_falls_back_after_root_owned_path(
+def test_bridge_reset_runtime_dir_reports_unwritable_configured_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configured_runtime = tmp_path / "configured" / "runtime"
     configured_log = tmp_path / "configured" / "glog"
-    fallback_runtime = tmp_path / "user-runtime"
     bridge = GnssSdrBridge(
         StreamConfig(
-            gnss_shared_u1_phase_compensation_enabled=False,
             gnss_sdr_runtime_dir=configured_runtime,
             gnss_sdr_log_dir=configured_log,
         ),
         _loggers(),
     )
-    original_clear = bridge._clear_dir
-
     def reject_configured_runtime(path: Path) -> None:
         if path == configured_runtime.resolve():
             raise PermissionError(errno.EACCES, "Permission denied", str(path / "tracking"))
-        original_clear(path)
 
     monkeypatch.setattr(bridge, "_clear_dir", reject_configured_runtime)
-    monkeypatch.setattr(bridge, "_runtime_fallback_dir", lambda: fallback_runtime)
 
-    bridge._reset_runtime_dir()
+    with pytest.raises(PermissionError, match="Permission denied"):
+        bridge._reset_runtime_dir()
 
-    assert bridge._runtime_dir == fallback_runtime.resolve()
-    assert bridge._log_dir == (fallback_runtime / "glog").resolve()
-    assert bridge._fifo_path == fallback_runtime.resolve() / "gnss_iq.fifo"
-    assert bridge._config_path == fallback_runtime.resolve() / "fifo_gps_l1.conf"
-    assert bridge._outputs_dir == fallback_runtime.resolve() / "outputs"
-    assert bridge._tracking_outputs_dir == fallback_runtime.resolve() / "outputs" / "tracking"
-    assert bridge._receiver_log_path == (fallback_runtime / "glog" / "receiver.log").resolve()
-    assert fallback_runtime.is_dir()
-    assert (fallback_runtime / "glog").is_dir()
-
-
-def test_bridge_session_glog_scan_uses_log_dir(tmp_path: Path) -> None:
-    template_path = tmp_path / "fifo.conf.template"
-    template_path.write_text(
-        "SignalSource.filename={fifo_path}\n"
-        "GNSS-SDR.internal_fs_sps={internal_fs_sps}\n",
-        encoding="utf-8",
-    )
-    runtime_dir = tmp_path / "runtime" / "gnss-sdr"
-    log_dir = tmp_path / "logs" / "gnss-sdr"
-    log_dir.mkdir(parents=True)
-    cfg = StreamConfig(
-        gnss_sdr_config_template=template_path,
-        gnss_sdr_runtime_dir=runtime_dir,
-        gnss_sdr_log_dir=log_dir,
-    )
-    bridge = GnssSdrBridge(cfg, _loggers())
-    bridge._session_epoch_s = time.time()
-    glog_path = log_dir / "gnss-sdr.test.INFO.1"
-    glog_path.write_text("Current receiver time: 3 s\n", encoding="utf-8")
-
-    assert bridge._latest_session_glog_path() == glog_path
+    assert bridge._runtime_dir == configured_runtime.resolve()
+    assert bridge._log_dir == configured_log.resolve()
 
 
 class _FakeBridge:
@@ -2407,8 +2578,19 @@ class _FakeBridge:
     def active(self) -> bool:
         return True
 
-    def stop(self, reason: str = "normal stop") -> None:
+    def stop(self, reason: str = "normal stop") -> bool:
         self.stop_reasons.append(reason)
+        return True
+
+
+class _RetryingStopBridge(_FakeBridge):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = int(failures)
+
+    def stop(self, reason: str = "normal stop") -> bool:
+        self.stop_reasons.append(reason)
+        return len(self.stop_reasons) > self.failures
 
 
 class _FailingWriteBridge(_FakeBridge):
@@ -2427,10 +2609,17 @@ class _FakeOverflowDevice:
         self.channels = channels
         self.stopped = False
 
-    def recv_chunk(self) -> tuple[object, str]:
+    def recv_chunk(self) -> RxChunkResult:
         import numpy as np
 
-        return np.zeros((self.channels, 0), dtype=np.complex64), "overflow"
+        return RxChunkResult(
+            chunk=np.zeros((self.channels, 0), dtype=np.complex64),
+            state="overflow",
+            got_samples=0,
+            error_code="overflow",
+            out_of_sequence=False,
+            time_spec_s=None,
+        )
 
     def stop(self) -> None:
         self.stopped = True
@@ -2441,27 +2630,47 @@ class _FakeOneChunkDevice:
         self._runtime = runtime
         self._chunk = chunk
         self.stopped = False
+        self.recv_calls = 0
 
-    def recv_chunk(self) -> tuple[np.ndarray, str]:
-        self._runtime._running = False
-        return self._chunk, "ok"
+    def recv_chunk(self) -> RxChunkResult:
+        self.recv_calls += 1
+        chunk = self._chunk
+        if self.recv_calls > 1:
+            self._runtime._running = False
+            chunk = self._chunk[:, :0]
+        return RxChunkResult(
+            chunk=chunk,
+            state="ok",
+            got_samples=int(chunk.shape[1]),
+            error_code="none",
+            out_of_sequence=False,
+            time_spec_s=None,
+        )
 
     def stop(self) -> None:
         self.stopped = True
 
 
-class _FakePausableDevice:
+class _FakeStoppableDevice:
     def __init__(self) -> None:
-        self.paused = False
         self.stopped = False
         self.stop_calls = 0
-
-    def pause_stream(self) -> None:
-        self.paused = True
 
     def stop(self) -> None:
         self.stopped = True
         self.stop_calls += 1
+
+
+class _FailingCleanupDevice(_FakeStoppableDevice):
+    def __init__(self, *, stop_failures: int = 0) -> None:
+        super().__init__()
+        self.stop_failures = stop_failures
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        if self.stop_calls <= self.stop_failures:
+            raise RuntimeError("synthetic stop failure")
+        self.stopped = True
 
 
 class _FakeStartupDevice:
@@ -2472,7 +2681,7 @@ class _FakeStartupDevice:
         self.restarted = False
         self.stopped = False
 
-    def recv_chunk(self) -> tuple[object, str]:
+    def recv_chunk(self) -> RxChunkResult:
         import numpy as np
 
         self.recv_count += 1
@@ -2483,10 +2692,35 @@ class _FakeStartupDevice:
                 raise self.error
         if self.error is not None:
             raise self.error
-        return np.zeros((self.channels, 8), dtype=np.complex64), "ok"
+        return RxChunkResult(
+            chunk=np.zeros((self.channels, 8), dtype=np.complex64),
+            state="ok",
+            got_samples=8,
+            error_code="none",
+            out_of_sequence=False,
+            time_spec_s=None,
+        )
 
     def restart_stream(self) -> None:
         self.restarted = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class _FakeFixedResultDevice:
+    def __init__(self, result: RxChunkResult) -> None:
+        self.result = result
+        self.recv_count = 0
+        self.restart_count = 0
+        self.stopped = False
+
+    def recv_chunk(self) -> RxChunkResult:
+        self.recv_count += 1
+        return self.result
+
+    def restart_stream(self) -> None:
+        self.restart_count += 1
 
     def stop(self) -> None:
         self.stopped = True
@@ -2502,29 +2736,89 @@ def test_backend_stop_calls_gnss_bridge_stop() -> None:
     assert bridge.stop_reasons == ["normal stop"]
 
 
-def test_backend_preserved_usrp_stop_pauses_reusable_device() -> None:
-    statuses: list[str] = []
-    runtime = BackendRuntime(
-        StreamConfig(preserve_usrp_session_on_stop=True),
-        _runtime_loggers(),
-        on_status=statuses.append,
+def test_backend_retains_gnss_bridge_owner_until_cleanup_retry_succeeds() -> None:
+    runtime = BackendRuntime(StreamConfig(), _runtime_loggers())
+    bridge = _RetryingStopBridge(failures=1)
+    runtime._gnss_bridge = bridge  # type: ignore[assignment]
+
+    assert runtime._finalize_gnss_bridge("first stop") is False
+    assert runtime._gnss_bridge is bridge
+    assert runtime._gnss_bridge_cleanup_failed is True
+
+    assert runtime._finalize_gnss_bridge("retry stop") is True
+    assert runtime._gnss_bridge is None
+    assert runtime._gnss_bridge_cleanup_failed is False
+    assert bridge.stop_reasons == ["first stop", "retry stop"]
+
+
+def test_bridge_stop_retains_live_stdout_thread_until_retry(tmp_path: Path) -> None:
+    class DelayedThread:
+        ident = 1
+        name = "delayed-stdout-test"
+
+        def __init__(self) -> None:
+            self.live = True
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return self.live
+
+    cfg = StreamConfig(
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+        gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
     )
-    device = _FakePausableDevice()
-    runtime._device = device  # type: ignore[assignment]
+    bridge = GnssSdrBridge(cfg, _loggers())
+    thread = DelayedThread()
+    bridge._stdout_thread = thread  # type: ignore[assignment]
 
-    runtime.stop("normal stop")
+    assert bridge.stop("first stop") is False
+    assert bridge._stdout_thread is thread
 
-    assert device.paused is True
-    assert device.stopped is False
-    assert statuses == ["Stopping USRP stream"]
+    thread.live = False
+    assert bridge.stop("retry stop") is True
+    assert bridge._stdout_thread is None
+
+
+def test_bridge_stop_retains_unverified_process_until_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class StubbornProcess:
+        pid = 987654
+        returncode = None
+
+        def __init__(self) -> None:
+            self.live = True
+
+        def poll(self):
+            return None if self.live else 0
+
+    cfg = StreamConfig(
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+        gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+    process = StubbornProcess()
+    bridge._proc = process  # type: ignore[assignment]
+    monkeypatch.setattr(
+        bridge,
+        "_terminate_process_group_or_process",
+        lambda _pid: (_ for _ in ()).throw(OSError("synthetic terminate failure")),
+    )
+
+    assert bridge.stop("first stop") is False
+    assert bridge._proc is process
+
+    process.live = False
+    assert bridge.stop("retry stop") is True
+    assert bridge._proc is None
 
 
 def test_backend_finalizer_stops_and_detaches_device_after_exception() -> None:
-    runtime = BackendRuntime(
-        StreamConfig(preserve_usrp_session_on_stop=False),
-        _runtime_loggers(),
-    )
-    device = _FakePausableDevice()
+    runtime = BackendRuntime(StreamConfig(), _runtime_loggers())
+    device = _FakeStoppableDevice()
     runtime._device = device  # type: ignore[assignment]
 
     runtime._finalize_usrp_device()
@@ -2534,19 +2828,22 @@ def test_backend_finalizer_stops_and_detaches_device_after_exception() -> None:
     assert runtime._device is None
 
 
-def test_backend_finalizer_pauses_and_retains_preserved_device() -> None:
-    runtime = BackendRuntime(
-        StreamConfig(preserve_usrp_session_on_stop=True),
-        _runtime_loggers(),
-    )
-    device = _FakePausableDevice()
+def test_backend_failed_usrp_stop_retains_owner_until_retry_succeeds() -> None:
+    runtime = BackendRuntime(StreamConfig(), _runtime_loggers())
+    device = _FailingCleanupDevice(stop_failures=1)
     runtime._device = device  # type: ignore[assignment]
 
     runtime._finalize_usrp_device()
 
-    assert device.paused is True
-    assert device.stopped is False
     assert runtime._device is device
+    assert runtime._device_cleanup_failed is True
+
+    runtime._finalize_usrp_device()
+
+    assert device.stopped is True
+    assert device.stop_calls == 2
+    assert runtime._device is None
+    assert runtime._device_cleanup_failed is False
 
 
 def test_backend_join_retains_live_thread_reference_until_exit() -> None:
@@ -2569,6 +2866,26 @@ def test_backend_join_retains_live_thread_reference_until_exit() -> None:
     release.set()
     worker.join(timeout=1.0)
     assert runtime._join_owned_thread("_rx_thread", timeout_s=0.1) is True
+
+
+def test_backend_retains_handoff_dependencies_when_consumer_misses_join(
+    monkeypatch,
+) -> None:
+    runtime = BackendRuntime(StreamConfig(), _runtime_loggers())
+    raw_queue: queue.Queue = queue.Queue(maxsize=2)
+    phase_bank = object()
+    runtime._gnss_raw_queue = raw_queue
+    runtime._gnss_handoff_thread = object()  # type: ignore[assignment]
+    runtime._shared_u1_phase_bank = phase_bank  # type: ignore[assignment]
+    runtime._shared_u1_desired_vectors_cache = {"G01": {}}
+    runtime._shared_u1_source_satellites_cache = (1,)
+    monkeypatch.setattr(runtime, "_join_owned_thread", lambda *_args, **_kwargs: False)
+
+    assert runtime._finalize_gnss_handoff_owners() is False
+    assert runtime._gnss_raw_queue is raw_queue
+    assert runtime._shared_u1_phase_bank is phase_bank
+    assert runtime._shared_u1_desired_vectors_cache == {"G01": {}}
+    assert runtime._shared_u1_source_satellites_cache == (1,)
     assert runtime._rx_thread is None
 
 
@@ -2579,7 +2896,7 @@ def test_backend_dsp_stage_exception_enters_failed_stop() -> None:
         _runtime_loggers(),
         on_failed=failures.append,
     )
-    device = _FakePausableDevice()
+    device = _FakeStoppableDevice()
     runtime._device = device  # type: ignore[assignment]
     runtime._running = True
 
@@ -2634,7 +2951,14 @@ def test_backend_exception_stops_blocking_device_before_rx_join(
         def recv_chunk(self):
             self.recv_calls += 1
             if self.recv_calls == 1:
-                return np.zeros((4, 8), dtype=np.complex64), "ok"
+                return RxChunkResult(
+                    chunk=np.zeros((4, 8), dtype=np.complex64),
+                    state="ok",
+                    got_samples=8,
+                    error_code="none",
+                    out_of_sequence=False,
+                    time_spec_s=None,
+                )
             recv_entered.set()
             assert stop_requested.wait(2.0)
             events.append("recv_exited")
@@ -2653,12 +2977,15 @@ def test_backend_exception_stops_blocking_device_before_rx_join(
         StreamConfig(
             log_dir=tmp_path,
             gnss_sdr_enable=False,
-            preserve_usrp_session_on_stop=False,
             samples_per_chunk=8,
         ),
         _runtime_loggers(),
     )
-    runtime._device = BlockingAfterStartupProbe()  # type: ignore[assignment]
+    device = BlockingAfterStartupProbe()
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.UsrpRxDevice",
+        lambda _config: device,
+    )
     monkeypatch.setattr(
         "antijamming.runtime.backend.collect_host_transport_report",
         lambda _address: [],
@@ -2691,6 +3018,138 @@ def test_backend_exception_stops_blocking_device_before_rx_join(
     assert runtime._device is None
 
 
+def test_backend_rx_exception_during_requested_stop_is_not_a_new_failure() -> None:
+    failures: list[str] = []
+    runtime = BackendRuntime(
+        StreamConfig(),
+        _runtime_loggers(),
+        on_failed=failures.append,
+    )
+    device = _FakeStartupDevice(4, RuntimeError("synthetic stop wakeup"))
+    runtime._device = device  # type: ignore[assignment]
+    runtime._running = False
+    runtime._stop_requested.set()
+    runtime._stop_reason = "GUI close"
+
+    runtime._rx_drain_loop()
+
+    assert failures == []
+    assert runtime._stop_reason == "GUI close"
+
+
+def test_backend_dsp_exception_during_requested_stop_is_not_a_new_failure() -> None:
+    failures: list[str] = []
+    runtime = BackendRuntime(
+        StreamConfig(),
+        _runtime_loggers(),
+        on_failed=failures.append,
+    )
+    runtime._running = False
+    runtime._stop_requested.set()
+    runtime._stop_reason = "GUI close"
+
+    runtime._run_dsp_stage(
+        "phase",
+        lambda: (_ for _ in ()).throw(RuntimeError("synthetic stop wakeup")),
+    )
+
+    assert failures == []
+    assert runtime._stop_reason == "GUI close"
+
+
+def test_backend_startup_exception_after_stop_request_is_not_a_new_failure(
+    monkeypatch,
+) -> None:
+    failures: list[str] = []
+    runtime = BackendRuntime(
+        StreamConfig(logging_enabled=False),
+        _runtime_loggers(),
+        on_failed=failures.append,
+    )
+
+    def cancelled_device(_config):
+        runtime._stop_reason = "GUI close"
+        runtime._stop_requested.set()
+        raise RuntimeError("synthetic constructor wakeup")
+
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.UsrpRxDevice",
+        cancelled_device,
+    )
+    monkeypatch.setattr(runtime, "_log_runtime_startup_context", lambda: None)
+    monkeypatch.setattr(runtime, "_record_runtime_event", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.finalize_session_logs",
+        lambda *_args, **_kwargs: None,
+    )
+
+    runtime.run()
+
+    assert failures == []
+    assert runtime._failure_reason is None
+    assert runtime._stop_reason == "GUI close"
+
+
+def test_backend_startup_failure_finalizes_session_as_failed(monkeypatch) -> None:
+    failures: list[str] = []
+    finalized: list[dict[str, object]] = []
+    runtime = BackendRuntime(
+        StreamConfig(logging_enabled=False),
+        _runtime_loggers(),
+        on_failed=failures.append,
+    )
+
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.UsrpRxDevice",
+        lambda _config: (_ for _ in ()).throw(RuntimeError("synthetic startup failure")),
+    )
+    monkeypatch.setattr(runtime, "_log_runtime_startup_context", lambda: None)
+    monkeypatch.setattr(runtime, "_record_runtime_event", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.finalize_session_logs",
+        lambda *_args, **kwargs: finalized.append(kwargs),
+    )
+
+    runtime.run()
+
+    assert failures == ["Backend runtime failed: synthetic startup failure"]
+    assert runtime._failure_reason == "Backend runtime failed: synthetic startup failure"
+    assert finalized == [
+        {
+            "stop_reason": "exception: synthetic startup failure",
+            "outcome": "failed",
+        }
+    ]
+
+
+def test_backend_start_rejects_live_worker_from_prior_run() -> None:
+    runtime = BackendRuntime(StreamConfig(), _runtime_loggers())
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait, name="stale-test-worker")
+    worker.start()
+    runtime._rx_thread = worker
+
+    try:
+        with pytest.raises(RuntimeError, match="prior worker.*stale-test-worker"):
+            runtime.start()
+    finally:
+        release.set()
+        worker.join(timeout=1.0)
+
+
+def test_backend_start_rejects_live_shared_u1_monitor_from_prior_run() -> None:
+    class LiveMonitor:
+        def stop(self, timeout_s: float = 3.0) -> bool:
+            del timeout_s
+            return False
+
+    runtime = BackendRuntime(StreamConfig(), _runtime_loggers())
+    runtime._shared_u1_phase_monitor = LiveMonitor()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="Shared-U1 monitor remains alive"):
+        runtime.start()
+
+
 def test_backend_startup_probe_restarts_usrp_after_first_recv_socket_close(
     monkeypatch,
 ) -> None:
@@ -2710,6 +3169,33 @@ def test_backend_startup_probe_restarts_usrp_after_first_recv_socket_close(
     assert statuses == ["Retrying USRP RX startup"]
 
 
+def test_backend_startup_probe_rejects_unknown_uhd_metadata_after_retry(
+    monkeypatch,
+) -> None:
+    cfg = StreamConfig()
+    runtime = BackendRuntime(cfg, _runtime_loggers())
+    result = RxChunkResult(
+        chunk=np.ones((len(cfg.channels), 8), dtype=np.complex64),
+        state="other",
+        got_samples=8,
+        error_code="alignment",
+        out_of_sequence=False,
+        time_spec_s=None,
+    )
+    device = _FakeFixedResultDevice(result)
+    runtime._device = device  # type: ignore[assignment]
+    monkeypatch.setattr("antijamming.runtime.backend.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        RuntimeError,
+        match="startup probe failed after retry.*unsupported RX metadata.*alignment",
+    ):
+        runtime._prime_usrp_rx_startup()
+
+    assert device.recv_count == 2
+    assert device.restart_count == 1
+
+
 def test_backend_cleanup_stop_does_not_overwrite_rx_failure_reason() -> None:
     runtime = BackendRuntime(StreamConfig(), _runtime_loggers())
     runtime._failed_stop("RX recv failed: EnvironmentError: IOError: socket closed")
@@ -2723,13 +3209,13 @@ def test_backend_gnss_exception_path_pauses_handoff_only() -> None:
     failures: list[str] = []
     statuses: list[str] = []
     runtime = BackendRuntime(
-        StreamConfig(gnss_sdr_require_local=False),
+        StreamConfig(),
         _runtime_loggers(),
         on_failed=failures.append,
         on_status=statuses.append,
     )
     bridge = _FakeBridge()
-    device = _FakePausableDevice()
+    device = _FakeStoppableDevice()
     runtime._gnss_bridge = bridge  # type: ignore[assignment]
     runtime._device = device  # type: ignore[assignment]
     runtime._running = True
@@ -2771,7 +3257,7 @@ def test_backend_handles_concurrent_gnss_failure_only_once() -> None:
 def test_backend_handoff_thread_exits_and_preserves_sdr_on_bounded_fifo_stall() -> None:
     statuses: list[str] = []
     runtime = BackendRuntime(
-        StreamConfig(gnss_shared_u1_phase_compensation_enabled=False),
+        StreamConfig(),
         _runtime_loggers(),
         on_status=statuses.append,
     )
@@ -2786,6 +3272,17 @@ def test_backend_handoff_thread_exits_and_preserves_sdr_on_bounded_fifo_stall() 
     raw_q.put(np.ones((len(runtime._config.channels), 1024), dtype=np.complex64))
     runtime._gnss_bridge = bridge  # type: ignore[assignment]
     runtime._gnss_raw_queue = raw_q
+    runtime._shared_u1_phase_bank = SharedU1PhaseCompensationBank(
+        source_count=runtime._config.gnss_1c_channel_count,
+        channel_count=len(runtime._config.channels),
+        sample_rate_hz=runtime._config.sample_rate,
+        samples_per_chunk=runtime._config.samples_per_chunk,
+        transition_s=runtime._config.gnss_shared_u1_phase_transition_s,
+        max_weight_norm=runtime._config.lcmv_max_weight_norm,
+    )
+    runtime._shared_u1_source_satellites_cache = tuple(
+        None for _ in range(runtime._config.gnss_1c_channel_count)
+    )
     runtime._running = True
     thread = threading.Thread(
         target=runtime._gnss_beamform_loop,
@@ -2827,6 +3324,82 @@ def test_backend_overflow_stop_reason_is_recorded() -> None:
     assert failures
     assert failures[-1].startswith("Auto-stop on RX overflow:")
     assert runtime._stop_reason == failures[-1]
+
+
+def test_backend_unknown_uhd_metadata_never_reaches_iq_consumers() -> None:
+    failures: list[str] = []
+    cfg = StreamConfig(process_every_n_chunks=1)
+    runtime = BackendRuntime(cfg, _runtime_loggers(), on_failed=failures.append)
+    result = RxChunkResult(
+        chunk=np.ones((len(cfg.channels), 8), dtype=np.complex64),
+        state="other",
+        got_samples=8,
+        error_code="alignment",
+        out_of_sequence=False,
+        time_spec_s=None,
+    )
+    device = _FakeFixedResultDevice(result)
+    raw_q: queue.Queue = queue.Queue(maxsize=1)
+    runtime._device = device  # type: ignore[assignment]
+    runtime._gnss_raw_queue = raw_q
+    runtime._gnss_bridge = _FakeBridge()  # type: ignore[assignment]
+    runtime._running = True
+
+    runtime._rx_drain_loop()
+
+    assert runtime._running is False
+    assert runtime._raw_chunk_count == 0
+    assert runtime._phase_queue.get_nowait() is None
+    assert runtime._phase_queue.empty()
+    assert raw_q.empty()
+    assert device.stopped is True
+    assert failures == ["RX recv failed: UHD reported unsupported RX metadata: alignment"]
+
+
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        (
+            RxChunkResult(
+                chunk=np.zeros((3, 8), dtype=np.complex64),
+                state="ok",
+                got_samples=8,
+                error_code="none",
+                out_of_sequence=False,
+                time_spec_s=None,
+            ),
+            "channel count mismatch",
+        ),
+        (
+            RxChunkResult(
+                chunk=np.zeros((4, 8), dtype=np.complex128),
+                state="ok",
+                got_samples=8,
+                error_code="none",
+                out_of_sequence=False,
+                time_spec_s=None,
+            ),
+            "must use complex64",
+        ),
+        (
+            RxChunkResult(
+                chunk=np.zeros((4, 8), dtype=np.complex64),
+                state="ok",
+                got_samples=7,
+                error_code="none",
+                out_of_sequence=False,
+                time_spec_s=None,
+            ),
+            "sample count mismatch",
+        ),
+    ],
+)
+def test_backend_rejects_malformed_usrp_result_before_consumption(
+    result: RxChunkResult,
+    message: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=message):
+        validate_rx_chunk_result(result, expected_channels=4)
 
 
 def test_backend_pauses_gnss_handoff_when_raw_queue_is_full() -> None:

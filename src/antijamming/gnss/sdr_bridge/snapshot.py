@@ -30,7 +30,7 @@ class SnapshotMixin:
         state_t0 = time.monotonic()
         with self._state_lock:
             fresh_geometry = self._fresh_sky_geometry(now)
-            used_in_fix_prns = self._fresh_used_in_fix_prns(now)
+            used_in_fix_keys = self._fresh_used_in_fix_sat_keys(now)
             pvt_current = self._pvt_is_current(now)
             pvt_observation_count = self._pvt_observation_count if pvt_current else None
             latest_accuracy = dict(self._latest_accuracy) if self._accuracy_is_current(now) else {}
@@ -72,7 +72,7 @@ class SnapshotMixin:
                             latest_cno_seen=True,
                             carrier_lock_test=carrier_lock_test,
                             telemetry_confirmed=bool(item.get("telemetry_confirmed", False)),
-                            pvt_used=sat_key in used_in_fix_prns,
+                            pvt_used=sat_key in used_in_fix_keys,
                         )
                     )
                 elif item.get("state") == "tracking":
@@ -83,7 +83,7 @@ class SnapshotMixin:
                             latest_cno_seen=False,
                             carrier_lock_test=None,
                             telemetry_confirmed=bool(item.get("telemetry_confirmed", False)),
-                            pvt_used=sat_key in used_in_fix_prns,
+                            pvt_used=sat_key in used_in_fix_keys,
                         )
                     )
                 geometry = fresh_geometry.get(sat_key)
@@ -95,7 +95,7 @@ class SnapshotMixin:
                 tracking_monitor = latest_tracking_monitor.get(sat_key)
                 if tracking_monitor is not None:
                     item.update(self._tracking_monitor_prn_fields(tracking_monitor))
-                item["used_in_fix"] = sat_key in used_in_fix_prns
+                item["used_in_fix"] = sat_key in used_in_fix_keys
                 prns.append(item)
             tracking_keys = sorted(
                 (sat_key for sat_key, entry in self._prn_states.items() if entry["state"] == "tracking"),
@@ -113,10 +113,6 @@ class SnapshotMixin:
                 (sat_key for sat_key, entry in self._prn_states.items() if entry["state"] == "lost"),
                 key=_sat_sort_key,
             )
-            tracking = [_sat_prn(sat_key) for sat_key in tracking_keys]
-            acquired = [_sat_prn(sat_key) for sat_key in acquired_keys]
-            assigned = [_sat_prn(sat_key) for sat_key in assigned_keys]
-            lost = [_sat_prn(sat_key) for sat_key in lost_keys]
             receiver_time_s = self._receiver_time_s
             pvt_output_seen = bool(self._pvt_output_seen)
             nmea_tty_line_count = int(self._nmea_tty_line_count)
@@ -132,7 +128,11 @@ class SnapshotMixin:
                 # Skyplot placement requires geometry from GSV/KML/NMEA sources.
                 # Tracking-only PRNs without az/el are reported elsewhere, not
                 # plotted at invented positions.
-                entry = {**_sat_public_fields(sat_key), **geometry, "used_in_fix": sat_key in used_in_fix_prns}
+                entry = {
+                    **_sat_public_fields(sat_key),
+                    **geometry,
+                    "used_in_fix": sat_key in used_in_fix_keys,
+                }
                 state_entry = self._prn_states.get(sat_key)
                 if state_entry is not None:
                     entry["state"] = state_entry.get("state", "visible")
@@ -145,13 +145,6 @@ class SnapshotMixin:
                 for entry in prns
                 if entry.get("state") == "tracking" and isinstance(entry.get("cno_db_hz"), (int, float))
             ]
-            stable_tracking_prns = sorted(
-                int(entry["prn"])
-                for entry in prns
-                if entry.get("state") == "tracking"
-                and isinstance(entry.get("cno_db_hz"), (int, float))
-                and bool(entry.get("cno_stable", False))
-            )
             stable_tracking_satellites = [
                 str(entry.get("satellite_id", f"G{int(entry['prn']):02d}"))
                 for entry in prns
@@ -159,14 +152,6 @@ class SnapshotMixin:
                 and isinstance(entry.get("cno_db_hz"), (int, float))
                 and bool(entry.get("cno_stable", False))
             ]
-            pending_tracking_prns = sorted(
-                int(entry["prn"])
-                for entry in prns
-                if entry.get("state") == "tracking"
-                and not bool(entry.get("cno_stable", False))
-                and str(entry.get("cno_unstable_reason", ""))
-                in {"missing_cno", "too_few_samples", "awaiting_nav"}
-            )
             pending_tracking_satellites = [
                 str(entry.get("satellite_id", f"G{int(entry['prn']):02d}"))
                 for entry in prns
@@ -175,14 +160,6 @@ class SnapshotMixin:
                 and str(entry.get("cno_unstable_reason", ""))
                 in {"missing_cno", "too_few_samples", "awaiting_nav"}
             ]
-            unstable_tracking_prns = sorted(
-                int(entry["prn"])
-                for entry in prns
-                if entry.get("state") == "tracking"
-                and not bool(entry.get("cno_stable", False))
-                and str(entry.get("cno_unstable_reason", ""))
-                in {"low_cno", "high_variance"}
-            )
             unstable_tracking_satellites = [
                 str(entry.get("satellite_id", f"G{int(entry['prn']):02d}"))
                 for entry in prns
@@ -213,9 +190,10 @@ class SnapshotMixin:
             valid_observables_count = sum(
                 1 for observable in observables if bool(observable.get("valid_pseudorange", False))
             )
-            used_in_fix_keys = sorted(used_in_fix_prns, key=_sat_sort_key)
-            used_in_fix_prn_list = [_sat_prn(sat_key) for sat_key in used_in_fix_keys]
-            used_in_fix_satellites = [_sat_label(sat_key) for sat_key in used_in_fix_keys]
+            sorted_used_in_fix_keys = sorted(used_in_fix_keys, key=_sat_sort_key)
+            used_in_fix_satellites = [
+                _sat_label(sat_key) for sat_key in sorted_used_in_fix_keys
+            ]
         self._record_snapshot_timing("snapshot_state_build", time.monotonic() - state_t0)
         io_t0 = time.monotonic()
         output_io_metrics = self._refresh_output_io_metrics(now)
@@ -223,24 +201,17 @@ class SnapshotMixin:
         self._record_snapshot_timing("snapshot_total", time.monotonic() - snapshot_t0)
         return {
             "prns": prns,
-            "tracking_prns": tracking,
             "tracking_satellites": [_sat_label(sat_key) for sat_key in tracking_keys],
-            "stable_tracking_prns": stable_tracking_prns,
             "stable_tracking_satellites": stable_tracking_satellites,
-            "pending_tracking_prns": pending_tracking_prns,
             "pending_tracking_satellites": pending_tracking_satellites,
-            "unstable_tracking_prns": unstable_tracking_prns,
             "unstable_tracking_satellites": unstable_tracking_satellites,
-            "acquired_prns": acquired,
             "acquired_satellites": [_sat_label(sat_key) for sat_key in acquired_keys],
-            "assigned_prns": assigned,
             "assigned_satellites": [_sat_label(sat_key) for sat_key in assigned_keys],
-            "lost_prns": lost,
             "lost_satellites": [_sat_label(sat_key) for sat_key in lost_keys],
-            "tracking_count": len(tracking),
-            "acquired_count": len(acquired),
-            "assigned_count": len(assigned),
-            "lost_count": len(lost),
+            "tracking_count": len(tracking_keys),
+            "acquired_count": len(acquired_keys),
+            "assigned_count": len(assigned_keys),
+            "lost_count": len(lost_keys),
             "receiver_time_s": receiver_time_s,
             "pvt_output_seen": pvt_output_seen,
             "pvt_current": pvt_current,
@@ -248,8 +219,7 @@ class SnapshotMixin:
             "accuracy": latest_accuracy,
             "sky_prns": sky_prns,
             "sky_geometry_count": len(sky_prns),
-            "used_in_fix_count": len(used_in_fix_prns),
-            "used_in_fix_prns": used_in_fix_prn_list,
+            "used_in_fix_count": len(used_in_fix_keys),
             "used_in_fix_satellites": used_in_fix_satellites,
             "used_in_fix_source": "nmea_gsa",
             "nmea_tty_devname": nmea_tty_devname,
@@ -335,12 +305,12 @@ class SnapshotMixin:
             self._sat_geometry_by_prn.pop(sat_key, None)
         return fresh
 
-    def _fresh_used_in_fix_prns(self, now: float) -> set[_SatKey]:
+    def _fresh_used_in_fix_sat_keys(self, now: float) -> set[_SatKey]:
         observed = self._used_in_fix_observed_monotonic_s
         if observed is None or (now - observed) > USED_IN_FIX_TIMEOUT_S:
-            self._used_in_fix_prns.clear()
+            self._used_in_fix_sat_keys.clear()
             return set()
-        return set(self._used_in_fix_prns)
+        return set(self._used_in_fix_sat_keys)
 
     def _pvt_is_current(self, now: float) -> bool:
         observed = self._pvt_observed_monotonic_s

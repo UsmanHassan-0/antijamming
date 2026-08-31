@@ -9,7 +9,7 @@ This procedure is for a run where the operator controls the physical bladeRF and
 The run directory contains:
 
 - `session_manifest.json`: UTC/local start and stop times, monotonic duration, outcome, and copied-artifact inventory.
-- `operator_events.jsonl`: physical jammer/bladeRF markers, attenuation, bladeRF gain, LCMV state, current/target complex weights, transition progress, DoA, input/output digital powers, spatial state, and the nearest live GNSS state.
+- `operator_events.jsonl`: physical jammer/bladeRF markers, optional notes, LCMV state, current/target complex weights, transition progress, DoA, input/output digital powers, spatial state, and the nearest live GNSS state.
 - `runtime_evidence.jsonl`: automatic synchronized snapshots at 0.1-second-or-better configured UI cadence. Every snapshot contains inferred RF state and its basis; LCMV enabled/mode/method; uniform, transition-start, current, target, and effective calibrated GNSS weights; ramp progress; phase alignment; MUSIC source diagnostics; DoA; channel/output powers; spatial detector state; suppression state; and GNSS/PVT state. State changes generate separate `automatic_runtime_state_transition` records.
 - `tracking_observables.jsonl`: per-satellite receiver time/TOW, C/N0, Doppler, carrier phase in radians/cycles, code phase in samples/seconds, prompt I/Q/magnitude/phase, sample counter, correlation length, acquisition/symbol/word/pseudorange validity, PLL 180-degree lock flag, and cycle-slip flag.
 - The normal `app`, UHD, stream, transport, phase, DoA, LCMV, spatial-vector, GNSS handoff, GNSS-SDR, health, UI, and error logs.
@@ -22,8 +22,8 @@ The tracking archive uses the configured GNSS-SDR `TrackingMonitor` on UDP 1236 
 1. Start the bladeRF playback first. Confirm that the intended IQ file is still running and note its remaining duration.
 2. Keep the physical jammer off.
 3. Run `./run_realtime.sh`, but do not press `Start` yet.
-4. Select `Configured jammer attenuation (dB)` and `Declared bladeRF SW gain (dB)`. The current defaults are 50 dB and 50 dB; select 55 dB when that is the bladeRF command used.
-5. Press `Start`. When the USRP stream reports started, the GUI automatically logs the selected attenuation, selected bladeRF gain, and configured 45 dB USRP RX gain. No RF marker is required. `Record bladeRF ON` and `Record jammer OFF` are optional when a physically confirmed timestamp is desired. The settings are configured/declared values rather than measured RF power.
+4. Record external transmitter settings in the lab notebook or transmitter's own run evidence, not in this receiver runtime.
+5. Press `Start`. No RF marker is required. `Record bladeRF ON` and `Record jammer OFF` are optional when a physically confirmed timestamp is desired.
 
 ## Core preservation and jammer cycle
 
@@ -43,7 +43,7 @@ Run these only while enough IQ file time remains:
 
 - With LCMV already enabled, stop and restart bladeRF. Automatic power, GNSS and spatial-signature consequences are retained. Optional `Record bladeRF OFF/ON` markers identify the external process actions unambiguously. This does not claim that frozen weights can recreate a playback file after EOF.
 - Move the active jammer, then record `tools/mark_rf_event.py --event jammer_moved --notes "physical position description"`. The GUI has ON/OFF buttons; the helper supplies the moved marker and free-form location note.
-- When attenuation changes while the jammer is active, change the GUI attenuation field immediately. Editing completion records an `attenuation_db` event. The same applies to bladeRF software gain.
+- When external transmitter settings change, retain them in the external device's own evidence and use an optional marker note here only to timestamp the physical action.
 
 ## Stop and produce reports
 
@@ -61,7 +61,7 @@ The second command reports all existing spatial and output-power metrics, includ
 
 ## What the suppression numbers mean in this implementation
 
-- `measured_output_reduction_vs_uniform_db` compares the actual one-stream beamformed IQ power against the power that the uniform combiner would have produced from the same four-channel covariance. It is total output reduction and can include wanted-signal loss.
+- `measured_output_reduction_vs_uniform_db` compares the actual common spatial-row output power against the power that the uniform combiner would have produced from the same four-channel covariance. It is total output reduction and can include wanted-signal loss.
 - `measured_output_reduction_vs_raw_avg_channel_db` and `...raw_sum_channels_db` use different input-power reference conventions. They are useful accounting metrics, not jammer-only suppression.
 - The runtime automatically forms a positive-semidefinite projection of `R_current - R_arm`, evaluates uniform and actually applied weights against the same excess covariance, aggregates linear powers, and reports `inferred_added_scene_suppression_db` during automatically inferred jammer-like periods. This needs no button, but it is added-scene suppression rather than proven jammer-only suppression.
 - An optional physical `jammer_on` marker allows the same estimator to be reported as physically labeled `jammer_only_suppression_db`, provided the rest of the scene stayed unchanged.

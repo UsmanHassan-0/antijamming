@@ -34,7 +34,20 @@ if [[ ! -x "${APP_PY}" ]]; then
 fi
 
 cd "${ROOT_DIR}"
-mkdir -p logs logs/sidecar
+mkdir -p logs
+
+RUNTIME_LOGGING_ENABLED="$("${APP_PY}" - <<'PY'
+import json
+from pathlib import Path
+
+value = json.loads(Path("configs/antijamming/x300_realtime.json").read_text()).get(
+    "logging_enabled"
+)
+if type(value) is not bool:
+    raise SystemExit("logging_enabled must be a JSON boolean")
+print("1" if value else "0")
+PY
+)"
 
 runtime_usrp_ip() {
   "${APP_PY}" - <<'PY'
@@ -95,7 +108,6 @@ owned_gnss_sdr_pids() {
 
 stop_owned_gnss_sdr() {
   local pids=()
-  local pid
 
   mapfile -t pids < <(owned_gnss_sdr_pids)
   if ((${#pids[@]} == 0)); then
@@ -180,7 +192,6 @@ else
 fi
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 export UHD_LOG_CONSOLE_LEVEL="${UHD_LOG_CONSOLE_LEVEL:-error}"
-export UHD_LOG_FILE="${ROOT_DIR}/logs/uhd_console.log"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -206,12 +217,21 @@ case "$(qt_platform_name)" in
     ;;
 esac
 
-: >"${UHD_LOG_FILE}"
+if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
+  export UHD_LOG_FILE="${ROOT_DIR}/logs/uhd_console.log"
+  mkdir -p logs/sidecar
+  : >"${UHD_LOG_FILE}"
+else
+  unset UHD_LOG_FILE
+fi
 
 echo "[run_realtime] Launching realtime anti-jamming GUI..."
 echo "[run_realtime] Runtime profile: ${RUNTIME_CONFIG#${ROOT_DIR}/}"
-echo "[run_realtime] UHD logs: ${UHD_LOG_FILE}"
-echo "[run_realtime] Sidecar logs: logs/sidecar/current (set ANTIJAM_SIDECAR=0 to disable)"
+if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
+  echo "[run_realtime] Logging: enabled (UHD=${UHD_LOG_FILE}, sidecar=logs/sidecar/current)"
+else
+  echo "[run_realtime] Logging: disabled by x300_realtime.json (diagnostic sidecar off)"
+fi
 echo "[run_realtime] Qt platform: ${QT_QPA_PLATFORM}"
 case "$(qt_platform_name)" in
   offscreen|minimal)
@@ -222,11 +242,15 @@ case "$(qt_platform_name)" in
     ;;
 esac
 echo "[run_realtime] If the window does not appear, check logs/app.log and logs/errors.log."
-"${APP_PY}" -m antijamming.app.main "${ORIGINAL_ARGS[@]}" 2>>"${UHD_LOG_FILE}" &
+if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
+  "${APP_PY}" -m antijamming.app.main "${ORIGINAL_ARGS[@]}" 2>>"${UHD_LOG_FILE}" &
+else
+  "${APP_PY}" -m antijamming.app.main "${ORIGINAL_ARGS[@]}" &
+fi
 APP_PID="$!"
 
 SIDECAR_PID=""
-if [[ "${ANTIJAM_SIDECAR:-1}" != "0" ]]; then
+if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
   if [[ -r "${SIDECAR_SCRIPT}" ]]; then
     SIDECAR_IFACE="${ANTIJAM_SIDECAR_IFACE:-}"
     if [[ -z "${SIDECAR_IFACE}" ]]; then

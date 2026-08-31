@@ -96,8 +96,6 @@ def read_jsonl(path: Path) -> list[dict[str, object]]:
 
 def load_events(session: Path) -> list[dict[str, object]]:
     path = session / "operator_events.jsonl"
-    if not path.is_file():
-        path = session / "operator_events.log"
     events = read_jsonl(path)
     for event in events:
         epoch = event.get("wall_time_unix_ns")
@@ -194,17 +192,10 @@ def _phase_residuals_at_event(
                 sample_times = []
                 break
             sample_times.append(sample_counter / sample_rate)
-        if len(sample_times) == 3:
-            t0, t1, t2 = sample_times
-            time_basis[satellite] = "tracking_sample_counter"
-        else:
-            # Compatibility fallback for older archives that predate sample
-            # counters. UDP receive timestamps contain scheduler jitter and are
-            # therefore weaker carrier-phase evidence.
-            t0 = float(first["_epoch_s"])
-            t1 = float(second["_epoch_s"])
-            t2 = float(third["_epoch_s"])
-            time_basis[satellite] = "udp_wall_time_fallback"
+        if len(sample_times) != 3:
+            continue
+        t0, t1, t2 = sample_times
+        time_basis[satellite] = "tracking_sample_counter"
         if p0 is None or p1 is None or p2 is None or t1 <= t0 or t2 < t1:
             continue
         local_rate = (p1 - p0) / (t1 - t0)
@@ -609,8 +600,6 @@ def audit_session(session: Path) -> dict[str, object]:
     runtime_evidence = load_runtime_evidence(session)
     timeline = parse_timeline(session)
     operator_event_path = session / "operator_events.jsonl"
-    if not operator_event_path.is_file():
-        operator_event_path = session / "operator_events.log"
     suppression = estimate_jammer_only_suppression(
         parse_operator_events(operator_event_path),
         parse_spatial_events(session),

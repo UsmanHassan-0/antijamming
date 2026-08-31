@@ -510,18 +510,33 @@ def build_lcmv_response_plot(
     *,
     doa_min_deg: float,
     doa_max_deg: float,
-) -> tuple[pg.PlotWidget, pg.PlotDataItem, pg.InfiniteLine]:
-    """Build the LCMV angular response plot using display bearing coordinates."""
-    plot, curve, marker = build_azimuth_response_plot(
+) -> tuple[
+    pg.PlotWidget,
+    pg.PlotDataItem,
+    pg.InfiniteLine,
+]:
+    """Build one model scan of measured-U1 target weights, not an OTA null."""
+    bearing_x_max = 360.0 if doa_min_deg == 0.0 and doa_max_deg >= 359.0 else doa_max_deg
+    plot, curves = build_plot_widget(
         bottom_label="DoA bearing (deg)",
         left_label="Ideal steering-vector model response dB",
-        response_color=DOA_COLOR,
+        x_range=(doa_min_deg, bearing_x_max),
         y_range=(-80.0, 5.0),
-        doa_min_deg=doa_min_deg,
-        doa_max_deg=doa_max_deg,
+        curves=(
+            PlotCurveSpec(
+                name="Measured-U1 target weights (model)",
+                color=DOA_COLOR,
+                width=2.0,
+            ),
+        ),
     )
+    marker = pg.InfiniteLine(
+        pos=0.0, angle=90, pen=pg.mkPen(WARNING, width=2), label="MUSIC guard candidate"
+    )
+    marker.setVisible(False)
+    plot.addItem(marker)
     plot.setTitle(
-        "Active LCMV ideal steering-vector model response",
+        "Measured-U1 target: computed steering-model scan, not OTA suppression",
         color=FG_TEXT,
     )
-    return plot, curve, marker
+    return plot, curves[0], marker

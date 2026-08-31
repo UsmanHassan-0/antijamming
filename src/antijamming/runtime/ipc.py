@@ -173,7 +173,7 @@ class _ClientSession:
         except OSError:
             pass
 
-    def wait_closed(self, timeout_s: float = 1.0) -> None:
+    def wait_closed(self, timeout_s: float = 1.0) -> bool:
         """Wait briefly for this session's reader/sender to leave their loops."""
 
         deadline = time.monotonic() + max(0.0, float(timeout_s))
@@ -185,6 +185,7 @@ class _ClientSession:
             if remaining_s <= 0.0:
                 break
             thread.join(timeout=remaining_s)
+        return all(thread is current or not thread.is_alive() for thread in (self._reader, self._sender))
 
     def _send(self, message: dict[str, Any]) -> None:
         encoded = (
@@ -334,7 +335,7 @@ class JsonIpcServer:
                     pass
                 raise
 
-    def close(self) -> None:
+    def close(self) -> bool:
         with self._lifecycle_lock:
             self._closed.set()
             listener = self._listener
@@ -352,9 +353,11 @@ class JsonIpcServer:
             accept_thread is not None
             and accept_thread is not threading.current_thread()
             and accept_thread.ident is not None
+            and accept_thread.is_alive()
         ):
             accept_thread.join(timeout=1.0)
-        if accept_thread is None or not accept_thread.is_alive():
+        accept_stopped = accept_thread is None or not accept_thread.is_alive()
+        if accept_stopped:
             with self._lifecycle_lock:
                 if self._accept_thread is accept_thread:
                     self._accept_thread = None
@@ -362,13 +365,15 @@ class JsonIpcServer:
             sessions = list(self._sessions)
         for session in sessions:
             session.close()
-        for session in sessions:
-            session.wait_closed(timeout_s=1.0)
+        sessions_stopped = all(
+            session.wait_closed(timeout_s=1.0) for session in sessions
+        )
         try:
             if self.socket_path.is_socket():
                 self.socket_path.unlink()
         except OSError:
             pass
+        return bool(accept_stopped and sessions_stopped)
 
     def handle_command(
         self,

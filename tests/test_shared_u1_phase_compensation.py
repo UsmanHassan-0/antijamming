@@ -5,6 +5,7 @@ from pathlib import Path
 import threading
 
 import numpy as np
+import pytest
 
 from antijamming.config import StreamConfig
 from antijamming.gnss import (
@@ -48,7 +49,7 @@ def test_shared_u1_phase_rows_preserve_each_prn_response_and_one_null() -> None:
         },
     }
     bank = SharedU1PhaseCompensationBank(
-        satellites=(3, 4),
+        source_count=2,
         channel_count=4,
         sample_rate_hz=4_000_000.0,
         samples_per_chunk=20_000,
@@ -60,6 +61,7 @@ def test_shared_u1_phase_rows_preserve_each_prn_response_and_one_null() -> None:
         shared_measured_u1_weights=shared,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(3, 4),
         enabled_now=False,
         now_monotonic=now,
     )
@@ -68,8 +70,14 @@ def test_shared_u1_phase_rows_preserve_each_prn_response_and_one_null() -> None:
         shared_measured_u1_weights=shared,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(3, 4),
         enabled_now=True,
         now_monotonic=now + 0.01,
+    )
+
+    assert bank.applied_source_labels((3, 4)) == (
+        "phase_compensated_shared_measured_u1",
+        "phase_compensated_shared_measured_u1",
     )
 
     jammer = np.ones((4,), dtype=np.complex128)
@@ -94,40 +102,17 @@ def test_shared_u1_phase_rows_preserve_each_prn_response_and_one_null() -> None:
         assert status[satellite]["continuity_residual_abs"] < 1e-12
 
 
-def test_shared_u1_phase_renderer_pins_each_prn_without_global_fifo_backpressure(
-    tmp_path: Path,
-) -> None:
-    cfg = StreamConfig(
-        gnss_shared_u1_phase_compensation_enabled=True,
-        gnss_shared_u1_phase_satellites=(3, 4, 7, 8),
-        gnss_sdr_runtime_dir=tmp_path / "runtime",
-        gnss_sdr_log_dir=tmp_path / "glog",
-    )
-    bridge = GnssSdrBridge(cfg, _loggers())
-    rendered = bridge._render_config()
-
-    assert "GNSS-SDR.num_sources=4" in rendered
-    assert "GNSS-SDR.synchronize_signal_sources=false" in rendered
-    assert "GNSS-SDR.synchronize_signal_sources=true" not in rendered
-    for index, prn in enumerate((3, 4, 7, 8)):
-        assert f"SignalSource{index}.filename=" in rendered
-        assert f"gnss_iq_G{prn:02d}.fifo" in rendered
-        assert f"Channel{index}.satellite={prn}" in rendered
-        assert f"Channel{index}.RF_channel_ID={index}" in rendered
-
-
 def test_shared_u1_phase_renderer_uses_independent_dynamic_channel_slots(
     tmp_path: Path,
 ) -> None:
     cfg = StreamConfig(
-        gnss_shared_u1_phase_compensation_enabled=True,
-        gnss_shared_u1_phase_satellites=(),
         gnss_1c_channel_count=4,
         gnss_channels_in_acquisition=4,
         gnss_sdr_runtime_dir=tmp_path / "runtime",
         gnss_sdr_log_dir=tmp_path / "glog",
     )
     bridge = GnssSdrBridge(cfg, _loggers())
+    bridge._nmea_tty_path = "/dev/pts/test"
     rendered = bridge._render_config()
 
     assert "GNSS-SDR.num_sources=4" in rendered
@@ -160,7 +145,6 @@ def test_dynamic_source_reassignment_discards_old_prn_phase_state() -> None:
         },
     }
     bank = SharedU1PhaseCompensationBank(
-        satellites=(),
         source_count=2,
         channel_count=4,
         sample_rate_hz=4_000_000.0,
@@ -215,7 +199,7 @@ def test_phase_compensation_above_six_db_is_allowed_when_weight_norm_is_safe() -
         }
     }
     bank = SharedU1PhaseCompensationBank(
-        satellites=(4,),
+        source_count=1,
         channel_count=4,
         sample_rate_hz=4_000_000.0,
         samples_per_chunk=20_000,
@@ -228,6 +212,7 @@ def test_phase_compensation_above_six_db_is_allowed_when_weight_norm_is_safe() -
         shared_measured_u1_weights=shared,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(4,),
         enabled_now=False,
         now_monotonic=10.0,
     )
@@ -236,6 +221,7 @@ def test_phase_compensation_above_six_db_is_allowed_when_weight_norm_is_safe() -
         shared_measured_u1_weights=shared,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(4,),
         enabled_now=True,
         now_monotonic=10.01,
     )
@@ -264,7 +250,7 @@ def test_phase_compensation_still_rejects_unsafe_weight_norm() -> None:
         }
     }
     bank = SharedU1PhaseCompensationBank(
-        satellites=(4,),
+        source_count=1,
         channel_count=4,
         sample_rate_hz=4_000_000.0,
         samples_per_chunk=20_000,
@@ -276,6 +262,7 @@ def test_phase_compensation_still_rejects_unsafe_weight_norm() -> None:
         shared_measured_u1_weights=shared,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(4,),
         enabled_now=False,
         now_monotonic=10.0,
     )
@@ -284,6 +271,7 @@ def test_phase_compensation_still_rejects_unsafe_weight_norm() -> None:
         shared_measured_u1_weights=shared,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(4,),
         enabled_now=True,
         now_monotonic=10.01,
     )
@@ -300,8 +288,6 @@ def test_shared_u1_phase_runtime_labels_transport_and_actual_fifo_state(
 ) -> None:
     cfg = StreamConfig(
         log_dir=tmp_path,
-        gnss_shared_u1_phase_compensation_enabled=True,
-        gnss_shared_u1_phase_satellites=(3, 4, 7, 8),
     )
     runtime = BackendRuntime(cfg, setup_logging(tmp_path))
 
@@ -309,7 +295,50 @@ def test_shared_u1_phase_runtime_labels_transport_and_actual_fifo_state(
         "shared_prn_phase_continuity_fanout"
     )
     assert runtime._fifo_output_source_label() == (
-        "shared_uniform_phase_reference_prn_fanout"
+        "shared_common_before_gnss_fanout_start"
+    )
+
+
+def test_shared_u1_phase_source_labels_report_mixed_applied_rows() -> None:
+    common = np.ones((4,), dtype=np.complex128)
+    protection = np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.complex128)
+    desired = np.asarray([1.0, 0.5j, 0.3, -0.2j], dtype=np.complex128)
+    vectors = {
+        "G03": {
+            "desired_spatial_vector": desired,
+            "updated_monotonic": 10.0,
+            "tracking_sample_counter": 1000,
+        }
+    }
+    bank = SharedU1PhaseCompensationBank(
+        source_count=2,
+        channel_count=4,
+        sample_rate_hz=4_000_000.0,
+        samples_per_chunk=20_000,
+        transition_s=1.0,
+    )
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=protection,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        source_satellites=(3, None),
+        enabled_now=False,
+        now_monotonic=10.0,
+    )
+    bank.advance(
+        shared_common_weights=common,
+        shared_measured_u1_weights=protection,
+        shared_measured_u1_available=True,
+        desired_vectors=vectors,
+        source_satellites=(3, None),
+        enabled_now=True,
+        now_monotonic=10.01,
+    )
+
+    assert bank.applied_source_labels((3, None)) == (
+        "phase_compensated_shared_measured_u1",
+        "shared_common_waiting_for_channel_prn",
     )
 
 
@@ -325,7 +354,7 @@ def test_shared_u1_phase_waits_for_covariance_worker_without_missing_onset() -> 
         }
     }
     bank = SharedU1PhaseCompensationBank(
-        satellites=(3,),
+        source_count=1,
         channel_count=4,
         sample_rate_hz=4_000_000.0,
         samples_per_chunk=20_000,
@@ -336,6 +365,7 @@ def test_shared_u1_phase_waits_for_covariance_worker_without_missing_onset() -> 
         shared_measured_u1_weights=common,
         shared_measured_u1_available=False,
         desired_vectors=vectors,
+        source_satellites=(3,),
         enabled_now=False,
         now_monotonic=10.0,
     )
@@ -344,6 +374,7 @@ def test_shared_u1_phase_waits_for_covariance_worker_without_missing_onset() -> 
         shared_measured_u1_weights=common,
         shared_measured_u1_available=False,
         desired_vectors=vectors,
+        source_satellites=(3,),
         enabled_now=True,
         now_monotonic=10.01,
     )
@@ -352,6 +383,7 @@ def test_shared_u1_phase_waits_for_covariance_worker_without_missing_onset() -> 
         shared_measured_u1_weights=shared,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(3,),
         enabled_now=True,
         now_monotonic=10.02,
     )
@@ -390,7 +422,7 @@ def test_prn_monitor_recovers_calibrated_spatial_iq_from_one_code_period(
         session_dir=tmp_path,
         session_id="synthetic",
         logger=logging.getLogger("test.shared_u1_phase.monitor"),
-        satellites=(prn,),
+        source_count=1,
         min_quality_measurements=1,
     )
     monitor._append_span(
@@ -436,7 +468,7 @@ def test_prn_monitor_owns_submitted_samples_and_retains_live_worker_resources(
         session_dir=tmp_path,
         session_id="ownership",
         logger=logging.getLogger("test.shared_u1_phase.ownership"),
-        satellites=(3,),
+        source_count=1,
     )
 
     def blocked_append(_start, raw, _weights) -> None:
@@ -465,6 +497,88 @@ def test_prn_monitor_owns_submitted_samples_and_retains_live_worker_resources(
     np.testing.assert_array_equal(observed[0], np.ones((2, 8), dtype=np.complex64))
 
 
+def test_prn_monitor_rejects_empty_calibration_instead_of_treating_it_as_absent(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="phase correction length"):
+        SharedU1DesiredVectorMonitor(
+            sample_rate_hz=1_023_000.0,
+            channel_count=4,
+            phase_correction_vector=(),
+            tracking_snapshot=lambda: {},
+            session_dir=tmp_path,
+            session_id="empty-calibration",
+            logger=logging.getLogger("test.shared_u1_phase.empty_calibration"),
+            source_count=1,
+        )
+
+
+def test_prn_monitor_stop_cannot_leave_a_sample_behind_shutdown_sentinel(
+    tmp_path: Path,
+) -> None:
+    copy_entered = threading.Event()
+    allow_copy = threading.Event()
+
+    class DelayedArray:
+        def __array__(self, dtype=None, copy=None):
+            del copy
+            copy_entered.set()
+            assert allow_copy.wait(1.0)
+            return np.ones((2, 8), dtype=dtype or np.complex64)
+
+    monitor = SharedU1DesiredVectorMonitor(
+        sample_rate_hz=1_023_000.0,
+        channel_count=2,
+        phase_correction_vector=None,
+        tracking_snapshot=lambda: {},
+        session_dir=tmp_path,
+        session_id="submit-stop-race",
+        logger=logging.getLogger("test.shared_u1_phase.submit_stop_race"),
+        source_count=1,
+    )
+    monitor._accepting_samples = True
+    submitter = threading.Thread(
+        target=monitor.submit,
+        args=(0, DelayedArray(), np.ones((1, 2), dtype=np.complex128)),
+    )
+    submitter.start()
+    assert copy_entered.wait(1.0)
+
+    assert monitor.stop(timeout_s=0.0) is True
+    allow_copy.set()
+    submitter.join(timeout=1.0)
+
+    assert not submitter.is_alive()
+    assert monitor._queue.qsize() == 1
+    assert monitor._queue.get_nowait() is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"source_count": 0}, "source_count must be positive"),
+        ({"channel_count": 0}, "channel_count must be positive"),
+        ({"sample_rate_hz": 0.0}, "sample_rate_hz must be positive"),
+        ({"samples_per_chunk": 0}, "samples_per_chunk must be positive"),
+        ({"transition_s": -1.0}, "transition_s must be nonnegative"),
+    ],
+)
+def test_shared_u1_bank_rejects_invalid_dimensions_and_pacing(
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    kwargs: dict[str, object] = {
+        "source_count": 1,
+        "channel_count": 4,
+        "sample_rate_hz": 4_000_000.0,
+        "samples_per_chunk": 32_768,
+        "transition_s": 1.0,
+    }
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        SharedU1PhaseCompensationBank(**kwargs)  # type: ignore[arg-type]
+
+
 def test_shared_u1_phase_rephases_every_later_covariance_update() -> None:
     common = np.ones((4,), dtype=np.complex128)
     first = np.asarray([0.8 + 0.1j, 0.2 - 0.3j, 1.1 + 0.2j, 0.5 + 0.4j])
@@ -479,7 +593,7 @@ def test_shared_u1_phase_rephases_every_later_covariance_update() -> None:
         }
     }
     bank = SharedU1PhaseCompensationBank(
-        satellites=(5,),
+        source_count=1,
         channel_count=4,
         sample_rate_hz=4_000_000.0,
         samples_per_chunk=32_768,
@@ -490,6 +604,7 @@ def test_shared_u1_phase_rephases_every_later_covariance_update() -> None:
         shared_measured_u1_weights=common,
         shared_measured_u1_available=False,
         desired_vectors=vectors,
+        source_satellites=(5,),
         enabled_now=False,
         now_monotonic=20.0,
     )
@@ -498,6 +613,7 @@ def test_shared_u1_phase_rephases_every_later_covariance_update() -> None:
         shared_measured_u1_weights=first,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(5,),
         enabled_now=True,
         now_monotonic=20.01,
     )
@@ -506,6 +622,7 @@ def test_shared_u1_phase_rephases_every_later_covariance_update() -> None:
         shared_measured_u1_weights=second,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(5,),
         enabled_now=True,
         now_monotonic=21.01,
     )
@@ -537,7 +654,7 @@ def test_jammer_off_ramp_preserves_complex_response_at_every_chunk() -> None:
     # Ten samples per chunk and a one-second transition produce ten exact
     # intermediate points, making every ramp step observable in this test.
     bank = SharedU1PhaseCompensationBank(
-        satellites=(5,),
+        source_count=1,
         channel_count=4,
         sample_rate_hz=100.0,
         samples_per_chunk=10,
@@ -548,6 +665,7 @@ def test_jammer_off_ramp_preserves_complex_response_at_every_chunk() -> None:
         shared_measured_u1_weights=shared,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(5,),
         enabled_now=False,
         now_monotonic=20.0,
     )
@@ -556,6 +674,7 @@ def test_jammer_off_ramp_preserves_complex_response_at_every_chunk() -> None:
         shared_measured_u1_weights=shared,
         shared_measured_u1_available=True,
         desired_vectors=vectors,
+        source_satellites=(5,),
         enabled_now=True,
         now_monotonic=20.01,
     )
@@ -569,6 +688,7 @@ def test_jammer_off_ramp_preserves_complex_response_at_every_chunk() -> None:
             shared_measured_u1_weights=shared,
             shared_measured_u1_available=True,
             desired_vectors={},
+            source_satellites=(5,),
             enabled_now=False,
             now_monotonic=21.0 + chunk_index / 10.0,
         )
@@ -587,7 +707,7 @@ def test_jammer_off_ramp_preserves_complex_response_at_every_chunk() -> None:
 
 def test_shared_u1_phase_can_skip_per_chunk_status_allocation() -> None:
     bank = SharedU1PhaseCompensationBank(
-        satellites=(3, 4, 7, 8),
+        source_count=4,
         channel_count=4,
         sample_rate_hz=4_000_000.0,
         samples_per_chunk=32_768,

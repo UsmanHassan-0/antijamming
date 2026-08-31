@@ -21,7 +21,6 @@ class LcmvCovarianceNullResult:
     weights: np.ndarray
     preserve_vector: np.ndarray
     null_vector: np.ndarray
-    null_angle_deg: float | None
     diagonal_loading: float
     condition_number_R: float
     condition_number: float
@@ -45,11 +44,6 @@ class LcmvModelResponse:
     response_db: np.ndarray
     response_power_db: np.ndarray
     response_db_epsilon: float
-    closest_grid_bearing_to_selected_null_deg: float | None
-    selected_null_grid_error_deg: float | None
-    model_response_at_selected_null_abs: float | None
-    model_response_at_selected_null_db: float | None
-    model_response_power_at_selected_null_db: float | None
     model_min_response_abs: float | None
     model_min_response_db: float | None
     model_min_response_bearing_deg: float | None
@@ -74,49 +68,6 @@ class _LcmvConstraintResult(TypedDict):
     null_residual: complex
 
 
-def covariance_lcmv_ideal_null_weights(
-    *,
-    covariance: np.ndarray,
-    n_channels: int,
-    null_angle_deg: float,
-    rf_freq_hz: float,
-    array_spacing_m: float,
-    preserve_vector: np.ndarray | None = None,
-    diagonal_loading_rel: float = 1e-3,
-    diagonal_loading_abs: float = 0.0,
-    condition_number_limit: float = 1e8,
-    max_weight_norm: float = 8.0,
-) -> LcmvCovarianceNullResult:
-    """Return full-covariance LCMV weights using an ideal steering null."""
-
-    n = int(n_channels)
-    if n != 4:
-        raise ValueError(f"covariance LCMV steering model expects 4 channels, got {n}")
-    null_angle = float(null_angle_deg) % 360.0
-    if not np.isfinite(null_angle):
-        raise ValueError("covariance LCMV null angle is not finite")
-    null_steering = np.asarray(
-        steering_vector(
-            np.asarray([null_angle], dtype=np.float64),
-            float(rf_freq_hz),
-            float(array_spacing_m),
-        ),
-        dtype=np.complex128,
-    ).reshape(-1)
-    if null_steering.size != n:
-        raise ValueError(
-            f"covariance LCMV steering vector size {null_steering.size} does not match {n}"
-        )
-    result = _covariance_lcmv_constraint_weights(
-        covariance=covariance,
-        preserve_vector=preserve_vector,
-        null_vector=null_steering,
-        diagonal_loading_rel=diagonal_loading_rel,
-        diagonal_loading_abs=diagonal_loading_abs,
-        condition_number_limit=condition_number_limit,
-        max_weight_norm=max_weight_norm,
-    )
-    return LcmvCovarianceNullResult(null_angle_deg=null_angle, **result)
 
 
 def covariance_lcmv_vector_null_weights(
@@ -151,7 +102,7 @@ def covariance_lcmv_vector_null_weights(
         condition_number_limit=condition_number_limit,
         max_weight_norm=max_weight_norm,
     )
-    return LcmvCovarianceNullResult(null_angle_deg=None, **result)
+    return LcmvCovarianceNullResult(**result)
 
 
 def _covariance_lcmv_constraint_weights(
@@ -328,7 +279,6 @@ def lcmv_model_response(
     scan_angles_deg: np.ndarray,
     rf_freq_hz: float,
     array_spacing_m: float,
-    selected_null_angle_deg: float | None = None,
     response_db_epsilon: float = RESPONSE_DB_EPS,
 ) -> LcmvModelResponse:
     """Return absolute model response arrays; no normalization is applied."""
@@ -352,11 +302,6 @@ def lcmv_model_response(
             response_db=empty,
             response_power_db=empty,
             response_db_epsilon=eps_input,
-            closest_grid_bearing_to_selected_null_deg=None,
-            selected_null_grid_error_deg=None,
-            model_response_at_selected_null_abs=None,
-            model_response_at_selected_null_db=None,
-            model_response_power_at_selected_null_db=None,
             model_min_response_abs=None,
             model_min_response_db=None,
             model_min_response_bearing_deg=None,
@@ -392,16 +337,6 @@ def lcmv_model_response(
     )
     min_idx = int(np.argmin(response_abs)) if response_abs.size else None
     max_idx = int(np.argmax(response_abs)) if response_abs.size else None
-    selected_idx: int | None = None
-    grid_error: float | None = None
-    if selected_null_angle_deg is not None and np.isfinite(
-        float(selected_null_angle_deg)
-    ):
-        distance = np.abs(
-            (scan_internal - float(selected_null_angle_deg) + 180.0) % 360.0 - 180.0
-        )
-        selected_idx = int(np.argmin(distance))
-        grid_error = float(distance[selected_idx])
 
     return LcmvModelResponse(
         scan_internal_angles_deg=scan_internal,
@@ -411,19 +346,6 @@ def lcmv_model_response(
         response_db=response_db,
         response_power_db=response_power_db,
         response_db_epsilon=eps,
-        closest_grid_bearing_to_selected_null_deg=(
-            float(display[selected_idx]) if selected_idx is not None else None
-        ),
-        selected_null_grid_error_deg=grid_error,
-        model_response_at_selected_null_abs=(
-            float(response_abs[selected_idx]) if selected_idx is not None else None
-        ),
-        model_response_at_selected_null_db=(
-            float(response_db[selected_idx]) if selected_idx is not None else None
-        ),
-        model_response_power_at_selected_null_db=(
-            float(response_power_db[selected_idx]) if selected_idx is not None else None
-        ),
         model_min_response_abs=float(response_abs[min_idx])
         if min_idx is not None
         else None,

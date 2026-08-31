@@ -24,19 +24,8 @@ def test_default_twinrx_antenna_map_is_by_physical_channel() -> None:
     ]
 
 
-def test_forced_antenna_overrides_channel_map() -> None:
-    device = _device_for_config(StreamConfig(antenna="rx2"))
-
-    assert [device._rx_antenna_for_channel(ch) for ch in (0, 1, 2, 3)] == [
-        "RX2",
-        "RX2",
-        "RX2",
-        "RX2",
-    ]
-
-
 def test_default_twinrx_lo_sharing_map_matches_two_board_layout() -> None:
-    device = _device_for_config(StreamConfig(twinrx_lo_sharing=True))
+    device = _device_for_config(StreamConfig())
 
     assert [device._rx_lo_source_for_channel(ch) for ch in (0, 1, 2, 3)] == [
         "internal",
@@ -93,6 +82,12 @@ class _FakeLoUsrp:
         index = min(self.lock_queries, len(self._lock_states) - 1)
         self.lock_queries += 1
         return _FakeSensor(str(self._lock_states[index]))
+
+
+class _FakeMissingLoSensorUsrp:
+    @staticmethod
+    def get_rx_sensor_names(_channel: int) -> list[str]:
+        return []
 
 
 class _FakeClock:
@@ -187,3 +182,18 @@ def test_lo_lock_wait_times_out_after_bounded_polling(
 
     assert clock.sleep_calls == [0.05, 0.05]
     assert device._lo_lock_wait_elapsed_s == pytest.approx(0.1)
+
+
+def test_lo_lock_wait_rejects_missing_sensor_instead_of_treating_it_as_locked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    device = _device_for_config(StreamConfig(channels=(0,), lo_lock_timeout_s=0.1))
+    device._usrp = _FakeMissingLoSensorUsrp()
+    monkeypatch.setattr("antijamming.radio.usrp.device.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("antijamming.radio.usrp.device.time.sleep", clock.sleep)
+
+    with pytest.raises(RuntimeError, match="lo_locked sensor not exposed"):
+        device._wait_for_lo_lock()
+
+    assert clock.sleep_calls == [0.05, 0.05]

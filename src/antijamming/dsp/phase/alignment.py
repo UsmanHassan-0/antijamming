@@ -86,8 +86,6 @@ class CalibrationCorrectionSelection:
     vector: np.ndarray
     phase_only_vector_available: bool
     complex_gain_vector_available: bool
-    fallback_used: bool
-    fallback_reason: str
     reference_channel: object
 
     def metadata(
@@ -105,8 +103,6 @@ class CalibrationCorrectionSelection:
             "calibration_correction_mode_applied": self.applied_mode,
             "complex_gain_vector_available": bool(self.complex_gain_vector_available),
             "phase_only_vector_available": bool(self.phase_only_vector_available),
-            "fallback_used": bool(self.fallback_used),
-            "fallback_reason": self.fallback_reason,
             "applied_correction_vector_real": [
                 _finite_float(np.real(value)) for value in vector
             ],
@@ -133,10 +129,13 @@ class CalibrationCorrectionSelection:
 
 
 def normalize_calibration_correction_mode(mode: object) -> str:
-    value = str(mode or CALIBRATION_MODE_COMPLEX_GAIN).strip().lower()
+    value = str(mode).strip().lower()
     if value in VALID_CALIBRATION_CORRECTION_MODES:
         return value
-    return CALIBRATION_MODE_COMPLEX_GAIN
+    allowed = ", ".join(sorted(VALID_CALIBRATION_CORRECTION_MODES))
+    raise ValueError(
+        f"unknown calibration_correction_mode={mode!r}; expected one of {allowed}"
+    )
 
 
 def load_calibration_correction_selection(
@@ -145,17 +144,11 @@ def load_calibration_correction_selection(
     mode: str = CALIBRATION_MODE_COMPLEX_GAIN,
     expected_channel_count: int | None = None,
 ) -> CalibrationCorrectionSelection:
-    """Load the requested runtime calibration vector with explicit fallback metadata."""
+    """Load the requested runtime calibration vector or reject it explicitly."""
 
     resolved = Path(path).expanduser()
     payload = _read_validated_calibration_payload(resolved)
     configured_mode = normalize_calibration_correction_mode(mode)
-    if str(mode or "").strip().lower() not in VALID_CALIBRATION_CORRECTION_MODES:
-        invalid_mode_reason = (
-            f"unknown calibration_correction_mode={mode!r}; using complex_gain"
-        )
-    else:
-        invalid_mode_reason = ""
 
     phase_vector, phase_error = _calibration_phase_only_vector(payload)
     complex_vector, complex_error = _calibration_complex_gain_vector(payload)
@@ -168,64 +161,33 @@ def load_calibration_correction_selection(
         expected_channel_count=expected_channel_count,
     )
 
-    fallback_used = bool(invalid_mode_reason)
-    fallback_reason = invalid_mode_reason
-    applied_mode = configured_mode
-    selected = phase_vector if phase_available else None
-
     if configured_mode == CALIBRATION_MODE_COMPLEX_GAIN:
-        if complex_available:
-            selected = complex_vector
-            applied_mode = CALIBRATION_MODE_COMPLEX_GAIN
-        else:
-            fallback_used = True
-            applied_mode = CALIBRATION_MODE_PHASE_ONLY
-            fallback_reason = (
-                "complex_gain requested but invalid: "
+        if not complex_available:
+            raise ValueError(
+                "complex_gain calibration is required but invalid: "
                 f"{complex_error or _vector_validation_reason(complex_vector, expected_channel_count)}"
             )
-            if phase_available:
-                selected = phase_vector
-            else:
-                selected = None
-                fallback_reason += (
-                    "; phase_only invalid: "
-                    f"{phase_error or _vector_validation_reason(phase_vector, expected_channel_count)}"
-                )
-    elif not phase_available:
-        fallback_used = True
-        applied_mode = CALIBRATION_MODE_PHASE_ONLY
-        selected = None
-        fallback_reason = (
-            (fallback_reason + "; " if fallback_reason else "")
-            + "phase_only invalid: "
-            + (
-                phase_error
-                or _vector_validation_reason(phase_vector, expected_channel_count)
+        selected = complex_vector
+    else:
+        if not phase_available:
+            raise ValueError(
+                "phase_only calibration is required but invalid: "
+                f"{phase_error or _vector_validation_reason(phase_vector, expected_channel_count)}"
             )
-        )
+        selected = phase_vector
 
-    if selected is None:
-        fallback_used = True
-        selected = np.ones(
-            (max(0, int(expected_channel_count or 0)),),
-            dtype=np.complex128,
+    if selected is None:  # Defensive type narrowing after the strict checks above.
+        raise RuntimeError(
+            f"validated {configured_mode} calibration did not produce a vector"
         )
-        if selected.size == 0:
-            selected = np.zeros((0,), dtype=np.complex128)
-        fallback_reason = (
-            fallback_reason + "; " if fallback_reason else ""
-        ) + "using all-ones correction vector"
 
     return CalibrationCorrectionSelection(
         file_path=resolved,
         configured_mode=configured_mode,
-        applied_mode=applied_mode,
+        applied_mode=configured_mode,
         vector=np.asarray(selected, dtype=np.complex128).reshape(-1),
         phase_only_vector_available=phase_available,
         complex_gain_vector_available=complex_available,
-        fallback_used=fallback_used,
-        fallback_reason=fallback_reason,
         reference_channel=_calibration_reference_channel(payload),
     )
 
