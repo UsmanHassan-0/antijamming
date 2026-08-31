@@ -16,6 +16,7 @@ import numpy as np
 # The phase monitor estimates relative phase against the array aggregate.
 # Runtime hardware calibration comes only from persisted calibration vectors.
 
+
 def phase_offsets_deg(buffer: np.ndarray) -> np.ndarray:
     """Estimate per-channel phase offsets relative to the array aggregate."""
     buffer = np.asarray(buffer, dtype=np.complex128)
@@ -32,7 +33,9 @@ def phase_offsets_deg(buffer: np.ndarray) -> np.ndarray:
     for ch in range(buffer.shape[0]):
         # Mean cross-array phase is stable for the narrowband calibration tone
         # and for short live chunks used by the GUI phase monitor.
-        cross = np.mean(np.asarray(buffer[ch], dtype=np.complex128) * np.conj(aggregate))
+        cross = np.mean(
+            np.asarray(buffer[ch], dtype=np.complex128) * np.conj(aggregate)
+        )
         offsets.append(float(np.degrees(np.angle(cross))))
     return np.asarray(offsets, dtype=np.float64)
 
@@ -48,7 +51,9 @@ def phase_correction_vector(buffer: np.ndarray) -> np.ndarray:
     return correction_vector_from_phase_offsets_deg(phase_offsets_deg(buffer))
 
 
-def correction_vector_from_phase_offsets_deg(offsets_deg: np.ndarray | list[float]) -> np.ndarray:
+def correction_vector_from_phase_offsets_deg(
+    offsets_deg: np.ndarray | list[float],
+) -> np.ndarray:
     """Convert measured phase offsets in degrees into complex correction weights."""
     offsets = np.asarray(offsets_deg, dtype=np.float64).reshape(-1)
     if offsets.size == 0:
@@ -85,7 +90,9 @@ class CalibrationCorrectionSelection:
     fallback_reason: str
     reference_channel: object
 
-    def metadata(self, *, expected_channel_count: int | None = None) -> dict[str, object]:
+    def metadata(
+        self, *, expected_channel_count: int | None = None
+    ) -> dict[str, object]:
         vector = np.asarray(self.vector, dtype=np.complex128).reshape(-1)
         magnitudes = np.abs(vector)
         phases_deg = np.degrees(np.angle(vector))
@@ -192,7 +199,10 @@ def load_calibration_correction_selection(
         fallback_reason = (
             (fallback_reason + "; " if fallback_reason else "")
             + "phase_only invalid: "
-            + (phase_error or _vector_validation_reason(phase_vector, expected_channel_count))
+            + (
+                phase_error
+                or _vector_validation_reason(phase_vector, expected_channel_count)
+            )
         )
 
     if selected is None:
@@ -204,9 +214,8 @@ def load_calibration_correction_selection(
         if selected.size == 0:
             selected = np.zeros((0,), dtype=np.complex128)
         fallback_reason = (
-            (fallback_reason + "; " if fallback_reason else "")
-            + "using all-ones correction vector"
-        )
+            fallback_reason + "; " if fallback_reason else ""
+        ) + "using all-ones correction vector"
 
     return CalibrationCorrectionSelection(
         file_path=resolved,
@@ -226,14 +235,18 @@ def load_phase_correction_vector(path: str | Path) -> np.ndarray:
     payload = _read_validated_calibration_payload(Path(path).expanduser())
     vector, error = _calibration_phase_only_vector(payload)
     if vector is None:
-        raise ValueError(error or f"No correction_vector or phase_offsets_deg in {path}")
+        raise ValueError(
+            error or f"No correction_vector or phase_offsets_deg in {path}"
+        )
     return vector
 
 
 def _read_validated_calibration_payload(resolved: Path) -> dict[str, object]:
     payload = json.loads(resolved.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError(f"Phase calibration file must contain a JSON object: {resolved}")
+        raise ValueError(
+            f"Phase calibration file must contain a JSON object: {resolved}"
+        )
     if payload.get("quality_pass") is False:
         raise ValueError(f"Refusing invalid phase calibration file: {resolved}")
     if "phase_offsets_std_deg" in payload:
@@ -259,7 +272,9 @@ def _calibration_phase_only_vector(
             return None, f"correction_vector invalid: {exc}"
     if "phase_offsets_deg" in payload:
         try:
-            return correction_vector_from_phase_offsets_deg(payload["phase_offsets_deg"]), ""
+            return correction_vector_from_phase_offsets_deg(
+                payload["phase_offsets_deg"]
+            ), ""
         except Exception as exc:
             return None, f"phase_offsets_deg invalid: {exc}"
     return None, "missing correction_vector and phase_offsets_deg"
@@ -346,6 +361,7 @@ def _finite_float(value: object) -> float | None:
 # Static calibration is the only runtime correction. If no calibration vector is
 # supplied, samples pass through unchanged instead of using any channel as master.
 
+
 def apply_phase_calibration(
     buffer: np.ndarray,
     correction_vector: np.ndarray | None = None,
@@ -361,4 +377,8 @@ def apply_phase_calibration(
         raise ValueError(
             f"phase correction size {correction.size} does not match channel count {buffer.shape[0]}"
         )
+    if not np.all(np.isfinite(buffer)):
+        raise ValueError("phase calibration buffer contains NaN or Inf")
+    if not np.all(np.isfinite(correction)):
+        raise ValueError("phase correction vector contains NaN or Inf")
     return np.asarray(buffer * correction[:, None], dtype=np.complex128)

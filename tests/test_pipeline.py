@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from antijamming.dsp.doa.music import (
     bartlett_spectrum,
@@ -14,7 +15,65 @@ from antijamming.dsp.pipeline import compute_realtime_metrics
 from antijamming.dsp.pipeline.stages import (
     _dominant_spectrum_peaks,
     compute_doa_metrics,
+    compute_phase_metrics,
 )
+
+
+@pytest.mark.parametrize(
+    "buffer",
+    [
+        np.empty((4, 0), dtype=np.complex128),
+        np.ones((3, 32), dtype=np.complex128),
+        np.full((4, 32), np.nan + 0j, dtype=np.complex128),
+    ],
+)
+def test_doa_metrics_reject_invalid_or_nonfinite_sample_buffers(buffer) -> None:
+    with pytest.raises(ValueError, match="DoA"):
+        compute_doa_metrics(
+            buffer,
+            center_freq_hz=1.57542e9,
+            scan_angles_deg=np.linspace(0.0, 359.0, 360),
+            array_spacing_m=0.07,
+        )
+
+
+@pytest.mark.parametrize(
+    "buffer",
+    [
+        np.empty((4, 0), dtype=np.complex128),
+        np.ones((32,), dtype=np.complex128),
+        np.full((4, 32), np.inf + 0j, dtype=np.complex128),
+    ],
+)
+def test_phase_metrics_reject_invalid_or_nonfinite_sample_buffers(buffer) -> None:
+    with pytest.raises(ValueError, match="phase metrics"):
+        compute_phase_metrics(buffer)
+
+
+def test_doa_metrics_reject_empty_or_nonfinite_scan() -> None:
+    samples = np.ones((4, 32), dtype=np.complex128)
+
+    with pytest.raises(ValueError, match="at least one scan angle"):
+        compute_doa_metrics(samples, 1.57542e9, np.asarray([]), 0.07)
+    with pytest.raises(ValueError, match="scan angles contain"):
+        compute_doa_metrics(samples, 1.57542e9, np.asarray([0.0, np.nan]), 0.07)
+
+
+@pytest.mark.parametrize(
+    ("frequency", "spacing", "angles"),
+    [
+        (np.nan, 0.07, np.asarray([0.0])),
+        (1.57542e9, 0.0, np.asarray([0.0])),
+        (1.57542e9, 0.07, np.asarray([np.inf])),
+    ],
+)
+def test_steering_vector_rejects_nonphysical_or_nonfinite_inputs(
+    frequency,
+    spacing,
+    angles,
+) -> None:
+    with pytest.raises(ValueError):
+        steering_vector(angles, frequency, spacing)
 
 
 def test_compute_realtime_metrics_shapes_and_ranges() -> None:
@@ -69,8 +128,7 @@ def test_doa_shared_covariance_matches_independent_reference_formulas() -> None:
 
     rng = np.random.default_rng(20260816)
     samples = (
-        rng.standard_normal((4, 4096))
-        + 1j * rng.standard_normal((4, 4096))
+        rng.standard_normal((4, 4096)) + 1j * rng.standard_normal((4, 4096))
     ).astype(np.complex128)
     scan_angles = np.linspace(0.0, 359.0, 720)
 
@@ -96,9 +154,7 @@ def test_doa_shared_covariance_matches_independent_reference_formulas() -> None:
         0.095,
         normalize=False,
     )
-    expected_eigenvalues, expected_eigenvectors = covariance_eigendecomposition(
-        samples
-    )
+    expected_eigenvalues, expected_eigenvectors = covariance_eigendecomposition(samples)
 
     np.testing.assert_allclose(actual["doa_raw_spectrum"], expected_music, rtol=1e-13)
     np.testing.assert_allclose(
@@ -259,7 +315,9 @@ def test_compute_realtime_metrics_clamps_music_sources_to_noise_subspace() -> No
     assert "doa_spectrum" not in metrics
 
 
-def test_compute_realtime_metrics_leaves_phase_uncorrected_without_static_calibration() -> None:
+def test_compute_realtime_metrics_leaves_phase_uncorrected_without_static_calibration() -> (
+    None
+):
     sample_count = 256
     t = np.linspace(0.0, 1.0, sample_count, endpoint=False)
     ref = np.exp(1j * 2.0 * np.pi * 3.0 * t)

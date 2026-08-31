@@ -56,6 +56,47 @@ def _runtime_config() -> StreamConfig:
     return build_runtime_config()
 
 
+def _reap_backend_process(
+    process: subprocess.Popen,
+    loggers: dict,
+    *,
+    initial_wait_s: float,
+) -> bool:
+    """Wait, terminate, then kill and reap one owned backend process."""
+
+    try:
+        process.wait(timeout=max(0.0, float(initial_wait_s)))
+        return True
+    except subprocess.TimeoutExpired:
+        loggers["errors"].error(
+            "Headless backend service did not exit within %.1f seconds; sending SIGTERM.",
+            max(0.0, float(initial_wait_s)),
+        )
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=5.0)
+        return True
+    except subprocess.TimeoutExpired:
+        loggers["errors"].error(
+            "Headless backend service ignored SIGTERM for 5.0 seconds; sending SIGKILL."
+        )
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=2.0)
+        return True
+    except subprocess.TimeoutExpired:
+        loggers["errors"].error(
+            "Headless backend service was not reaped within 2.0 seconds after SIGKILL."
+        )
+        return False
+
+
 def _run_gui(
     cfg: StreamConfig,
     *,
@@ -90,62 +131,59 @@ def _run_gui(
         or "no native pool reported",
     )
     socket_path = Path("/tmp") / f"antijamming-gui-{os.getpid()}.sock"
-    backend_process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "antijamming.app.headless",
-            "--socket",
-            str(socket_path),
-        ],
-        cwd=str(REPO_ROOT),
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    try:
+        backend_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "antijamming.app.headless",
+                "--socket",
+                str(socket_path),
+            ],
+            cwd=str(REPO_ROOT),
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except BaseException:
+        uhd_marker_monitor.stop()
+        raise
     worker = RemoteStreamWorker(socket_path)
     try:
         worker.connect_service(timeout_s=8.0)
-    except Exception:
-        try:
-            os.killpg(backend_process.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            backend_process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(backend_process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+    except BaseException:
+        worker.close()
+        _reap_backend_process(
+            backend_process,
+            loggers,
+            initial_wait_s=0.0,
+        )
+        uhd_marker_monitor.stop()
         raise
-    win = MainWindow(cfg, worker)
     shutdown_requested = {"value": False}
+    cleanup_completed = {"value": False}
 
     def _cleanup_worker() -> None:
+        if cleanup_completed["value"]:
+            return
+        cleanup_completed["value"] = True
         uhd_marker_monitor.stop()
         if worker.isRunning():
             worker.stop()
             if not worker.wait(10000):
                 loggers["errors"].error("GUI worker did not stop within 10 seconds.")
         worker.shutdown_service("standalone GUI exit")
-        try:
-            backend_process.wait(timeout=18.0)
-        except subprocess.TimeoutExpired:
-            loggers["errors"].error(
-                "Headless backend service did not exit within 18 seconds; sending SIGTERM."
-            )
-            try:
-                os.killpg(backend_process.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-            try:
-                backend_process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(backend_process.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+        _reap_backend_process(
+            backend_process,
+            loggers,
+            initial_wait_s=18.0,
+        )
         worker.close()
+
+    try:
+        win = MainWindow(cfg, worker)
+    except BaseException:
+        _cleanup_worker()
+        raise
 
     def _request_shutdown(reason: str) -> None:
         if shutdown_requested["value"]:
@@ -164,8 +202,12 @@ def _run_gui(
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(sig, _handle_signal)
-        except Exception:
-            pass
+        except Exception as exc:
+            loggers["errors"].warning(
+                "Could not install GUI signal handler for %s: %s",
+                sig,
+                exc,
+            )
 
     signal_timer = QTimer(app)
     signal_timer.timeout.connect(lambda: None)
@@ -205,8 +247,14 @@ def _run_gui(
         app.platformName(),
         win.geometry().getRect(),
     )
-    print("[run_realtime] GUI window shown. Check logs/app.log if it is not visible.", flush=True)
-    return app.exec()
+    print(
+        "[run_realtime] GUI window shown. Check logs/app.log if it is not visible.",
+        flush=True,
+    )
+    try:
+        return app.exec()
+    finally:
+        _cleanup_worker()
 
 
 def run() -> int:

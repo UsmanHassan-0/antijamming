@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import math
+from typing import Any
 
 import numpy as np
 
@@ -40,6 +41,8 @@ def signal_power_metrics(
             f"{prefix}_iq_correlation_coefficient": None,
             f"{prefix}_noncircularity_abs": None,
         }
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{prefix} samples contain NaN or Inf")
 
     magnitudes = np.abs(values).astype(np.float64, copy=False)
     real_abs = np.abs(values.real).astype(np.float64, copy=False)
@@ -50,7 +53,9 @@ def signal_power_metrics(
     rms = float(math.sqrt(max(power, 0.0)))
     threshold = max(0.0, float(component_threshold))
     near_full_scale_pct = (
-        100.0 * float(np.count_nonzero(component_abs >= threshold)) / max(sample_count, 1)
+        100.0
+        * float(np.count_nonzero(component_abs >= threshold))
+        / max(sample_count, 1)
     )
     mean_complex = complex(np.mean(values.astype(np.complex128, copy=False)))
     centered = values.astype(np.complex128, copy=False) - mean_complex
@@ -64,9 +69,7 @@ def signal_power_metrics(
     iq_denom = math.sqrt(max(i_ac_power * q_ac_power, 0.0))
     iq_correlation = iq_cross / iq_denom if iq_denom > POWER_EPS else None
     noncircularity = (
-        float(abs(np.mean(centered**2)) / ac_power)
-        if ac_power > POWER_EPS
-        else None
+        float(abs(np.mean(centered**2)) / ac_power) if ac_power > POWER_EPS else None
     )
     return {
         f"{prefix}_sample_count": sample_count,
@@ -114,6 +117,8 @@ def cross_channel_delay_metrics(
             "delay_estimator": "gcc_phat_parabolic",
             "delay_estimate_available": False,
         }
+    if not np.all(np.isfinite(values)):
+        raise ValueError("cross-channel delay samples contain NaN or Inf")
     rate = float(sample_rate_hz)
     ref_index = int(reference_channel)
     if not math.isfinite(rate) or rate <= 0.0 or not 0 <= ref_index < values.shape[0]:
@@ -186,7 +191,9 @@ def cross_channel_delay_metrics(
             )
         )
         coefficient = abs(numerator) / denominator if denominator > POWER_EPS else None
-        phase_deg = float(np.degrees(np.angle(numerator))) if denominator > POWER_EPS else None
+        phase_deg = (
+            float(np.degrees(np.angle(numerator))) if denominator > POWER_EPS else None
+        )
         delays.append(_finite_float(delay_samples))
         delays_ns.append(_finite_float(delay_samples * 1e9 / rate))
         correlations.append(_finite_float(coefficient))
@@ -231,7 +238,10 @@ def channel_power_metrics(
         power = ch_metrics.get(f"{prefix}_ch{channel}_power_linear")
         if isinstance(power, (int, float)) and math.isfinite(float(power)):
             powers.append(float(power))
-            powers_db.append(power_db(float(power)))
+            power_db_value = power_db(float(power))
+            powers_db.append(
+                float(power_db_value) if power_db_value is not None else float("nan")
+            )
         else:
             powers.append(float("nan"))
             powers_db.append(float("nan"))
@@ -301,7 +311,9 @@ def output_reduction_metrics(
             lcmv_output_power_linear,
         ),
         "uniform_vs_raw_avg_channel_db": ratio_db(raw_avg, uniform_output_power_linear),
-        "uniform_vs_raw_sum_channels_db": ratio_db(raw_sum, uniform_output_power_linear),
+        "uniform_vs_raw_sum_channels_db": ratio_db(
+            raw_sum, uniform_output_power_linear
+        ),
         "lcmv_vs_uniform_power_ratio_linear": linear_ratio(
             lcmv_output_power_linear,
             uniform_output_power_linear,
@@ -511,7 +523,9 @@ def rms_db(rms_linear: float | None) -> float | None:
     return 20.0 * math.log10(max(rms, math.sqrt(POWER_EPS)))
 
 
-def ratio_db(numerator_power: float | None, denominator_power: float | None) -> float | None:
+def ratio_db(
+    numerator_power: float | None, denominator_power: float | None
+) -> float | None:
     if numerator_power is None or denominator_power is None:
         return None
     numerator = float(numerator_power)
@@ -521,7 +535,9 @@ def ratio_db(numerator_power: float | None, denominator_power: float | None) -> 
     return 10.0 * math.log10(max(numerator, POWER_EPS) / max(denominator, POWER_EPS))
 
 
-def linear_ratio(numerator_power: float | None, denominator_power: float | None) -> float | None:
+def linear_ratio(
+    numerator_power: float | None, denominator_power: float | None
+) -> float | None:
     if numerator_power is None or denominator_power is None:
         return None
     numerator = float(numerator_power)
@@ -542,14 +558,16 @@ def complex_vector_payload(values: object) -> dict[str, list[float | None]]:
 
 
 def _channel_index(powers: Sequence[float], *, strongest: bool) -> int | None:
-    finite = [(idx, float(power)) for idx, power in enumerate(powers) if math.isfinite(power)]
+    finite = [
+        (idx, float(power)) for idx, power in enumerate(powers) if math.isfinite(power)
+    ]
     if not finite:
         return None
     key = max if strongest else min
     return int(key(finite, key=lambda item: item[1])[0])
 
 
-def _finite_float(value: object) -> float | None:
+def _finite_float(value: Any) -> float | None:
     try:
         number = float(value)
     except (TypeError, ValueError):

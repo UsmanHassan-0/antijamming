@@ -651,6 +651,9 @@ class SharedU1DesiredVectorMonitor:
         self._queue: queue.Queue[
             tuple[int, np.ndarray, np.ndarray] | None
         ] = queue.Queue(maxsize=256)
+        self._stop = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._accepting_samples = False
         self._thread: threading.Thread | None = None
         self._spans: deque[_RawSpan] = deque()
         self._latest_end = 0
@@ -676,27 +679,43 @@ class SharedU1DesiredVectorMonitor:
             }
 
     def start(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = self._path.open("a", encoding="utf-8", buffering=1)
-        self._thread = threading.Thread(
-            target=self._run,
-            name="gnss_shared_u1_phase_vectors",
-            daemon=True,
-        )
-        self._thread.start()
-        self._write(
-            {
-                "event": "shared_u1_phase_vector_monitor_start",
-                "schema_version": 1,
-                "satellites": sorted(self._satellite_rows),
-                "dynamic_channel_prn_mapping": self._dynamic_sources,
-                "source_count": self._source_count,
-                "purpose": (
-                    "PRN code-despread desired vectors for shared measured-U1 "
-                    "LCMV complex-response compensation; no per-PRN LCMV solve"
-                ),
-            }
-        )
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._queue = queue.Queue(maxsize=256)
+            self._stop.clear()
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = self._path.open("a", encoding="utf-8", buffering=1)
+            self._write(
+                {
+                    "event": "shared_u1_phase_vector_monitor_start",
+                    "schema_version": 1,
+                    "satellites": sorted(self._satellite_rows),
+                    "dynamic_channel_prn_mapping": self._dynamic_sources,
+                    "source_count": self._source_count,
+                    "purpose": (
+                        "PRN code-despread desired vectors for shared measured-U1 "
+                        "LCMV complex-response compensation; no per-PRN LCMV solve"
+                    ),
+                }
+            )
+            self._thread = threading.Thread(
+                target=self._run,
+                name="gnss_shared_u1_phase_vectors",
+                daemon=True,
+            )
+            self._accepting_samples = True
+            try:
+                self._thread.start()
+            except BaseException:
+                self._accepting_samples = False
+                self._stop.set()
+                self._thread = None
+                handle = self._handle
+                self._handle = None
+                if handle is not None:
+                    handle.close()
+                raise
 
     def submit(
         self,
@@ -704,9 +723,12 @@ class SharedU1DesiredVectorMonitor:
         raw_chunk: np.ndarray,
         logical_weights: np.ndarray,
     ) -> None:
+        with self._lifecycle_lock:
+            if not self._accepting_samples:
+                return
         item = (
             int(sample_start),
-            np.asarray(raw_chunk, dtype=np.complex64),
+            np.array(raw_chunk, dtype=np.complex64, copy=True, order="C"),
             np.asarray(logical_weights, dtype=np.complex128).copy(),
         )
         try:
@@ -714,7 +736,11 @@ class SharedU1DesiredVectorMonitor:
         except queue.Full:
             self._queue_drops += 1
 
-    def stop(self) -> None:
+    def stop(self, timeout_s: float = 3.0) -> bool:
+        with self._lifecycle_lock:
+            self._accepting_samples = False
+            self._stop.set()
+            thread = self._thread
         try:
             self._queue.put_nowait(None)
         except queue.Full:
@@ -723,43 +749,59 @@ class SharedU1DesiredVectorMonitor:
                 self._queue.put_nowait(None)
             except (queue.Empty, queue.Full):
                 pass
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-        self._thread = None
-        self._write(
-            {
-                "event": "shared_u1_phase_vector_monitor_stop",
-                "queue_drops": self._queue_drops,
-            }
-        )
-        handle = self._handle
-        self._handle = None
-        if handle is not None:
-            handle.close()
+        if (
+            thread is not None
+            and thread.ident is not None
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=max(0.0, float(timeout_s)))
+        stopped = thread is None or not thread.is_alive()
+        if not stopped:
+            self._logger.error(
+                "Shared-U1 phase vector monitor did not stop within %.3f s; "
+                "retaining its thread and log handle until worker exit.",
+                max(0.0, float(timeout_s)),
+            )
+        return stopped
 
     def _run(self) -> None:
-        while True:
-            try:
-                item = self._queue.get(timeout=0.1)
-            except queue.Empty:
-                item = ()
-            if item is None:
-                return
-            if item:
-                self._append_span(*item)
-            now = time.monotonic()
-            if (
-                self._latest_end > 0
-                and now - self._last_measurement_monotonic
-                >= self._measurement_interval_s
-            ):
-                self._last_measurement_monotonic = now
+        try:
+            while not self._stop.is_set():
                 try:
-                    self._measure_tracking()
-                except Exception as exc:
-                    self._logger.warning(
-                        "Shared-U1 PRN vector measurement failed: %s", exc
-                    )
+                    item = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    item = ()
+                if item is None or self._stop.is_set():
+                    return
+                if item:
+                    self._append_span(*item)
+                now = time.monotonic()
+                if (
+                    self._latest_end > 0
+                    and now - self._last_measurement_monotonic
+                    >= self._measurement_interval_s
+                ):
+                    self._last_measurement_monotonic = now
+                    try:
+                        self._measure_tracking()
+                    except Exception as exc:
+                        self._logger.warning(
+                            "Shared-U1 PRN vector measurement failed: %s", exc
+                        )
+        finally:
+            with self._lifecycle_lock:
+                self._write(
+                    {
+                        "event": "shared_u1_phase_vector_monitor_stop",
+                        "queue_drops": self._queue_drops,
+                    }
+                )
+                handle = self._handle
+                self._handle = None
+                if handle is not None:
+                    handle.close()
+                if self._thread is threading.current_thread():
+                    self._thread = None
 
     def _append_span(
         self,

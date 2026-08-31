@@ -21,5 +21,9 @@ def apply_beamformer(x: np.ndarray, weights: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"combiner weight count {w.size} does not match channel count {samples.shape[0]}"
         )
+    if not np.all(np.isfinite(samples)):
+        raise ValueError("combiner samples contain NaN or Inf")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("combiner weights contain NaN or Inf")
     y = w.conj() @ samples
     return np.asarray(y, dtype=np.complex64)

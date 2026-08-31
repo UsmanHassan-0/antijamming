@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, TypedDict
 
 import numpy as np
 
@@ -55,6 +56,22 @@ class LcmvModelResponse:
     model_max_response_abs: float | None
     model_max_response_db: float | None
     model_max_response_bearing_deg: float | None
+
+
+class _LcmvConstraintResult(TypedDict):
+    weights: np.ndarray
+    preserve_vector: np.ndarray
+    null_vector: np.ndarray
+    diagonal_loading: float
+    condition_number_R: float
+    condition_number: float
+    weight_norm: float
+    max_weight_abs: float
+    preserve_target: complex
+    preserve_response: complex
+    null_response: complex
+    preserve_residual: complex
+    null_residual: complex
 
 
 def covariance_lcmv_ideal_null_weights(
@@ -119,7 +136,9 @@ def covariance_lcmv_vector_null_weights(
     if n == 0:
         raise ValueError("covariance measured-vector LCMV null vector is empty")
     if not np.all(np.isfinite(vector)):
-        raise ValueError("covariance measured-vector LCMV null vector contains NaN or Inf")
+        raise ValueError(
+            "covariance measured-vector LCMV null vector contains NaN or Inf"
+        )
     vector_norm = float(np.linalg.norm(vector))
     if not np.isfinite(vector_norm) or vector_norm <= 0.0:
         raise ValueError("covariance measured-vector LCMV null vector has zero norm")
@@ -144,7 +163,7 @@ def _covariance_lcmv_constraint_weights(
     diagonal_loading_abs: float,
     condition_number_limit: float,
     max_weight_norm: float,
-) -> dict[str, object]:
+) -> _LcmvConstraintResult:
     cov = np.asarray(covariance, dtype=np.complex128)
     null_vector = np.asarray(null_vector, dtype=np.complex128).reshape(-1)
     if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
@@ -167,6 +186,18 @@ def _covariance_lcmv_constraint_weights(
         raise ValueError("covariance LCMV inputs contain NaN or Inf")
     if not np.all(np.isfinite(null_vector)):
         raise ValueError("covariance LCMV null vector contains NaN or Inf")
+    if not np.allclose(cov, cov.conj().T, rtol=1e-7, atol=1e-12):
+        raise ValueError("covariance LCMV covariance is not Hermitian")
+    cov = 0.5 * (cov + cov.conj().T)
+    covariance_eigenvalues = np.linalg.eigvalsh(cov)
+    covariance_scale = float(
+        max(
+            float(np.max(np.abs(covariance_eigenvalues))),
+            float(np.finfo(np.float64).tiny),
+        )
+    )
+    if float(np.min(covariance_eigenvalues)) < -1e-10 * covariance_scale:
+        raise ValueError("covariance LCMV covariance is not positive semidefinite")
     preserve_norm_value = float(np.linalg.norm(preserve))
     null_norm_value = float(np.linalg.norm(null_vector))
     if not np.isfinite(preserve_norm_value) or preserve_norm_value <= 0.0:
@@ -186,7 +217,10 @@ def _covariance_lcmv_constraint_weights(
     )
     loaded = cov + loading * np.eye(n, dtype=np.complex128)
     cond_r = float(np.linalg.cond(loaded))
-    limit = float(condition_number_limit)
+    limit = _positive_finite_value(
+        condition_number_limit,
+        label="covariance LCMV condition-number limit",
+    )
     if not np.isfinite(cond_r) or cond_r > limit:
         raise ValueError(
             "covariance LCMV loaded covariance ill-conditioned: "
@@ -240,8 +274,16 @@ def _diagonal_loading_value(
 ) -> float:
     cov = np.asarray(covariance, dtype=np.complex128)
     n = max(int(cov.shape[0]), 1)
-    rel = max(0.0, float(diagonal_loading_rel))
-    absolute = max(0.0, float(diagonal_loading_abs))
+    rel = float(diagonal_loading_rel)
+    absolute = float(diagonal_loading_abs)
+    if not np.isfinite(rel) or rel < 0.0:
+        raise ValueError(
+            "covariance LCMV relative diagonal loading must be finite and nonnegative"
+        )
+    if not np.isfinite(absolute) or absolute < 0.0:
+        raise ValueError(
+            "covariance LCMV absolute diagonal loading must be finite and nonnegative"
+        )
     trace_mean = float(np.real(np.trace(cov)) / float(n))
     if not np.isfinite(trace_mean) or trace_mean < 0.0:
         trace_mean = 0.0
@@ -262,10 +304,22 @@ def _validated_weight_vector(
     if not np.all(np.isfinite(w)):
         raise ValueError(f"{label} weights contain NaN or Inf")
     weight_norm = float(np.linalg.norm(w))
-    norm_limit = float(max_weight_norm)
+    norm_limit = _positive_finite_value(
+        max_weight_norm,
+        label=f"{label} maximum weight norm",
+    )
     if not np.isfinite(weight_norm) or weight_norm > norm_limit:
-        raise ValueError(f"{label} weight norm {weight_norm:.3f} exceeds limit {norm_limit:.3f}")
+        raise ValueError(
+            f"{label} weight norm {weight_norm:.3f} exceeds limit {norm_limit:.3f}"
+        )
     return w
+
+
+def _positive_finite_value(value: Any, *, label: str) -> float:
+    number = float(value)
+    if not np.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{label} must be a positive finite value")
+    return number
 
 
 def lcmv_model_response(
@@ -281,6 +335,13 @@ def lcmv_model_response(
 
     w = np.asarray(weights, dtype=np.complex128).reshape(-1)
     scan_internal = np.asarray(scan_angles_deg, dtype=np.float64).reshape(-1)
+    eps_input = float(response_db_epsilon)
+    if not np.isfinite(eps_input) or eps_input <= 0.0:
+        raise ValueError("LCMV model response epsilon must be a positive finite value")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("LCMV model response weights contain NaN or Inf")
+    if not np.all(np.isfinite(scan_internal)):
+        raise ValueError("LCMV model response scan angles contain NaN or Inf")
     if w.size == 0 or scan_internal.size == 0:
         empty = np.zeros((0,), dtype=np.float64)
         return LcmvModelResponse(
@@ -290,7 +351,7 @@ def lcmv_model_response(
             response_power=empty,
             response_db=empty,
             response_power_db=empty,
-            response_db_epsilon=float(response_db_epsilon),
+            response_db_epsilon=eps_input,
             closest_grid_bearing_to_selected_null_deg=None,
             selected_null_grid_error_deg=None,
             model_response_at_selected_null_abs=None,
@@ -304,6 +365,9 @@ def lcmv_model_response(
             model_max_response_bearing_deg=None,
         )
 
+    if w.size != 4:
+        raise ValueError(f"LCMV model response expects 4 weights, got {w.size}")
+
     steering = steering_vector(
         scan_internal,
         float(rf_freq_hz),
@@ -311,22 +375,31 @@ def lcmv_model_response(
     )
     response_abs = np.asarray(np.abs(w.conj() @ steering), dtype=np.float64)
     response_power = np.asarray(response_abs**2, dtype=np.float64)
-    eps = max(float(response_db_epsilon), np.finfo(np.float64).tiny)
-    response_db = np.asarray(20.0 * np.log10(np.maximum(response_abs, eps)), dtype=np.float64)
+    eps = float(max(eps_input, float(np.finfo(np.float64).tiny)))
+    response_db = np.asarray(
+        20.0 * np.log10(np.maximum(response_abs, eps)), dtype=np.float64
+    )
     response_power_db = np.asarray(
         10.0 * np.log10(np.maximum(response_power, eps)),
         dtype=np.float64,
     )
     display = np.asarray(
-        [internal_angle_to_operator_bearing_deg(float(angle)) for angle in scan_internal],
+        [
+            internal_angle_to_operator_bearing_deg(float(angle))
+            for angle in scan_internal
+        ],
         dtype=np.float64,
     )
     min_idx = int(np.argmin(response_abs)) if response_abs.size else None
     max_idx = int(np.argmax(response_abs)) if response_abs.size else None
     selected_idx: int | None = None
     grid_error: float | None = None
-    if selected_null_angle_deg is not None and np.isfinite(float(selected_null_angle_deg)):
-        distance = np.abs((scan_internal - float(selected_null_angle_deg) + 180.0) % 360.0 - 180.0)
+    if selected_null_angle_deg is not None and np.isfinite(
+        float(selected_null_angle_deg)
+    ):
+        distance = np.abs(
+            (scan_internal - float(selected_null_angle_deg) + 180.0) % 360.0 - 180.0
+        )
         selected_idx = int(np.argmin(distance))
         grid_error = float(distance[selected_idx])
 
@@ -351,10 +424,22 @@ def lcmv_model_response(
         model_response_power_at_selected_null_db=(
             float(response_power_db[selected_idx]) if selected_idx is not None else None
         ),
-        model_min_response_abs=float(response_abs[min_idx]) if min_idx is not None else None,
-        model_min_response_db=float(response_db[min_idx]) if min_idx is not None else None,
-        model_min_response_bearing_deg=float(display[min_idx]) if min_idx is not None else None,
-        model_max_response_abs=float(response_abs[max_idx]) if max_idx is not None else None,
-        model_max_response_db=float(response_db[max_idx]) if max_idx is not None else None,
-        model_max_response_bearing_deg=float(display[max_idx]) if max_idx is not None else None,
+        model_min_response_abs=float(response_abs[min_idx])
+        if min_idx is not None
+        else None,
+        model_min_response_db=float(response_db[min_idx])
+        if min_idx is not None
+        else None,
+        model_min_response_bearing_deg=float(display[min_idx])
+        if min_idx is not None
+        else None,
+        model_max_response_abs=float(response_abs[max_idx])
+        if max_idx is not None
+        else None,
+        model_max_response_db=float(response_db[max_idx])
+        if max_idx is not None
+        else None,
+        model_max_response_bearing_deg=float(display[max_idx])
+        if max_idx is not None
+        else None,
     )

@@ -23,7 +23,7 @@ tools/mark_rf_event.py --event jammer_off
 tools/mark_rf_event.py --event bladeRF_off
 ```
 
-The helper and GUI append atomic JSONL to both `logs/operator_events.log` and the current run's `operator_events.jsonl`. Without them, the audit still reports automatic inference, transitions, weights, tracking continuity and added-scene suppression, but does not claim physical jammer truth. See `docs/15_self_run_live_evidence.md` for the complete preservation, jammer-cycle, re-arm, carrier-continuity, and report procedure.
+The helper and GUI append atomic JSONL to both `logs/operator_events.log` and the current run's `operator_events.jsonl`. Without them, the audit still reports automatic inference, transitions, weights, tracking continuity and added-scene suppression, but does not claim physical jammer truth. See `docs/audits/self_run_live_evidence.md` for the complete preservation, jammer-cycle, re-arm, carrier-continuity, and report procedure.
 
 Warnings to inspect:
 

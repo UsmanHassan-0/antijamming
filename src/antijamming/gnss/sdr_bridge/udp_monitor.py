@@ -53,9 +53,13 @@ class UdpMonitorMixin:
                 args=(spec, sock),
                 daemon=True,
             )
+            try:
+                thread.start()
+            except BaseException:
+                sock.close()
+                raise
             self._udp_monitor_sockets.append(sock)
             self._udp_monitor_threads.append(thread)
-            thread.start()
             self._handoff_log.info(
                 "GNSS-SDR UDP %s monitor listening on 127.0.0.1:%d",
                 spec.name,
@@ -72,8 +76,15 @@ class UdpMonitorMixin:
                 pass
         threads = list(getattr(self, "_udp_monitor_threads", []))
         for thread in threads:
-            thread.join(timeout=1.0)
-        self._udp_monitor_threads.clear()
+            if thread.ident is not None and thread is not threading.current_thread():
+                thread.join(timeout=1.0)
+        live_threads = [thread for thread in threads if thread.is_alive()]
+        self._udp_monitor_threads[:] = live_threads
+        if live_threads:
+            self._err_log.error(
+                "GNSS-SDR UDP monitor threads did not stop within 1.0 s: %s",
+                ",".join(thread.name for thread in live_threads),
+            )
 
     def _udp_monitor_specs(self) -> list[_UdpMonitorSpec]:
         specs: list[_UdpMonitorSpec] = []

@@ -13,6 +13,7 @@ from antijamming.dsp.diagnostics import (
     covariance_output_power,
     channel_power_metrics,
     output_reduction_metrics,
+    signal_power_metrics,
     spatial_vector_coherence_metrics,
 )
 
@@ -112,7 +113,10 @@ def test_spatial_vector_coherence_aligns_arbitrary_eigenvector_phase() -> None:
     assert metrics["ideal_measured_coherence_abs"] == pytest.approx(1.0)
     assert metrics["ideal_measured_mismatch_power"] == pytest.approx(0.0, abs=1e-12)
     assert metrics["ideal_measured_principal_angle_deg"] == pytest.approx(0.0)
-    assert max(abs(v or 0.0) for v in metrics["u1_aligned_over_ideal_phase_diff_deg"]) < 1e-9
+    assert (
+        max(abs(v or 0.0) for v in metrics["u1_aligned_over_ideal_phase_diff_deg"])
+        < 1e-9
+    )
 
 
 def test_component_power_after_beamformer_reports_predicted_suppression() -> None:
@@ -141,3 +145,100 @@ def test_covariance_output_power_matches_quadratic_form() -> None:
     power = covariance_output_power(covariance=covariance, weights=weights)
 
     assert power == pytest.approx(1.25)
+
+
+def test_signal_power_metrics_rejects_nonfinite_iq() -> None:
+    with pytest.raises(ValueError, match="samples contain NaN or Inf"):
+        signal_power_metrics(
+            np.asarray([1.0 + 0.0j, np.nan + 0.0j]),
+            prefix="raw",
+        )
+
+
+@pytest.mark.parametrize(
+    ("covariance", "message"),
+    [
+        (
+            np.asarray(
+                [
+                    [1.0, 1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                dtype=np.complex128,
+            ),
+            "not Hermitian",
+        ),
+        (
+            np.diag([-1.0, 1.0, 1.0, 1.0]).astype(np.complex128),
+            "not positive semidefinite",
+        ),
+    ],
+)
+def test_covariance_lcmv_rejects_invalid_covariance(covariance, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        covariance_lcmv_vector_null_weights(
+            covariance=covariance,
+            null_vector=np.asarray([1.0, -1.0, 1.0, -1.0]),
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"diagonal_loading_rel": np.nan},
+        {"diagonal_loading_abs": np.inf},
+        {"condition_number_limit": np.nan},
+        {"max_weight_norm": np.inf},
+    ],
+)
+def test_covariance_lcmv_rejects_nonfinite_control_values(kwargs) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        covariance_lcmv_vector_null_weights(
+            covariance=np.eye(4, dtype=np.complex128),
+            null_vector=np.asarray([1.0, -1.0, 1.0, -1.0]),
+            **kwargs,
+        )
+
+
+def test_lcmv_model_response_rejects_nonfinite_epsilon() -> None:
+    with pytest.raises(ValueError, match="epsilon"):
+        lcmv_model_response(
+            weights=np.ones((4,), dtype=np.complex128),
+            scan_angles_deg=np.asarray([0.0, 90.0]),
+            rf_freq_hz=1.57542e9,
+            array_spacing_m=0.07,
+            response_db_epsilon=np.nan,
+        )
+
+
+def test_covariance_lcmv_random_psd_cases_satisfy_both_constraints() -> None:
+    rng = np.random.default_rng(20260831)
+    preserve = np.ones((4,), dtype=np.complex128)
+
+    for _ in range(100):
+        matrix = rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4))
+        covariance = matrix @ matrix.conj().T + 0.05 * np.eye(4)
+        null_vector = rng.standard_normal(4) + 1j * rng.standard_normal(4)
+        result = covariance_lcmv_vector_null_weights(
+            covariance=covariance,
+            null_vector=null_vector,
+            diagonal_loading_rel=1e-3,
+            condition_number_limit=1e12,
+            max_weight_norm=100.0,
+        )
+
+        np.testing.assert_allclose(
+            np.vdot(preserve, result.weights),
+            4.0 + 0.0j,
+            rtol=1e-9,
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            np.vdot(result.null_vector, result.weights),
+            0.0 + 0.0j,
+            rtol=0.0,
+            atol=1e-9,
+        )
+        assert np.all(np.isfinite(result.weights))

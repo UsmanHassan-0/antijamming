@@ -159,6 +159,7 @@ class BackendRuntime:
             "bladeRF_gain_db": None,
         }
         self._running = False
+        self._lifecycle_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._angle_scan = config.angle_scan_spec()
         self._scan_angles_deg = self._angle_scan.values()
@@ -361,14 +362,19 @@ class BackendRuntime:
     # -------------------------------------------------------------------------
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(
-            target=self.run,
-            name="antijamming_backend",
-            daemon=False,
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(
+                target=self.run,
+                name="antijamming_backend",
+                daemon=False,
+            )
+            try:
+                self._thread.start()
+            except BaseException:
+                self._thread = None
+                raise
 
     def wait(self, timeout: float | None = None) -> bool:
         thread = self._thread
@@ -626,12 +632,13 @@ class BackendRuntime:
                     self._shared_u1_phase_monitor.start()
                 else:
                     self._shared_u1_phase_monitor = None
-                self._gnss_handoff_thread = threading.Thread(
+                gnss_handoff_thread = threading.Thread(
                     target=self._gnss_beamform_loop,
                     name="gnss_ordered_handoff",
                     daemon=True,
                 )
-                self._gnss_handoff_thread.start()
+                gnss_handoff_thread.start()
+                self._gnss_handoff_thread = gnss_handoff_thread
                 self._loggers["transport"].info(
                     "GNSS pipeline: thread gnss_ordered_handoff "
                     "(raw_q=%d, buffer=%.2fs, memory=%.1f MiB); recv() publishes "
@@ -668,21 +675,30 @@ class BackendRuntime:
             self._rx_health_chunk_counter = 0
             self._dsp_chunk_counter = 0
 
-            self._rx_thread = threading.Thread(
+            rx_thread = threading.Thread(
                 target=self._rx_drain_loop,
                 name="usrp_rx_drain",
                 daemon=True,
             )
-            self._rx_thread.start()
+            rx_thread.start()
+            self._rx_thread = rx_thread
 
-            self._phase_thread = threading.Thread(
-                target=self._phase_loop, name="dsp_phase", daemon=True
+            phase_thread = threading.Thread(
+                target=self._run_dsp_stage,
+                args=("phase", self._phase_loop),
+                name="dsp_phase",
+                daemon=True,
             )
-            self._doa_thread = threading.Thread(
-                target=self._doa_loop, name="dsp_doa", daemon=True
+            phase_thread.start()
+            self._phase_thread = phase_thread
+            doa_thread = threading.Thread(
+                target=self._run_dsp_stage,
+                args=("doa", self._doa_loop),
+                name="dsp_doa",
+                daemon=True,
             )
-            self._phase_thread.start()
-            self._doa_thread.start()
+            doa_thread.start()
+            self._doa_thread = doa_thread
 
             while self._running:
                 now = time.monotonic()
@@ -702,31 +718,28 @@ class BackendRuntime:
             self._running = False
             self._emit_status("Stopping DSP and GNSS handoff")
             self._signal_dsp_shutdown()
-            for t in [self._rx_thread]:
-                if t is None:
-                    continue
-                try:
-                    t.join(timeout=2.0)
-                except Exception:
-                    pass
-            self._rx_thread = None
-            if self._gnss_handoff_thread is not None:
-                rq = self._gnss_raw_queue
-                if rq is not None:
-                    try:
-                        rq.put_nowait(None)
-                    except queue.Full:
-                        pass
-                if self._gnss_handoff_thread is not None:
-                    try:
-                        self._gnss_handoff_thread.join(timeout=4.0)
-                    except Exception:
-                        pass
-                    self._gnss_handoff_thread = None
-            self._gnss_raw_queue = None
+            # recv_chunk() and FIFO writes can be blocking ownership points.
+            # Stop their providers before joining the consumer threads.
+            self._finalize_usrp_device()
+            with self._gnss_failure_lock:
+                bridge = self._gnss_bridge
+                self._gnss_bridge = None
+            if bridge is not None:
+                self._emit_status("Finalizing GNSS-SDR logs")
+                bridge.stop(self._stop_reason)
+            self._join_owned_thread("_rx_thread", timeout_s=2.0)
+            rq = self._gnss_raw_queue
+            if rq is not None:
+                put_latest(rq, None)
+            handoff_stopped = self._join_owned_thread(
+                "_gnss_handoff_thread",
+                timeout_s=4.0,
+            )
+            if handoff_stopped:
+                self._gnss_raw_queue = None
             if self._shared_u1_phase_monitor is not None:
-                self._shared_u1_phase_monitor.stop()
-                self._shared_u1_phase_monitor = None
+                if self._shared_u1_phase_monitor.stop():
+                    self._shared_u1_phase_monitor = None
             self._shared_u1_phase_bank = None
             self._shared_u1_desired_vectors_cache = {}
             self._shared_u1_source_satellites_cache = ()
@@ -737,20 +750,8 @@ class BackendRuntime:
                     max(1, int(self._config.gnss_feed_queue_maxsize)),
                     self._gnss_raw_drops,
                 )
-            for t in [self._phase_thread, self._doa_thread]:
-                if t is None:
-                    continue
-                try:
-                    t.join(timeout=1.0)
-                except Exception:
-                    pass
-            self._phase_thread = None
-            self._doa_thread = None
-            if self._gnss_bridge is not None:
-                self._emit_status("Finalizing GNSS-SDR logs")
-                self._gnss_bridge.stop(self._stop_reason)
-            self._gnss_bridge = None
-            self._finalize_usrp_device()
+            self._join_owned_thread("_phase_thread", timeout_s=1.0)
+            self._join_owned_thread("_doa_thread", timeout_s=1.0)
             self._emit_status("USRP stream stopped")
             self._loggers["app"].info(
                 "USRP stream stopped (reason=%s, raw=%d, overflow=%d, timeout=%d, "
@@ -779,6 +780,45 @@ class BackendRuntime:
                     "failed" if self._stop_reason.startswith("exception:") else "stopped"
                 ),
             )
+
+    def _join_owned_thread(self, attr: str, *, timeout_s: float) -> bool:
+        """Join one owned worker without discarding a still-live reference."""
+
+        thread = getattr(self, attr)
+        if (
+            thread is not None
+            and thread.ident is not None
+            and thread is not threading.current_thread()
+        ):
+            try:
+                thread.join(timeout=max(0.0, float(timeout_s)))
+            except Exception as exc:
+                self._loggers["errors"].error(
+                    "Could not join worker %s: %s",
+                    thread.name,
+                    exc,
+                )
+        stopped = thread is None or not thread.is_alive()
+        if stopped:
+            if getattr(self, attr) is thread:
+                setattr(self, attr, None)
+            return True
+        self._loggers["errors"].error(
+            "Worker %s did not stop within %.3f s; retaining its live reference in %s.",
+            thread.name,
+            max(0.0, float(timeout_s)),
+            attr,
+        )
+        return False
+
+    def _run_dsp_stage(self, name: str, target: Callable[[], None]) -> None:
+        """Convert an uncaught DSP-stage exception into a runtime failure."""
+
+        try:
+            target()
+        except Exception as exc:
+            self._loggers["errors"].exception("DSP %s stage crashed: %s", name, exc)
+            self._failed_stop(f"DSP {name} stage failed: {exc}")
 
     def _finalize_usrp_device(self) -> None:
         """Leave no live UHD stream behind on normal or exceptional exit."""

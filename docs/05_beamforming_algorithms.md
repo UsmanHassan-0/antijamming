@@ -32,7 +32,7 @@ The current product config uses `lcmv_test_null_method: "covariance_lcmv_ideal"`
 
 Enabling LCMV first arms the runtime while the FIFO remains on uniform weights. Angular movement alone cannot activate covariance weights. Activation requires both an input-power rise and a generalized covariance-mode rise against the exact frozen arm-time baseline. Detection then latches until LCMV is disabled, so a long jammer interval cannot silently return the system to unprotected uniform weights.
 
-The ordinary one-stream product path applies target weights with a one-second
+The legacy single-FIFO path used when Shared-U1 fanout is disabled applies target weights with a one-second
 complex linear chunk ramp. The uniform and LCMV endpoints have the same complex
 response to the frozen measured bladeRF U1, so every interpolated weight has
 that same response. Repeated covariance updates do not restart an active ramp;

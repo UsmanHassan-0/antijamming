@@ -43,6 +43,7 @@ class HeadlessRuntimeService:
         self._shutdown = threading.Event()
         self._lifecycle_lock = threading.Lock()
         self._monitor_generation = 0
+        self._monitor_thread: threading.Thread | None = None
         self._backend = backend_factory(
             config=config,
             loggers=loggers,
@@ -74,7 +75,11 @@ class HeadlessRuntimeService:
             self._shutdown.wait()
         finally:
             self._stop_backend("headless service shutdown")
-            self._backend.wait(timeout=15.0)
+            if not self._backend.wait(timeout=15.0):
+                self._loggers.get("errors", self._loggers["app"]).error(
+                    "Headless backend did not stop within 15 seconds; "
+                    "the service process still owns the live backend."
+                )
             self._server.close()
         return 0
 
@@ -129,7 +134,7 @@ class HeadlessRuntimeService:
         raise ValueError(f"unknown antijamming command: {command!r}")
 
     @staticmethod
-    def _optional_float(value: object) -> float | None:
+    def _optional_float(value: Any) -> float | None:
         if value is None or value == "":
             return None
         return float(value)
@@ -142,16 +147,27 @@ class HeadlessRuntimeService:
             generation = self._monitor_generation
             self._loggers["app"].info("Headless backend start requested: %s", reason)
             self._backend.start()
-            self._server.publish_state(
-                backend_running=True,
-                service_state="starting",
-            )
-            threading.Thread(
+            monitor = threading.Thread(
                 target=self._monitor_backend,
                 args=(generation,),
                 name="antijam_backend_monitor",
                 daemon=True,
-            ).start()
+            )
+            try:
+                monitor.start()
+            except BaseException:
+                self._backend.stop("headless backend monitor startup failure")
+                if not self._backend.wait(timeout=15.0):
+                    self._loggers.get("errors", self._loggers["app"]).error(
+                        "Backend monitor thread failed to start and backend "
+                        "did not stop within 15 seconds."
+                    )
+                raise
+            self._monitor_thread = monitor
+            self._server.publish_state(
+                backend_running=True,
+                service_state="starting",
+            )
             return True
 
     def _stop_backend(self, reason: str) -> bool:
@@ -167,18 +183,25 @@ class HeadlessRuntimeService:
             return True
 
     def _monitor_backend(self, generation: int) -> None:
-        self._backend.wait()
-        with self._lifecycle_lock:
-            if generation != self._monitor_generation:
-                return
-            self._server.publish_state(
-                backend_running=False,
-                service_state="idle",
-            )
+        try:
+            self._backend.wait()
+            with self._lifecycle_lock:
+                if generation != self._monitor_generation:
+                    return
+                self._server.publish_state(
+                    backend_running=False,
+                    service_state="idle",
+                )
+        finally:
+            with self._lifecycle_lock:
+                if self._monitor_thread is threading.current_thread():
+                    self._monitor_thread = None
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Headless anti-jamming backend service")
+    parser = argparse.ArgumentParser(
+        description="Headless anti-jamming backend service"
+    )
     parser.add_argument(
         "--socket",
         type=Path,
@@ -215,8 +238,12 @@ def run() -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(sig, _handle_signal)
-        except Exception:
-            pass
+        except Exception as exc:
+            loggers.get("errors", loggers["app"]).warning(
+                "Could not install signal handler for %s: %s",
+                sig,
+                exc,
+            )
     return service.serve(auto_start=bool(args.auto_start))
 
 

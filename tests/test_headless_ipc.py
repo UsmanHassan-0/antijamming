@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+import socket
 import sys
 import threading
 import time
 
 import numpy as np
+import pytest
 
 from antijamming.app.headless import HeadlessRuntimeService
 from antijamming.runtime.ipc import JsonIpcClient, JsonIpcServer, metrics_for_wire
@@ -19,13 +22,22 @@ def _wait_for(predicate, timeout_s: float = 2.0) -> None:
     raise AssertionError("timed out waiting for condition")
 
 
+def _capture_exception(call, errors: list[Exception]) -> None:
+    try:
+        call()
+    except Exception as exc:
+        errors.append(exc)
+
+
 def test_headless_module_does_not_import_qt() -> None:
     before = set(sys.modules)
 
     __import__("antijamming.app.headless")
 
     newly_loaded = set(sys.modules) - before
-    assert not any(name == "PyQt6" or name.startswith("PyQt6.") for name in newly_loaded)
+    assert not any(
+        name == "PyQt6" or name.startswith("PyQt6.") for name in newly_loaded
+    )
 
 
 def test_wire_metrics_drop_iq_previews_and_convert_numpy() -> None:
@@ -112,6 +124,61 @@ def test_headless_service_stays_idle_until_explicit_start_command(tmp_path) -> N
     assert marker["event"]["attenuation_db"] == 50.0
 
 
+def test_headless_backend_monitor_start_failure_rolls_back_backend(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    created = []
+
+    class FakeBackend:
+        def __init__(self, **_kwargs) -> None:
+            self.running = False
+            self.starts = 0
+            self.stop_reasons: list[str] = []
+            self.stopped = threading.Event()
+            created.append(self)
+
+        def is_running(self) -> bool:
+            return self.running
+
+        def start(self) -> None:
+            self.starts += 1
+            self.running = True
+            self.stopped.clear()
+
+        def stop(self, reason: str) -> None:
+            self.stop_reasons.append(reason)
+            self.running = False
+            self.stopped.set()
+
+        def wait(self, timeout=None) -> bool:
+            return self.stopped.wait(timeout)
+
+    service = HeadlessRuntimeService(
+        object(),  # type: ignore[arg-type]
+        {"app": __import__("logging").getLogger("headless-monitor-start-test")},
+        tmp_path / "monitor-start.sock",
+        backend_factory=FakeBackend,  # type: ignore[arg-type]
+    )
+    real_start = threading.Thread.start
+
+    def fail_monitor_start(thread) -> None:
+        if thread.name == "antijam_backend_monitor":
+            raise RuntimeError("synthetic monitor start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_monitor_start)
+
+    with pytest.raises(RuntimeError, match="synthetic monitor start failure"):
+        service._start_backend("unit test")
+
+    backend = created[0]
+    assert backend.starts == 1
+    assert backend.stop_reasons == ["headless backend monitor startup failure"]
+    assert backend.is_running() is False
+    assert service._monitor_thread is None
+
+
 def test_json_ipc_round_trip_does_not_require_backend_or_hardware(tmp_path) -> None:
     commands: list[tuple[str, dict]] = []
     messages: list[dict] = []
@@ -148,6 +215,67 @@ def test_json_ipc_round_trip_does_not_require_backend_or_hardware(tmp_path) -> N
         client.close()
         server.close()
 
+    assert client._reader is None
+
+
+def test_json_ipc_client_close_interrupts_and_joins_reader(tmp_path) -> None:
+    socket_path = tmp_path / "headless.sock"
+    server = JsonIpcServer(socket_path, on_command=lambda _command, _args: {})
+    client = JsonIpcClient(socket_path)
+    server.start()
+    try:
+        client.connect()
+        reader = client._reader
+        assert reader is not None and reader.is_alive()
+        assert client.close(timeout_s=1.0) is True
+        assert not reader.is_alive()
+        assert client._reader is None
+        assert client._conn is None
+    finally:
+        client.close()
+        server.close()
+
+
+def test_json_ipc_client_close_prevents_late_connect_publication(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    fake_instances = []
+
+    class BlockingSocket:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.closed = False
+            fake_instances.append(self)
+
+        def connect(self, _path: str) -> None:
+            entered.set()
+            assert release.wait(2.0)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr("antijamming.runtime.ipc.socket.socket", BlockingSocket)
+    client = JsonIpcClient(tmp_path / "headless.sock")
+    errors: list[Exception] = []
+    connector = threading.Thread(
+        target=lambda: _capture_exception(lambda: client.connect(), errors),
+    )
+    connector.start()
+    assert entered.wait(1.0)
+
+    assert client.close() is False
+    release.set()
+    connector.join(timeout=1.0)
+
+    assert not connector.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ConnectionError)
+    assert client._conn is None
+    assert client._reader is None
+    assert fake_instances[0].closed is True
+
 
 def test_json_ipc_server_close_joins_acceptor_and_sessions(tmp_path) -> None:
     socket_path = tmp_path / "headless.sock"
@@ -169,3 +297,68 @@ def test_json_ipc_server_close_joins_acceptor_and_sessions(tmp_path) -> None:
     assert not accept_thread.is_alive()
     assert server._session_snapshot() == []
     assert not socket_path.exists()
+
+
+def test_json_ipc_server_accept_thread_start_failure_rolls_back_socket(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    socket_path = tmp_path / "headless.sock"
+    server = JsonIpcServer(socket_path, on_command=lambda _command, _args: {})
+    real_start = threading.Thread.start
+    injected = False
+
+    def fail_first_accept_start(thread) -> None:
+        nonlocal injected
+        if thread.name == "antijam_ipc_accept" and not injected:
+            injected = True
+            raise RuntimeError("synthetic accept start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_first_accept_start)
+    before_fds = len(list(Path("/proc/self/fd").iterdir()))
+
+    with pytest.raises(RuntimeError, match="synthetic accept start failure"):
+        server.start()
+
+    assert len(list(Path("/proc/self/fd").iterdir())) == before_fds
+    assert server._listener is None
+    assert server._accept_thread is None
+    assert not socket_path.exists()
+
+    server.start()
+    server.close()
+
+
+def test_json_ipc_session_sender_start_failure_does_not_kill_acceptor(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    socket_path = tmp_path / "headless.sock"
+    server = JsonIpcServer(socket_path, on_command=lambda _command, _args: {})
+    real_start = threading.Thread.start
+    injected = False
+
+    def fail_first_sender_start(thread) -> None:
+        nonlocal injected
+        if thread.name == "antijam_ipc_sender" and not injected:
+            injected = True
+            raise RuntimeError("synthetic sender start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_first_sender_start)
+    server.start()
+    first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client = JsonIpcClient(socket_path)
+    try:
+        first.connect(str(socket_path))
+        _wait_for(lambda: injected)
+        _wait_for(lambda: server._session_snapshot() == [])
+        client.connect()
+        _wait_for(lambda: len(server._session_snapshot()) == 1)
+        accept_thread = server._accept_thread
+        assert accept_thread is not None and accept_thread.is_alive()
+    finally:
+        first.close()
+        client.close()
+        server.close()

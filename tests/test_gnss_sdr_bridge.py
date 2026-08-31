@@ -89,6 +89,17 @@ def _close_pipe_fds(*groups: list[int]) -> None:
                 pass
 
 
+def _open_fd_count() -> int:
+    return len(list(Path("/proc/self/fd").iterdir()))
+
+
+def _capture_exception(call, errors: list[Exception]) -> None:
+    try:
+        call()
+    except Exception as exc:
+        errors.append(exc)
+
+
 def test_fifo_fair_poll_writes_each_source_without_serial_blocking(
     tmp_path: Path,
 ) -> None:
@@ -586,6 +597,51 @@ def test_bridge_prefers_product_local_executable(tmp_path: Path) -> None:
     bridge = GnssSdrBridge(cfg, _loggers())
 
     assert bridge._resolve_local_executable() == exe_path.resolve()
+
+
+def test_bridge_popen_failure_rolls_back_owned_fds_threads_and_fifos(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    install_dir = tmp_path / "install"
+    executable = install_dir / "gnss-sdr"
+    install_dir.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    runtime_dir = _fifo_runtime_dir(tmp_path)
+    cfg = StreamConfig(
+        log_dir=tmp_path / "logs",
+        gnss_sdr_install_dir=install_dir,
+        gnss_sdr_runtime_dir=runtime_dir,
+        gnss_sdr_log_dir=runtime_dir / "glog",
+        gnss_pvt_monitor_enable=False,
+        gnss_monitor_enable=False,
+        gnss_tracking_monitor_enable=False,
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+    monkeypatch.setattr(bridge, "_terminate_matching_stale_processes", lambda: None)
+    monkeypatch.setattr(
+        "antijamming.gnss.sdr_bridge.bridge.subprocess.Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("popen failed")),
+    )
+    before_fds = _open_fd_count()
+
+    with pytest.raises(OSError, match="popen failed"):
+        bridge.start()
+
+    assert _open_fd_count() == before_fds
+    assert bridge._proc is None
+    assert bridge._fifo_fds == []
+    assert bridge._stdout_handle is None
+    assert bridge._stdout_thread is None
+    assert bridge._glog_thread is None
+    assert bridge._nmea_master_fd is None
+    assert bridge._nmea_slave_fd is None
+    assert bridge._nmea_thread is None
+    assert bridge._udp_monitor_sockets == []
+    assert bridge._udp_monitor_threads == []
+    assert bridge._tracking_state_handle is None
+    assert all(not path.exists() for path in bridge._fifo_paths)
 
 
 def test_bridge_product_profile_uses_udp_and_has_no_dump_parsers(tmp_path: Path) -> None:
@@ -2522,6 +2578,148 @@ def test_backend_finalizer_pauses_and_retains_preserved_device() -> None:
     assert device.paused is True
     assert device.stopped is False
     assert runtime._device is device
+
+
+def test_backend_join_retains_live_thread_reference_until_exit() -> None:
+    runtime = BackendRuntime(StreamConfig(), _runtime_loggers())
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_worker() -> None:
+        entered.set()
+        assert release.wait(2.0)
+
+    worker = threading.Thread(target=blocked_worker, name="blocked-test-worker")
+    worker.start()
+    assert entered.wait(1.0)
+    runtime._rx_thread = worker
+
+    assert runtime._join_owned_thread("_rx_thread", timeout_s=0.01) is False
+    assert runtime._rx_thread is worker
+
+    release.set()
+    worker.join(timeout=1.0)
+    assert runtime._join_owned_thread("_rx_thread", timeout_s=0.1) is True
+    assert runtime._rx_thread is None
+
+
+def test_backend_dsp_stage_exception_enters_failed_stop() -> None:
+    failures: list[str] = []
+    runtime = BackendRuntime(
+        StreamConfig(),
+        _runtime_loggers(),
+        on_failed=failures.append,
+    )
+    device = _FakePausableDevice()
+    runtime._device = device  # type: ignore[assignment]
+    runtime._running = True
+
+    runtime._run_dsp_stage(
+        "phase",
+        lambda: (_ for _ in ()).throw(RuntimeError("synthetic stage failure")),
+    )
+
+    assert runtime._running is False
+    assert device.stopped is True
+    assert failures == ["DSP phase stage failed: synthetic stage failure"]
+
+
+def test_backend_concurrent_start_creates_one_owner_thread(monkeypatch) -> None:
+    runtime = BackendRuntime(StreamConfig(), _runtime_loggers())
+    entered = threading.Event()
+    release = threading.Event()
+    run_calls = 0
+
+    def blocked_run() -> None:
+        nonlocal run_calls
+        run_calls += 1
+        entered.set()
+        assert release.wait(2.0)
+
+    monkeypatch.setattr(runtime, "run", blocked_run)
+    callers = [threading.Thread(target=runtime.start) for _ in range(8)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(timeout=1.0)
+        assert not caller.is_alive()
+
+    assert entered.wait(1.0)
+    assert run_calls == 1
+    release.set()
+    assert runtime.wait(timeout=1.0)
+
+
+def test_backend_exception_stops_blocking_device_before_rx_join(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    recv_entered = threading.Event()
+    stop_requested = threading.Event()
+
+    class BlockingAfterStartupProbe:
+        def __init__(self) -> None:
+            self.recv_calls = 0
+
+        def recv_chunk(self):
+            self.recv_calls += 1
+            if self.recv_calls == 1:
+                return np.zeros((4, 8), dtype=np.complex64), "ok"
+            recv_entered.set()
+            assert stop_requested.wait(2.0)
+            events.append("recv_exited")
+            raise OSError("stream stopped")
+
+        @staticmethod
+        def startup_report_lines() -> list[str]:
+            return []
+
+        def stop(self) -> None:
+            if not stop_requested.is_set():
+                events.append("device_stopped")
+                stop_requested.set()
+
+    runtime = BackendRuntime(
+        StreamConfig(
+            log_dir=tmp_path,
+            gnss_sdr_enable=False,
+            preserve_usrp_session_on_stop=False,
+            samples_per_chunk=8,
+        ),
+        _runtime_loggers(),
+    )
+    runtime._device = BlockingAfterStartupProbe()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.collect_host_transport_report",
+        lambda _address: [],
+    )
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.music_spectrum",
+        lambda **_kwargs: np.zeros((4,), dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.reset_session_logs",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.finalize_session_logs",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(runtime, "_log_experiment_startup_context", lambda: None)
+    monkeypatch.setattr(runtime, "_record_runtime_event", lambda *_args, **_kwargs: {})
+
+    def fail_after_rx_blocks() -> dict:
+        assert recv_entered.wait(2.0)
+        raise RuntimeError("synthetic main-loop failure")
+
+    monkeypatch.setattr(runtime, "_compose_metrics_for_ui", fail_after_rx_blocks)
+
+    runtime.run()
+
+    assert events == ["device_stopped", "recv_exited"]
+    assert runtime._rx_thread is None
+    assert runtime._device is None
 
 
 def test_backend_startup_probe_restarts_usrp_after_first_recv_socket_close(

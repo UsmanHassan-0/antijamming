@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import threading
 
 import pytest
 from threadpoolctl import threadpool_info
@@ -18,7 +21,7 @@ from antijamming.config import (
 )
 from antijamming.logging import LOGGER_DEFS, reset_session_logs, setup_logging
 from antijamming.logging.setup import ImmediateFileHandler
-from antijamming.app.main import _runtime_config, parse_args
+from antijamming.app.main import _reap_backend_process, _runtime_config, parse_args
 from antijamming.app.runtime_config import build_runtime_config
 from antijamming.config.schemas.runtime import VALID_LCMV_METHODS
 from antijamming.rf.budget import manifest_from_config
@@ -185,7 +188,9 @@ def test_runtime_config_experiment_section_is_optional(tmp_path) -> None:
     assert cfg.experiment == {}
 
 
-def test_runtime_profile_authors_sample_rate_once_and_derives_followers(tmp_path) -> None:
+def test_runtime_profile_authors_sample_rate_once_and_derives_followers(
+    tmp_path,
+) -> None:
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     assert "usrp_rx_bandwidth_hz" not in payload
     assert "gnss_sdr_if_bandwidth_hz" not in payload
@@ -213,7 +218,9 @@ def test_runtime_profile_authors_sample_rate_once_and_derives_followers(tmp_path
     "field",
     ["usrp_rx_bandwidth_hz", "min_sample_rate"],
 )
-def test_runtime_profile_rejects_authored_sample_rate_followers(tmp_path, field) -> None:
+def test_runtime_profile_rejects_authored_sample_rate_followers(
+    tmp_path, field
+) -> None:
     payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     payload[field] = payload["sample_rate"]
     path = tmp_path / f"runtime_with_duplicate_{field}.json"
@@ -297,6 +304,68 @@ def test_runtime_config_loads_operator_experiment_section(tmp_path) -> None:
     assert cfg.experiment["jammer_attenuation_db"] == 80.0
 
 
+def test_runtime_config_rejects_duplicate_json_keys(tmp_path) -> None:
+    path = tmp_path / "duplicate.json"
+    path.write_text(
+        '{"sample_rate": 4000000, "sample_rate": 8000000}', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key 'sample_rate'"):
+        load_stream_config_file(path)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_runtime_config_rejects_non_finite_json_numbers(tmp_path, constant) -> None:
+    path = tmp_path / "nonfinite.json"
+    path.write_text(
+        f'{{"experiment": {{"measurement": {constant}}}}}', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="non-finite JSON number"):
+        load_stream_config_file(path)
+
+
+@pytest.mark.parametrize("sample_rate", ["NaN", "Infinity", "-Infinity"])
+def test_runtime_config_rejects_non_finite_string_sample_rate(
+    tmp_path,
+    sample_rate,
+) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["sample_rate"] = sample_rate
+    path = tmp_path / "nonfinite_string_sample_rate.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="positive finite number"):
+        load_stream_config_file(path)
+
+
+def test_rejected_runtime_overlay_is_transactional(tmp_path) -> None:
+    cfg = default_stream_config()
+    original_gain = cfg.gain_db
+    path = tmp_path / "partially_invalid_overlay.json"
+    path.write_text(
+        json.dumps({"gain_db": 1.25, "unknown_after_valid_key": True}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unknown runtime config key"):
+        apply_stream_config_file(cfg, path)
+
+    assert cfg.gain_db == original_gain
+
+
+def test_runtime_overlay_sample_rate_and_followers_publish_together(tmp_path) -> None:
+    cfg = default_stream_config()
+    path = tmp_path / "sample_rate_overlay.json"
+    path.write_text(json.dumps({"sample_rate": 5_000_000.0}), encoding="utf-8")
+
+    apply_stream_config_file(cfg, path)
+
+    assert cfg.sample_rate == 5_000_000.0
+    assert cfg.usrp_rx_bandwidth_hz == 5_000_000.0
+    assert cfg.min_sample_rate == 5_000_000.0
+
+
 def test_preserved_bench_manifest_loads_only_as_an_explicit_overlay() -> None:
     overlay = (
         REPO_ROOT
@@ -339,7 +408,7 @@ def test_project_docs_live_under_docs_directory() -> None:
     assert (REPO_ROOT / "docs/realtime_gui.md").exists()
     assert (REPO_ROOT / "docs/hardware.md").exists()
     assert (REPO_ROOT / "docs/architecture_refactor_notes.md").exists()
-    for name in (
+    numbered_docs = (
         "00_system_architecture.md",
         "01_rf_hardware_and_link_budget.md",
         "02_calibration.md",
@@ -348,14 +417,24 @@ def test_project_docs_live_under_docs_directory() -> None:
         "05_beamforming_algorithms.md",
         "06_diagnostics_and_metrics.md",
         "07_one_run_test_method.md",
-        "08_progress_tracker.md",
-        "09_known_failure_modes.md",
-        "10_next_steps_and_open_questions.md",
-    ):
+        "08_known_failure_modes.md",
+    )
+    assert (
+        tuple(
+            path.name for path in sorted((REPO_ROOT / "docs").glob("[0-9][0-9]_*.md"))
+        )
+        == numbered_docs
+    )
+    for name in numbered_docs:
         assert (REPO_ROOT / "docs" / name).exists()
+    assert (REPO_ROOT / "docs/progress_tracker.md").exists()
+    assert (REPO_ROOT / "docs/implementation_provenance.md").exists()
+    assert (REPO_ROOT / "docs/audits/README.md").exists()
 
 
-def test_runtime_logs_are_repo_anchored_from_other_working_directory(monkeypatch, tmp_path) -> None:
+def test_runtime_logs_are_repo_anchored_from_other_working_directory(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.chdir(tmp_path)
 
     cfg = default_stream_config()
@@ -377,7 +456,6 @@ def test_default_stream_config_rejects_missing_json_profile_path() -> None:
         default_stream_config(None)
 
 
-
 def test_runtime_has_core_signal_processing_logs() -> None:
     assert LOGGER_DEFS["doa"][1] == "doa.log"
     assert LOGGER_DEFS["lcmv"][1] == "lcmv.log"
@@ -396,6 +474,25 @@ def test_runtime_file_logs_use_immediate_handlers(tmp_path) -> None:
         any(isinstance(handler, ImmediateFileHandler) for handler in logger.handlers)
         for logger in loggers.values()
     )
+
+
+def test_repeated_logging_setup_closes_replaced_file_handlers(tmp_path) -> None:
+    first = setup_logging(tmp_path / "first")
+    replaced_handlers = [
+        handler
+        for logger in first.values()
+        for handler in logger.handlers
+        if isinstance(handler, logging.FileHandler)
+    ]
+
+    second = setup_logging(tmp_path / "second")
+
+    assert len(replaced_handlers) == len(LOGGER_DEFS)
+    assert all(handler.stream is None for handler in replaced_handlers)
+    for logger in second.values():
+        for handler in list(logger.handlers):
+            handler.close()
+        logger.handlers.clear()
 
 
 def test_session_log_reset_removes_rotated_backups(tmp_path) -> None:
@@ -477,6 +574,42 @@ def test_uhd_console_marker_monitor_logs_window_counts(tmp_path) -> None:
     assert "samples_per_D=unknown" in transport_log
 
 
+def test_uhd_console_marker_monitor_does_not_discard_live_thread_or_flush(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    loggers = setup_logging(tmp_path)
+    monitor = UhdConsoleMarkerMonitor(tmp_path / "uhd_console.log", loggers)
+    entered = threading.Event()
+    release = threading.Event()
+    flush_calls: list[bool] = []
+
+    def blocked_run() -> None:
+        entered.set()
+        assert release.wait(2.0)
+
+    monkeypatch.setattr(monitor, "_run", blocked_run)
+    monkeypatch.setattr(
+        monitor._scanner,
+        "flush",
+        lambda: flush_calls.append(True) or [],
+    )
+    monitor.start()
+    worker = monitor._thread
+    assert worker is not None
+    assert entered.wait(1.0)
+
+    assert monitor.stop(timeout_s=0.01) is False
+    assert monitor._thread is worker
+    assert flush_calls == []
+
+    release.set()
+    worker.join(timeout=1.0)
+    assert monitor.stop(timeout_s=0.1) is True
+    assert monitor._thread is None
+    assert flush_calls == [True]
+
+
 def test_parse_args_accepts_no_runtime_flags(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["antijamming.app.main"])
     args = parse_args()
@@ -484,6 +617,39 @@ def test_parse_args_accepts_no_runtime_flags(monkeypatch) -> None:
     assert args.auto_start is False
     assert args.auto_stop_after_s is None
     assert args.quit_after_stop is False
+
+
+def test_backend_process_reaper_waits_after_sigkill(monkeypatch, tmp_path) -> None:
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self) -> None:
+            self.wait_timeouts: list[float] = []
+
+        def wait(self, *, timeout: float) -> int:
+            self.wait_timeouts.append(timeout)
+            if len(self.wait_timeouts) < 3:
+                raise subprocess.TimeoutExpired("backend", timeout)
+            return -signal.SIGKILL
+
+    process = FakeProcess()
+    signals: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(
+        "antijamming.app.main.os.killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+    loggers = setup_logging(tmp_path)
+    assert _reap_backend_process(
+        process,  # type: ignore[arg-type]
+        loggers,
+        initial_wait_s=0.0,
+    )
+
+    assert process.wait_timeouts == [0.0, 5.0, 2.0]
+    assert signals == [
+        (12345, signal.SIGTERM),
+        (12345, signal.SIGKILL),
+    ]
 
 
 def test_parse_args_accepts_diagnostic_control_flags(monkeypatch) -> None:
@@ -506,7 +672,9 @@ def test_parse_args_accepts_diagnostic_control_flags(monkeypatch) -> None:
 
 
 def test_parse_args_rejects_runtime_flags(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["antijamming.app.main", "--sample-rate", "4000000"])
+    monkeypatch.setattr(
+        sys, "argv", ["antijamming.app.main", "--sample-rate", "4000000"]
+    )
 
     with pytest.raises(SystemExit):
         parse_args()

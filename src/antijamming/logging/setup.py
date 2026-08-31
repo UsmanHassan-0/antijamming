@@ -98,6 +98,21 @@ def _build_file_handler(path: Path, mode: str = "a") -> logging.FileHandler:
     return handler
 
 
+def _close_logger_handlers(logger: logging.Logger) -> None:
+    """Detach and close every handler currently owned by one named logger."""
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.flush()
+        except Exception:
+            pass
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
 def setup_logging(log_dir: Path) -> dict[str, logging.Logger]:
     """Create named runtime loggers with stable, non-rotating file names."""
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -109,7 +124,7 @@ def setup_logging(log_dir: Path) -> dict[str, logging.Logger]:
         log_path = log_dir / file_name
         logger = logging.getLogger(logger_name)
         logger.setLevel(logging.INFO)
-        logger.handlers.clear()
+        _close_logger_handlers(logger)
         logger.propagate = False
         logger.addHandler(_build_file_handler(log_path, mode="a"))
         logger_map[key] = logger
@@ -302,13 +317,7 @@ def reset_session_logs(
         except Exception:
             pass
     for logger in loggers.values():
-        for handler in list(logger.handlers):
-            try:
-                handler.flush()
-                handler.close()
-            except Exception:
-                pass
-        logger.handlers.clear()
+        _close_logger_handlers(logger)
 
     for key, (_logger_name, file_name) in LOGGER_DEFS.items():
         logger = loggers.get(key)

@@ -68,10 +68,10 @@ def _json_safe(value: Any) -> Any:
             }
         return _json_safe(value.tolist())
     if isinstance(value, (complex, np.complexfloating)):
-        number = complex(value)
+        complex_number = complex(value)
         return {
-            "real": _json_safe(number.real),
-            "imag": _json_safe(number.imag),
+            "real": _json_safe(complex_number.real),
+            "imag": _json_safe(complex_number.imag),
         }
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
@@ -125,8 +125,13 @@ class _ClientSession:
         )
 
     def start(self) -> None:
-        self._reader.start()
-        self._sender.start()
+        try:
+            self._reader.start()
+            self._sender.start()
+        except BaseException:
+            self.close()
+            self.wait_closed(timeout_s=1.0)
+            raise
 
     def enqueue(self, message: dict[str, Any]) -> None:
         if self._closed.is_set():
@@ -284,6 +289,7 @@ class JsonIpcServer:
         self.socket_path = Path(socket_path)
         self._on_command = on_command
         self._listener: socket.socket | None = None
+        self._lifecycle_lock = threading.Lock()
         self._closed = threading.Event()
         self._sessions_lock = threading.Lock()
         self._sessions: set[_ClientSession] = set()
@@ -296,29 +302,44 @@ class JsonIpcServer:
         self._accept_thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self._listener is not None:
-            return
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        self._remove_stale_socket()
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(str(self.socket_path))
-        os.chmod(self.socket_path, 0o600)
-        listener.listen(8)
-        listener.settimeout(0.5)
-        self._listener = listener
-        self._accept_thread = threading.Thread(
-            target=self._accept_loop,
-            name="antijam_ipc_accept",
-            daemon=True,
-        )
-        self._accept_thread.start()
+        with self._lifecycle_lock:
+            if self._closed.is_set():
+                raise RuntimeError("cannot restart a closed antijamming IPC server")
+            if self._listener is not None:
+                return
+            self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+            self._remove_stale_socket()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(str(self.socket_path))
+                os.chmod(self.socket_path, 0o600)
+                listener.listen(8)
+                listener.settimeout(0.5)
+                accept_thread = threading.Thread(
+                    target=self._accept_loop,
+                    name="antijam_ipc_accept",
+                    daemon=True,
+                )
+                self._listener = listener
+                self._accept_thread = accept_thread
+                accept_thread.start()
+            except BaseException:
+                self._listener = None
+                self._accept_thread = None
+                listener.close()
+                try:
+                    if self.socket_path.is_socket():
+                        self.socket_path.unlink()
+                except OSError:
+                    pass
+                raise
 
     def close(self) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        listener = self._listener
-        self._listener = None
+        with self._lifecycle_lock:
+            self._closed.set()
+            listener = self._listener
+            self._listener = None
+            accept_thread = self._accept_thread
         if listener is not None:
             try:
                 listener.close()
@@ -327,14 +348,16 @@ class JsonIpcServer:
         # The acceptor may already have returned a connection when shutdown
         # closes the listener.  Join it before snapshotting sessions so that a
         # late accepted session cannot escape cleanup.
-        accept_thread = self._accept_thread
-        self._accept_thread = None
         if (
             accept_thread is not None
             and accept_thread is not threading.current_thread()
             and accept_thread.ident is not None
         ):
             accept_thread.join(timeout=1.0)
+        if accept_thread is None or not accept_thread.is_alive():
+            with self._lifecycle_lock:
+                if self._accept_thread is accept_thread:
+                    self._accept_thread = None
         with self._sessions_lock:
             sessions = list(self._sessions)
         for session in sessions:
@@ -401,7 +424,12 @@ class JsonIpcServer:
             session.enqueue(self._latest_state)
             if self._latest_metrics is not None:
                 session.set_latest_metrics(self._latest_metrics)
-            session.start()
+            try:
+                session.start()
+            except BaseException:
+                session.close()
+                session.wait_closed(timeout_s=1.0)
+                self._discard(session)
 
     def _discard(self, session: _ClientSession) -> None:
         with self._sessions_lock:
@@ -441,42 +469,62 @@ class JsonIpcClient:
         self._on_message = on_message
         self._conn: socket.socket | None = None
         self._send_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._connecting = False
         self._closed = threading.Event()
         self._reader: threading.Thread | None = None
 
     def connect(self, timeout_s: float = 5.0) -> None:
+        with self._state_lock:
+            if self._closed.is_set():
+                raise ConnectionError("antijamming IPC client is closed")
+            if self._connecting or self._conn is not None:
+                raise ConnectionError(
+                    "antijamming IPC client is already connecting or connected"
+                )
+            self._connecting = True
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         last_error: OSError | None = None
-        while not self._closed.is_set():
-            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                conn.connect(str(self.socket_path))
-            except OSError as exc:
-                last_error = exc
-                conn.close()
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(0.05)
-                continue
-            self._conn = conn
-            self._reader = threading.Thread(
-                target=self._reader_loop,
-                name="antijam_ipc_client",
-                daemon=True,
+        try:
+            while not self._closed.is_set():
+                conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    conn.connect(str(self.socket_path))
+                except OSError as exc:
+                    last_error = exc
+                    conn.close()
+                    if time.monotonic() >= deadline:
+                        break
+                    self._closed.wait(0.05)
+                    continue
+                with self._state_lock:
+                    if self._closed.is_set():
+                        conn.close()
+                        break
+                    self._conn = conn
+                    self._reader = threading.Thread(
+                        target=self._reader_loop,
+                        args=(conn,),
+                        name="antijam_ipc_client",
+                        daemon=True,
+                    )
+                    self._reader.start()
+                return
+            raise ConnectionError(
+                f"could not connect to antijamming service at {self.socket_path}: "
+                f"{last_error or 'client closed'}"
             )
-            self._reader.start()
-            return
-        raise ConnectionError(
-            f"could not connect to antijamming service at {self.socket_path}: "
-            f"{last_error or 'timeout'}"
-        )
+        finally:
+            with self._state_lock:
+                self._connecting = False
 
-    def close(self) -> None:
-        if self._closed.is_set():
-            return
+    def close(self, timeout_s: float = 1.0) -> bool:
         self._closed.set()
-        conn = self._conn
-        self._conn = None
+        with self._state_lock:
+            conn = self._conn
+            self._conn = None
+            reader = self._reader
+            connecting = self._connecting
         if conn is not None:
             try:
                 conn.shutdown(socket.SHUT_RDWR)
@@ -486,17 +534,31 @@ class JsonIpcClient:
                 conn.close()
             except OSError:
                 pass
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=max(0.0, float(timeout_s)))
+        stopped = (reader is None or not reader.is_alive()) and not connecting
+        if stopped:
+            with self._state_lock:
+                if self._reader is reader:
+                    self._reader = None
+        return stopped
 
-    def command(self, command: str, **arguments: Any) -> str:
+    def command(
+        self,
+        command: str,
+        *,
+        request_id: str | None = None,
+        **arguments: Any,
+    ) -> str:
         conn = self._conn
         if conn is None:
             raise ConnectionError("antijamming IPC client is not connected")
-        request_id = uuid.uuid4().hex
+        resolved_request_id = str(request_id or uuid.uuid4().hex)
         message = {
             "protocol": PROTOCOL_NAME,
             "version": PROTOCOL_VERSION,
             "type": "command",
-            "request_id": request_id,
+            "request_id": resolved_request_id,
             "command": str(command),
             "arguments": _json_safe(arguments),
         }
@@ -505,12 +567,9 @@ class JsonIpcClient:
         ).encode("utf-8")
         with self._send_lock:
             conn.sendall(encoded)
-        return request_id
+        return resolved_request_id
 
-    def _reader_loop(self) -> None:
-        conn = self._conn
-        if conn is None:
-            return
+    def _reader_loop(self, conn: socket.socket) -> None:
         buffer = bytearray()
         try:
             while not self._closed.is_set():
@@ -534,7 +593,17 @@ class JsonIpcClient:
         except OSError:
             pass
         finally:
-            self.close()
+            self._closed.set()
+            with self._state_lock:
+                if self._conn is conn:
+                    self._conn = None
+            try:
+                conn.close()
+            except OSError:
+                pass
+            with self._state_lock:
+                if self._reader is threading.current_thread():
+                    self._reader = None
 
 
 __all__ = [

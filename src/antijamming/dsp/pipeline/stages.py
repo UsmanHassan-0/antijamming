@@ -22,6 +22,7 @@ from antijamming.dsp.phase.alignment import apply_phase_calibration, phase_offse
 # Tone-bin mode is used when a conducted calibration tone is present. It isolates
 # phase at the expected tone instead of relying on whole-chunk cross-correlation.
 
+
 def _tone_bin_phase_offsets_deg(
     buffer: np.ndarray,
     sample_rate_hz: float,
@@ -101,8 +102,7 @@ def _estimate_array_tone_offset_hz(
             bin_delta = 0.5 * (left - right) / denom
             bin_delta = max(-0.5, min(0.5, bin_delta))
             return float(
-                masked_freqs[peak_idx]
-                + bin_delta * (masked_freqs[1] - masked_freqs[0])
+                masked_freqs[peak_idx] + bin_delta * (masked_freqs[1] - masked_freqs[0])
             )
     return float(masked_freqs[peak_idx])
 
@@ -114,6 +114,7 @@ def _estimate_array_tone_offset_hz(
 # Phase metrics carry both raw and calibrated views because the GUI shows the
 # before/after effect of the loaded static phase calibration.
 
+
 def compute_phase_metrics(
     buffer: np.ndarray,
     preview_cols: int | None = None,
@@ -124,6 +125,10 @@ def compute_phase_metrics(
 ) -> dict:
     """Compute phase, power, and optional preview data for one sample buffer."""
     raw_buffer = np.asarray(buffer, dtype=np.complex128)
+    if raw_buffer.ndim != 2 or raw_buffer.shape[0] == 0 or raw_buffer.shape[1] == 0:
+        raise ValueError("phase metrics require a non-empty [channels, samples] buffer")
+    if not np.all(np.isfinite(raw_buffer)):
+        raise ValueError("phase metrics buffer contains NaN or Inf")
     corrected_buffer = apply_phase_calibration(
         raw_buffer,
         correction_vector=phase_correction_vector,
@@ -159,19 +164,26 @@ def compute_phase_metrics(
         "phase_offsets_deg": raw_offsets,
         "phase_offsets_raw_deg": raw_offsets,
         "phase_offsets_calibrated_deg": corrected_offsets,
-        "phase_estimator": "tone_bin_demod" if phase_monitor_use_tone_bin else "chunk_crosscorr",
+        "phase_estimator": "tone_bin_demod"
+        if phase_monitor_use_tone_bin
+        else "chunk_crosscorr",
         "phase_monitor_estimated_offset_hz": tone_monitor_estimated_offset_hz,
     }
     if preview_cols is not None and preview_cols > 0:
         cols = min(int(preview_cols), raw_buffer.shape[1])
-        metrics["complex_samples_raw"] = np.asarray(raw_buffer[:, :cols], dtype=np.complex64)
-        metrics["complex_samples_calibrated"] = np.asarray(corrected_buffer[:, :cols], dtype=np.complex64)
+        metrics["complex_samples_raw"] = np.asarray(
+            raw_buffer[:, :cols], dtype=np.complex64
+        )
+        metrics["complex_samples_calibrated"] = np.asarray(
+            corrected_buffer[:, :cols], dtype=np.complex64
+        )
     return metrics
 
 
 # =============================================================================
 # Direction Finding Metrics
 # =============================================================================
+
 
 def _angle_distance_deg(a: float, b: float) -> float:
     """Return the shortest circular distance between two azimuth angles."""
@@ -237,7 +249,16 @@ def compute_doa_metrics(
 ) -> dict:
     """Compute MUSIC DoA metrics plus Bartlett diagnostic spectra."""
     corrected = np.asarray(corrected_buffer, dtype=np.complex128)
-    n_channels = int(corrected.shape[0]) if corrected.ndim >= 1 else 1
+    if corrected.ndim != 2 or corrected.shape[0] != 4 or corrected.shape[1] == 0:
+        raise ValueError("DoA metrics require a non-empty 4-channel sample buffer")
+    if not np.all(np.isfinite(corrected)):
+        raise ValueError("DoA metrics buffer contains NaN or Inf")
+    scan = np.asarray(scan_angles_deg, dtype=np.float64).reshape(-1)
+    if scan.size == 0:
+        raise ValueError("DoA metrics require at least one scan angle")
+    if not np.all(np.isfinite(scan)):
+        raise ValueError("DoA scan angles contain NaN or Inf")
+    n_channels = int(corrected.shape[0])
     source_count = min(max(int(n_sources), 1), max(n_channels - 1, 1))
     covariance = spatial_covariance(corrected)
     eigenvalues, eigenvectors = covariance_eigendecomposition_from_matrix(covariance)
@@ -248,27 +269,27 @@ def compute_doa_metrics(
     doa_raw_spectrum = music_spectrum_from_eigenvectors(
         eigenvectors=eigenvectors,
         rf_freq_hz=center_freq_hz,
-        scan_angles_deg=scan_angles_deg,
+        scan_angles_deg=scan,
         array_spacing_m=array_spacing_m,
         n_sources=source_count,
         normalize=False,
     )
     normalized_for_peaks = doa_raw_spectrum / (np.max(doa_raw_spectrum) + 1e-12)
-    doa_deg = float(scan_angles_deg[int(np.argmax(doa_raw_spectrum))])
-    doa_peaks = _dominant_spectrum_peaks(scan_angles_deg, normalized_for_peaks)
+    doa_deg = float(scan[int(np.argmax(doa_raw_spectrum))])
+    doa_peaks = _dominant_spectrum_peaks(scan, normalized_for_peaks)
     bartlett_raw_spectrum = bartlett_spectrum_from_covariance(
         covariance=covariance,
         rf_freq_hz=center_freq_hz,
-        scan_angles_deg=scan_angles_deg,
+        scan_angles_deg=scan,
         array_spacing_m=array_spacing_m,
         normalize=False,
     )
     bartlett_normalized_for_peaks = bartlett_raw_spectrum / (
         np.max(bartlett_raw_spectrum) + 1e-12
     )
-    bartlett_deg = float(scan_angles_deg[int(np.argmax(bartlett_raw_spectrum))])
+    bartlett_deg = float(scan[int(np.argmax(bartlett_raw_spectrum))])
     bartlett_peaks = _dominant_spectrum_peaks(
-        scan_angles_deg,
+        scan,
         bartlett_normalized_for_peaks,
     )
 
@@ -301,7 +322,9 @@ def compute_gnss_output_vector(
         source,
         correction_vector=phase_correction_vector,
     )
-    return apply_beamformer(corrected, np.asarray(beamformer_weights, dtype=np.complex128))
+    return apply_beamformer(
+        corrected, np.asarray(beamformer_weights, dtype=np.complex128)
+    )
 
 
 # =============================================================================
@@ -310,6 +333,7 @@ def compute_gnss_output_vector(
 
 # This convenience function is used by tests and simple callers. The threaded
 # backend uses the individual stage helpers so expensive work can run in queues.
+
 
 def compute_realtime_metrics(
     buffer: np.ndarray,
@@ -362,9 +386,7 @@ def compute_realtime_metrics(
         "noise_tail_flatness_db": doa_metrics["noise_tail_flatness_db"],
         "noise_tail_testable": doa_metrics["noise_tail_testable"],
         "noise_tail_white_like": doa_metrics["noise_tail_white_like"],
-        "noise_tail_spread_threshold_db": doa_metrics[
-            "noise_tail_spread_threshold_db"
-        ],
+        "noise_tail_spread_threshold_db": doa_metrics["noise_tail_spread_threshold_db"],
         "noise_tail_flatness_threshold_db": doa_metrics[
             "noise_tail_flatness_threshold_db"
         ],

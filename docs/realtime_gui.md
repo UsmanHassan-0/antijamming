@@ -60,8 +60,10 @@ Run phase calibration from the sibling repo:
 ../phase-calibration/run_calibration.sh
 ```
 
-The launcher rejects runtime flags. Skip pre-launch USRP checks only when you
-need a fast local UI startup:
+The launcher accepts diagnostic lifecycle flags such as `--auto-start`,
+`--auto-stop-after-s`, and `--quit-after-stop`; it does not accept RF/hardware
+tuning flags. Skip pre-launch USRP checks only when you need a fast local UI
+startup:
 
 ```bash
 ANTIJAMMING_SKIP_USRP_PREFLIGHT=1 ./run_realtime.sh
@@ -132,9 +134,14 @@ The product path uses the app-rendered FIFO GNSS-SDR template:
 configs/gnss-sdr/fifo_gps_l1.conf.template
 ```
 
-The anti-jamming backend owns the USRP. GNSS-SDR reads the single FIFO IQ stream
-provided by the backend. Direct-USRP and RTL-SDR GNSS-SDR configs are not part of
-the product runtime.
+The anti-jamming backend owns the USRP. With the current
+`gnss_shared_u1_phase_compensation_enabled: true` profile, it computes one
+shared spatial output and fans it out through dynamically assigned per-channel
+FIFOs with PRN-specific complex continuity scalars. The configured receiver has
+ten GPS `1C` channels. These FIFO rows do not represent ten independent spatial
+LCMV solutions. If Shared-U1 mode is disabled, the bridge retains the legacy
+single-FIFO path. Direct-USRP and RTL-SDR GNSS-SDR configs are not part of the
+product runtime.
 
 In normal realtime mode, GNSS-SDR runs.
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import threading
 
 import numpy as np
 
@@ -418,6 +419,50 @@ def test_prn_monitor_recovers_calibrated_spatial_iq_from_one_code_period(
         recovered["desired_spatial_vector"],
         spatial * correction,
     ) > 1.0 - 1e-12
+
+
+def test_prn_monitor_owns_submitted_samples_and_retains_live_worker_resources(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    observed: list[np.ndarray] = []
+    monitor = SharedU1DesiredVectorMonitor(
+        sample_rate_hz=1_023_000.0,
+        channel_count=2,
+        phase_correction_vector=None,
+        tracking_snapshot=lambda: {},
+        session_dir=tmp_path,
+        session_id="ownership",
+        logger=logging.getLogger("test.shared_u1_phase.ownership"),
+        satellites=(3,),
+    )
+
+    def blocked_append(_start, raw, _weights) -> None:
+        entered.set()
+        assert release.wait(2.0)
+        observed.append(np.array(raw, copy=True))
+
+    monkeypatch.setattr(monitor, "_append_span", blocked_append)
+    raw = np.ones((2, 8), dtype=np.complex64)
+    monitor.start()
+    worker = monitor._thread
+    assert worker is not None
+    monitor.submit(0, raw, np.ones((1, 2), dtype=np.complex128))
+    assert entered.wait(1.0)
+    raw.fill(9.0 + 0.0j)
+
+    assert monitor.stop(timeout_s=0.01) is False
+    assert monitor._thread is worker
+    assert monitor._handle is not None
+
+    release.set()
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert monitor._thread is None
+    assert monitor._handle is None
+    np.testing.assert_array_equal(observed[0], np.ones((2, 8), dtype=np.complex64))
 
 
 def test_shared_u1_phase_rephases_every_later_covariance_update() -> None:

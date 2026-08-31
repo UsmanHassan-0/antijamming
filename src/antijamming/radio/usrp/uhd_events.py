@@ -112,6 +112,7 @@ class UhdConsoleMarkerMonitor:
         self._channel_count = None if channel_count is None else int(channel_count)
         self._samples_per_chunk = None if samples_per_chunk is None else int(samples_per_chunk)
         self._stop = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._scanner = UhdConsoleMarkerScanner()
         self._totals = {"D": 0, "O": 0}
@@ -120,28 +121,48 @@ class UhdConsoleMarkerMonitor:
         self._window_started_monotonic = 0.0
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._started_monotonic = time.monotonic()
-        self._window_started_monotonic = self._started_monotonic
-        self._window_counts = {"D": 0, "O": 0}
-        self._thread = threading.Thread(
-            target=self._run,
-            name="uhd_console_marker_monitor",
-            daemon=True,
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._started_monotonic = time.monotonic()
+            self._window_started_monotonic = self._started_monotonic
+            self._window_counts = {"D": 0, "O": 0}
+            self._thread = threading.Thread(
+                target=self._run,
+                name="uhd_console_marker_monitor",
+                daemon=True,
+            )
+            try:
+                self._thread.start()
+            except BaseException:
+                self._thread = None
+                self._stop.set()
+                raise
 
-    def stop(self, timeout_s: float = 1.0) -> None:
-        self._stop.set()
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=max(0.0, float(timeout_s)))
-        self._thread = None
-        for event in self._scanner.flush():
-            self._log_event(event)
-        self._log_summary(force=True)
+    def stop(self, timeout_s: float = 1.0) -> bool:
+        with self._lifecycle_lock:
+            self._stop.set()
+            thread = self._thread
+            if (
+                thread is not None
+                and thread.ident is not None
+                and thread is not threading.current_thread()
+            ):
+                thread.join(timeout=max(0.0, float(timeout_s)))
+            if thread is not None and thread.is_alive():
+                self._errors_log.error(
+                    "UHD console marker monitor did not stop within %.3f s; "
+                    "scanner state was not flushed concurrently.",
+                    max(0.0, float(timeout_s)),
+                )
+                return False
+            if self._thread is thread:
+                self._thread = None
+            for event in self._scanner.flush():
+                self._log_event(event)
+            self._log_summary(force=True)
+            return True
 
     def _run(self) -> None:
         position = 0

@@ -30,7 +30,7 @@ The old document implicitly treated 9.51 dBm as a confirmed 4 MHz measurement.
 That value is not derivable from 17.7 dBm over 183 MHz: flat-PSD scaling gives
 `17.7 + 10 log10(4/183) = 1.10 dBm`. Therefore 9.51 dBm remains an independent
 input that must be confirmed by a same-band measurement or PSD integration.
-The corrected complete tables are in `docs/12_rf_power_sweep_tables.md`.
+The corrected complete tables are in `docs/audits/rf_power_sweep_tables.md`.
 
 ## Total bladeRF power versus useful GNSS
 

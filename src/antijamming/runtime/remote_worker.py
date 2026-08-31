@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import threading
 from typing import Any
+import uuid
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -25,6 +26,7 @@ class RemoteStreamWorker(QObject):
         self._lock = threading.Lock()
         self._backend_running = False
         self._start_requested = False
+        self._pending_start_request_id: str | None = None
         self._seen_running_since_start = False
         self._stopped = threading.Event()
         self._stopped.set()
@@ -33,17 +35,24 @@ class RemoteStreamWorker(QObject):
         self._client.connect(timeout_s=timeout_s)
 
     def start(self) -> None:
+        request_id = uuid.uuid4().hex
         with self._lock:
             if self._backend_running or self._start_requested:
                 return
             self._start_requested = True
+            self._pending_start_request_id = request_id
             self._seen_running_since_start = False
             self._stopped.clear()
         try:
-            self._client.command("start", reason="standalone GUI Start")
+            self._client.command(
+                "start",
+                request_id=request_id,
+                reason="standalone GUI Start",
+            )
         except Exception as exc:
             with self._lock:
                 self._start_requested = False
+                self._pending_start_request_id = None
                 self._stopped.set()
             self.failed.emit(f"Backend start command failed: {exc}")
 
@@ -122,10 +131,20 @@ class RemoteStreamWorker(QObject):
         if message_type == "failed":
             with self._lock:
                 self._start_requested = False
+                self._pending_start_request_id = None
+                if not self._backend_running:
+                    self._stopped.set()
             self.failed.emit(str(message.get("message", "Backend failed")))
             return
         if message_type != "state":
             if message_type == "reply" and not bool(message.get("ok", False)):
+                request_id = str(message.get("request_id", ""))
+                with self._lock:
+                    if request_id == self._pending_start_request_id:
+                        self._start_requested = False
+                        self._pending_start_request_id = None
+                        if not self._backend_running:
+                            self._stopped.set()
                 self.failed.emit(str(message.get("error", "Backend command failed")))
             return
 
@@ -135,9 +154,11 @@ class RemoteStreamWorker(QObject):
             was_active = self._backend_running or self._start_requested
             self._backend_running = running
             if running:
+                self._pending_start_request_id = None
                 self._seen_running_since_start = True
             elif self._seen_running_since_start:
                 self._start_requested = False
+                self._pending_start_request_id = None
                 self._seen_running_since_start = False
                 self._stopped.set()
                 emit_finished = was_active

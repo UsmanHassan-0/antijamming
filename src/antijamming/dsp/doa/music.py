@@ -14,10 +14,13 @@ import numpy as np
 #   ch0/ant1  ch3/ant4
 # Internal azimuth uses +x for ch0->ch3 and +y for ch0->ch1.
 
+
 def _array_xy_positions_m(array_spacing_m: float) -> np.ndarray:
     """Return the fixed 4-element square array x/y coordinates."""
 
     spacing = float(array_spacing_m)
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError("array spacing must be a positive finite value")
     half_spacing = spacing / 2.0
     return np.asarray(
         [
@@ -29,15 +32,22 @@ def _array_xy_positions_m(array_spacing_m: float) -> np.ndarray:
         dtype=np.float64,
     )
 
+
 def steering_vector(
     theta_deg: np.ndarray,
     rf_freq_hz: float,
     array_spacing_m: float,
 ) -> np.ndarray:
     """Return planar steering vectors for the requested scan angles."""
+    frequency = float(rf_freq_hz)
+    if not np.isfinite(frequency) or frequency <= 0.0:
+        raise ValueError("steering frequency must be a positive finite value")
+    theta_values = np.asarray(theta_deg, dtype=np.float64).reshape(-1)
+    if not np.all(np.isfinite(theta_values)):
+        raise ValueError("steering angles contain NaN or Inf")
     c0 = 299792458.0
-    k = 2.0 * np.pi * rf_freq_hz / c0
-    theta = np.deg2rad(theta_deg)
+    k = 2.0 * np.pi * frequency / c0
+    theta = np.deg2rad(theta_values)
     positions = _array_xy_positions_m(array_spacing_m)
     direction = np.vstack((np.cos(theta), np.sin(theta)))
     phase = 1j * k * (positions @ direction)
@@ -54,12 +64,15 @@ def steering_vector(
 NOISE_TAIL_SPREAD_WHITE_LIKE_DB = 3.0
 NOISE_TAIL_FLATNESS_WHITE_LIKE_DB = 1.0
 
+
 def spatial_covariance(x: np.ndarray) -> np.ndarray:
     """Return the channel covariance matrix for [channels, samples] IQ data."""
 
     x = np.asarray(x, dtype=np.complex128)
     if x.ndim != 2 or x.shape[0] == 0:
         return np.zeros((0, 0), dtype=np.complex128)
+    if not np.all(np.isfinite(x)):
+        raise ValueError("covariance input contains NaN or Inf")
     return (x @ x.conj().T) / max(int(x.shape[1]), 1)
 
 
@@ -80,6 +93,15 @@ def covariance_eigendecomposition_from_matrix(
             np.zeros((0,), dtype=np.float64),
             np.zeros((0, 0), dtype=np.complex128),
         )
+    if r.ndim != 2 or r.shape[0] != r.shape[1]:
+        raise ValueError(
+            f"covariance eigendecomposition requires a square matrix, got {r.shape}"
+        )
+    if not np.all(np.isfinite(r)):
+        raise ValueError("covariance eigendecomposition input contains NaN or Inf")
+    if not np.allclose(r, r.conj().T, rtol=1e-7, atol=1e-12):
+        raise ValueError("covariance eigendecomposition input is not Hermitian")
+    r = 0.5 * (r + r.conj().T)
     evals, evecs = np.linalg.eigh(r)
     order = np.argsort(evals)[::-1]
     return np.asarray(np.real(evals[order]), dtype=np.float64), evecs[:, order]
@@ -116,7 +138,9 @@ def _noise_tail_diagnostics(
         spread_db = float(np.max(tail_db) - np.min(tail_db))
         log_gm = float(np.mean(np.log(tail)))
         am = float(np.mean(tail))
-        flatness_db = float(10.0 * np.log10(max(am, 1e-30)) - (10.0 / np.log(10.0)) * log_gm)
+        flatness_db = float(
+            10.0 * np.log10(max(am, 1e-30)) - (10.0 / np.log(10.0)) * log_gm
+        )
         white_like = (
             spread_db <= NOISE_TAIL_SPREAD_WHITE_LIKE_DB
             and flatness_db <= NOISE_TAIL_FLATNESS_WHITE_LIKE_DB
@@ -207,6 +231,7 @@ def source_count_diagnostics_from_eigenvalues(
 # a conventional beamformer diagnostic so MUSIC's pseudo-spectrum can be
 # compared against an angle-by-angle output-power estimate.
 
+
 def bartlett_spectrum(
     x: np.ndarray,
     rf_freq_hz: float,
@@ -252,6 +277,7 @@ def bartlett_spectrum_from_covariance(
     if not normalize:
         return p
     return p / (np.max(p) + 1e-12)
+
 
 def music_spectrum(
     x: np.ndarray,

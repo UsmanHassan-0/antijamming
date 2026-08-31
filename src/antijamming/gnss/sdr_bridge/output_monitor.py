@@ -44,12 +44,13 @@ class OutputMonitorMixin:
             return
         if self._nmea_thread is not None and self._nmea_thread.is_alive():
             return
-        self._nmea_thread = threading.Thread(
+        thread = threading.Thread(
             target=self._drain_nmea_tty,
             name="gnss_sdr_nmea_tty",
             daemon=True,
         )
-        self._nmea_thread.start()
+        thread.start()
+        self._nmea_thread = thread
         self._handoff_log.info(
             "GNSS-SDR NMEA tty monitor active: devname=%s file_output=%s rate_ms=%d",
             self._nmea_tty_path,
@@ -59,8 +60,19 @@ class OutputMonitorMixin:
 
     def _stop_nmea_tty_reader(self) -> None:
         self._close_nmea_tty_fds()
-        if self._nmea_thread is not None:
-            self._nmea_thread.join(timeout=1.0)
+        thread = self._nmea_thread
+        if (
+            thread is not None
+            and thread.ident is not None
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=1.0)
+        if thread is not None and thread.is_alive():
+            self._err_log.error(
+                "GNSS-SDR NMEA monitor did not stop within 1.0 s; "
+                "retaining the live thread reference."
+            )
+        elif self._nmea_thread is thread:
             self._nmea_thread = None
 
     def _close_nmea_tty_fds(self) -> None:

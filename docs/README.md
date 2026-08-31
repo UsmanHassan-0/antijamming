@@ -2,10 +2,14 @@
 
 Project documentation lives in this directory.
 
-- `realtime_gui.md` - realtime GUI launcher and product runtime profile notes
-- `hardware.md` - USRP/X300/TwinRX hardware and transport notes
-- `twinrx_lo_sharing_readme.md` - TwinRX LO-sharing map and cable notes
-- `architecture_refactor_notes.md` - architecture/refactoring working notes
-- `07_one_run_test_method.md` - implemented one-run state/reference method
-- `15_self_run_live_evidence.md` - exact independent live-test markers, retained evidence, and audit commands
-- `16_shared_u1_optimization_provenance.md` - source-to-PVT provenance, removed duplication, benchmarks, and verification for the shared measured-U1 fanout
+- `00_*.md` through `08_*.md` are the consecutively numbered conceptual guides.
+- `progress_tracker.md` is the one living, timestamped implementation and
+  verification ledger.
+- `implementation_provenance.md` maps standards, publications, project-specific
+  code, measurements, assumptions, and proposals.
+- `audits/` contains retained run-specific evidence; its `README.md` is the
+  index. Dated audit records are not current-state trackers.
+- `realtime_gui.md` documents the launcher and product runtime profile.
+- `hardware.md` and `twinrx_lo_sharing_readme.md` document the X300/TwinRX
+  hardware and transport constraints.
+- `architecture_refactor_notes.md` records explicitly deferred structural work.

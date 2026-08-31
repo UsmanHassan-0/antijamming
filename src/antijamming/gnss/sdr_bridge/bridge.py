@@ -261,6 +261,15 @@ class GnssSdrBridge(
             self._log.warning("%s", msg)
             return False
 
+        try:
+            return self._start_resolved(exe_path)
+        except BaseException:
+            self.stop("startup failure")
+            raise
+
+    def _start_resolved(self, exe_path: Path) -> bool:
+        """Start after executable resolution, rolling owned resources back on error."""
+
         self._terminate_matching_stale_processes()
         self._reset_runtime_dir()
         self._outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -327,17 +336,22 @@ class GnssSdrBridge(
         # A PTY keeps GNSS-SDR stdout line-buffered so state parsing reacts
         # quickly during startup and acquisition.
         master_fd, slave_fd = pty.openpty()
-        self._proc = subprocess.Popen(
-            self._gnss_sdr_launch_args(exe_path),
-            cwd=self._runtime_dir,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            text=False,
-            bufsize=0,
-            env=env,
-            start_new_session=True,
-        )
-        os.close(slave_fd)
+        try:
+            self._proc = subprocess.Popen(
+                self._gnss_sdr_launch_args(exe_path),
+                cwd=self._runtime_dir,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                text=False,
+                bufsize=0,
+                env=env,
+                start_new_session=True,
+            )
+        except BaseException:
+            os.close(master_fd)
+            raise
+        finally:
+            os.close(slave_fd)
         if not self._atexit_registered:
             atexit.register(self.stop, "python shutdown")
             self._atexit_registered = True
@@ -347,24 +361,30 @@ class GnssSdrBridge(
             self._config_path,
             self._runtime_dir,
         )
-        self._stdout_handle = os.fdopen(
-            master_fd,
-            "rb",
-            buffering=0,
-        )
-        self._stdout_thread = threading.Thread(
+        try:
+            self._stdout_handle = os.fdopen(
+                master_fd,
+                "rb",
+                buffering=0,
+            )
+        except BaseException:
+            os.close(master_fd)
+            raise
+        stdout_thread = threading.Thread(
             target=self._drain_stdout,
             name="gnss_sdr_stdout",
             daemon=True,
         )
-        self._stdout_thread.start()
+        stdout_thread.start()
+        self._stdout_thread = stdout_thread
         self._start_nmea_tty_reader()
-        self._glog_thread = threading.Thread(
+        glog_thread = threading.Thread(
             target=self._monitor_glog_files,
             name="gnss_sdr_glog",
             daemon=True,
         )
-        self._glog_thread.start()
+        glog_thread.start()
+        self._glog_thread = glog_thread
         startup_timeout_s = float(self._cfg.gnss_sdr_startup_timeout_s)
         timeout_label = "none" if startup_timeout_s <= 0.0 else f"{startup_timeout_s:.1f}s"
         self._report_startup(
@@ -375,19 +395,15 @@ class GnssSdrBridge(
             str(Path.home() / ".gr_fftw_wisdom"),
             timeout_label,
         )
-        try:
-            self._fifo_fds = []
-            for fifo_path in self._fifo_paths:
-                self._fifo_fds.append(
-                    self._open_fifo_writer(
-                        timeout_s=startup_timeout_s,
-                        fifo_path=fifo_path,
-                    )
+        self._fifo_fds = []
+        for fifo_path in self._fifo_paths:
+            self._fifo_fds.append(
+                self._open_fifo_writer(
+                    timeout_s=startup_timeout_s,
+                    fifo_path=fifo_path,
                 )
-            self._fifo_fd = self._fifo_fds[0]
-        except Exception:
-            self.stop("startup failure")
-            raise
+            )
+        self._fifo_fd = self._fifo_fds[0]
         self._drop_count = 0
         self._write_count = 0
         self._write_bytes = 0
@@ -645,17 +661,40 @@ class GnssSdrBridge(
             self._proc = None
 
         self._stop_nmea_tty_reader()
-        if self._stdout_thread is not None:
-            self._stdout_thread.join(timeout=1.0)
-            self._stdout_thread = None
-        if self._stdout_handle is not None:
+        stdout_handle = self._stdout_handle
+        self._stdout_handle = None
+        if stdout_handle is not None:
             try:
-                self._stdout_handle.close()
+                stdout_handle.close()
             except OSError:
                 pass
-            self._stdout_handle = None
-        if self._glog_thread is not None:
-            self._glog_thread.join(timeout=1.0)
+        stdout_thread = self._stdout_thread
+        if (
+            stdout_thread is not None
+            and stdout_thread.ident is not None
+            and stdout_thread is not threading.current_thread()
+        ):
+            stdout_thread.join(timeout=1.0)
+        if stdout_thread is not None and stdout_thread.is_alive():
+            self._err_log.error(
+                "GNSS-SDR stdout monitor did not stop within 1.0 s; "
+                "retaining the live thread reference."
+            )
+        elif self._stdout_thread is stdout_thread:
+            self._stdout_thread = None
+        glog_thread = self._glog_thread
+        if (
+            glog_thread is not None
+            and glog_thread.ident is not None
+            and glog_thread is not threading.current_thread()
+        ):
+            glog_thread.join(timeout=1.0)
+        if glog_thread is not None and glog_thread.is_alive():
+            self._err_log.error(
+                "GNSS-SDR glog monitor did not stop within 1.0 s; "
+                "retaining the live thread reference."
+            )
+        elif self._glog_thread is glog_thread:
             self._glog_thread = None
 
         self._archive_runtime_artifacts(config_only=False)

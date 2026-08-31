@@ -1,6 +1,11 @@
 # Calibration
 
-Runtime calibration is loaded in `src/antijamming/app/main.py` with `load_calibration_correction_selection()` from `src/antijamming/dsp/phase/alignment.py`. The selected vector becomes `cfg.phase_correction_vector` and is applied by `apply_phase_calibration()`.
+Runtime calibration is loaded by
+`src/antijamming/app/runtime_config.py::build_runtime_config()` with
+`load_calibration_correction_selection()` from
+`src/antijamming/dsp/phase/alignment.py`. Both the GUI and headless service use
+that shared builder. The selected vector becomes `cfg.phase_correction_vector`
+and is applied by `apply_phase_calibration()`.
 
 Phase-only calibration rotates each channel so coherent phase lines up. In kid terms: it makes all four channels clap at the same time. Complex-gain calibration also scales magnitudes. It makes them clap at comparable loudness too. The product default is `calibration_correction_mode: "complex_gain"`.
 
