@@ -11,9 +11,10 @@ links it without rewriting historical observations.
   `0672377aa6c3fa53a11e09747e0cbd300c815579`.
 - Active cleanup branch: `cleanup/no-usrp-verification-20260831`.
 - `main` and `per-prn-fifo-experimental` are outside this branch's mutations.
-- Laptop verification is hardware-free. Spark inventory discovery sees an
-  X300/HG at `192.168.40.2` and one bladeRF 2.0, but the cleanup branch has not
-  yet completed an attached-runtime test at this checkpoint.
+- Laptop verification is hardware-free. The identical cleanup commit completed
+  bounded Spark X300/GNSS-SDR testing; the bladeRF screen did not establish a
+  physical path to the selected TwinRX inputs. See
+  `docs/audits/cleanup_spark_hardware_2026-08-31.md`.
 - A passing test proves only its named inputs and exercised schedules. It does
   not prove that the repository is generally correct or race-free.
 - Architecture splitting, including `runtime/backend.py`, is deferred.
@@ -28,9 +29,33 @@ links it without rewriting historical observations.
 | Configuration/input boundaries | Focused and broad regressions passed | Attached-runtime validation |
 | Numerical/DSP boundaries | Focused and broad deterministic regressions passed | OTA correctness remains separate |
 | Documentation | One tracker, consecutive conceptual docs, retained audit index, and provenance map | Maintain these documents with future changes |
-| Hardware integration | Spark inventory discovered; cleanup runtime not yet exercised | Copy exact branch without GitHub push, then attached USRP/GNSS-SDR run |
+| Hardware integration | Spark X300/GNSS-SDR bounded run passed its recorded counters; bladeRF path unresolved | Confirm cable/splitter/ports before higher-gain bladeRF or jammer testing |
 
 ## Timestamped change log
+
+### 2026-08-31T22:57:13+05:00 — Spark attached-hardware checkpoint
+
+- Transferred exact commit `061e12f` to Spark by Git bundle without a GitHub
+  push. Both cleanup branches matched, both working trees were clean, and both
+  `main` references remained at `0672377`.
+- Spark's ARM environment passed `397` software tests with the one physical
+  USRP gate skipped; the explicitly enabled four-channel USRP smoke test then
+  passed separately.
+- Corrected Spark's live socket-buffer sysctls from 33,554,432 to the
+  repository-specified 50,000,000 bytes after UHD reported the smaller value.
+  The repeated bounded run had zero UHD buffer warnings, 3,063 receive chunks,
+  no overflow/timeout/clipping indicator, ten synchronized GNSS FIFOs with no
+  drops, empty `errors.log`, and no remaining owned process after shutdown.
+- The short run had no PVT, no LCMV activation, and no controlled jammer. Its
+  automatic audit correctly kept jammer state unknown and suppression
+  unavailable.
+- The bounded bladeRF screen used X300 gain 0 dB and bladeRF gains −23, 0, and
+  +10 dB. All TX-on power readings remained within 0.2 dB of the matched TX-off
+  capture despite a nonzero IQ window. TX returned idle after each test. No
+  higher gain was attempted: the bladeRF-to-four-input physical path remains
+  unproven and requires cable/splitter/port confirmation.
+- Exact run paths, hashes, counters, profile observations, and claim limits are
+  retained in `docs/audits/cleanup_spark_hardware_2026-08-31.md`.
 
 ### 2026-08-31T22:26:31+05:00 — strict active-contract software checkpoint
 

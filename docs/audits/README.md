@@ -17,6 +17,7 @@ silently rewrite an old result to match a later implementation.
 | `self_run_live_evidence.md` | Procedure and evidence requirements for an independently run live test |
 | `shared_u1_optimization_provenance.md` | Source-to-PVT changes, benchmark, and tests for Shared-U1 fanout |
 | `failure_provenance_and_regression_2026-08-22.md` | Dated failure and regression evidence ledger |
+| `cleanup_spark_hardware_2026-08-31.md` | Cleanup-branch software, X300/GNSS-SDR runtime, host-profile, and bounded bladeRF screen evidence |
 
 These records do not collectively prove current hardware behavior. Consult the
 living tracker for current code state and remaining verification boundaries.
