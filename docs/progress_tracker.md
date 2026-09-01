@@ -65,6 +65,10 @@ links it without rewriting historical observations.
   USRP pytest; attached Spark runs are recorded separately rather than hiding
   that gate. Configured Ruff, Vulture at 90% confidence, `compileall`, product
   shell syntax, and `git diff --check` all passed.
+- After fast-forwarding Spark to source/evidence commit `06df103`, its full
+  development/warnings-as-error suite also passed: `400 passed, 1 skipped` in
+  10.53 seconds. The primary Spark and laptop worktrees were clean at the same
+  commit before this documentation-only record was added.
 
 ### 2026-08-31T22:57:13+05:00 — Spark attached-hardware checkpoint
 
