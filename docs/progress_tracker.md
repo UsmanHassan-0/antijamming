@@ -33,6 +33,33 @@ links it without rewriting historical observations.
 
 ## Timestamped change log
 
+### 2026-09-01T18:15:24+05:00 — jammer-latch release audit
+
+- Confirmed that the cleanup product has a historical jammer-detection latch,
+  not automatic current-protection release. When current power-plus-covariance
+  evidence disappears, `evidence_now` becomes false but the latch stays true
+  until LCMV is disabled.
+- A current-code harness showed that an outside MUSIC peak keeps common LCMV
+  active after evidence disappears. With no outside peak, common status falls
+  back to uniform but the GNSS FIFO retains the last measured-U1 protection
+  while the latch remains true. Manual disable clears both.
+- Located the remembered release implementation only on
+  `origin/per-prn-fifo-experimental`: commit `9a23c86` separates historical
+  detection from `lcmv_jammer_protection_active` and releases after a two-second
+  hold. That value and implementation are not current-product or OTA-validated,
+  and the large experimental branch must not be merged wholesale.
+- Reproduced an operator-disable race with a deterministic solver barrier. OFF
+  first produced disabled/uniform/no-protection state, but the in-flight worker
+  later published ON status, non-uniform target weights, and GNSS protection
+  availability while runtime/config enable flags remained false.
+- The GUI's generic “Uniform fallback” wording can disagree with the actual
+  retained GNSS FIFO protection row. Detailed handoff labels carry the actual
+  source, but the primary status does not expose current protection separately.
+- Current focused tests passed `3 passed in 0.14s`; their exact boundary and the
+  older non-proof OTA evidence are recorded in
+  `docs/audits/jammer_latch_audit_2026-09-01.md`. No runtime code changed and no
+  current hardware release claim is made.
+
 ### 2026-09-01T16:15:04+05:00 — 4–10 MS/s sweep opened
 
 - Recorded the actual starting boundary before further runs: 4 MS/s has
