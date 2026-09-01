@@ -11,10 +11,16 @@ This record answers three bounded questions:
 3. Does GNSS-SDR decode the waveform directly when the RF and anti-jamming
    paths are bypassed?
 
-There was no jammer. LCMV was disabled. These runs do not prove jammer
-suppression, physical null depth, OTA array-manifold correctness, or the
-absence of other thread schedules and hardware faults. The direct-file run is
-waveform/receiver evidence only; it does not exercise anti-jamming code.
+There was no jammer. The cleanup RF run began with LCMV disabled, then
+`lcmv_auto_arm_after_pvt` armed it at session elapsed 540.123 seconds after a
+healthy PVT decision. It remained in `fallback` on `uniform_array_sum` because
+the input-power and generalized-covariance jammer-evidence gates did not fire;
+no covariance-null weights were applied. The matched `main` run also reached
+the armed uniform-fallback state before its FIFO failure. These runs therefore
+do not prove jammer suppression, physical null depth, OTA array-manifold
+correctness, or the absence of other thread schedules and hardware faults. The
+direct-file run is waveform/receiver evidence only; it does not exercise
+anti-jamming code.
 
 ## Waveform and tuning provenance
 
@@ -67,6 +73,10 @@ steady-state C/N0 estimates.
   RTKLIB residual summaries. Replaying from sample zero at gain changes caused
   reacquisition/reset intervals, so these counts are evidence of repeated
   valid output, not one continuous receiver-time interval.
+- LCMV state: initially off; auto-armed at session elapsed 540.123 seconds;
+  thereafter `enabled=true`, `mode=fallback`, and
+  `active_lcmv_weights_source=uniform_fallback`. No jammer-evidence activation
+  or covariance-null weight application was observed.
 
 Observed C/N0, with the physical splitter path reconnected:
 

@@ -33,6 +33,34 @@ links it without rewriting historical observations.
 
 ## Timestamped change log
 
+### 2026-09-01T16:15:04+05:00 — 4–10 MS/s sweep opened
+
+- Recorded the actual starting boundary before further runs: 4 MS/s has
+  attached RF/tracking/PVT evidence; 5 MS/s has a 1,200-second transport-only
+  soak; 5 MS/s RF/PVT and all attached 6–10 MS/s rates remain pending.
+- The one untouched-`main` FIFO-source-9 stall remains an open root-cause
+  investigation. The fair striped writer and 0.250-second deadline exist in
+  both revisions, so the longer cleanup success is not by itself evidence that
+  cleanup fixed the stall.
+- The rate sweep will use temporary profiles and the retained 1,200-second
+  waveform, leaving the checked-in 4 MS/s product profile unchanged. Results
+  and failures are added immediately to
+  `docs/audits/sample_rate_sweep_2026-09-01.md`.
+- Added and ran a seven-case 4–10 MS/s propagation regression plus the existing
+  32-channel/5 MS/s renderer case: `8 passed`. It proves config agreement from
+  the single authored rate through X300 followers and every rendered GNSS-SDR
+  source/conditioner; it does not prove attached realtime capacity.
+- The attached 5–10 MS/s RF sweep was paused before its first new run after the
+  bladeRF was physically removed. Spark still detected the X300, but neither
+  USB enumeration nor `bladeRF-cli` found a bladeRF. No temporary rate profile
+  or runtime was started, so RF/tracking/PVT evidence above 4 MS/s remains
+  pending (the earlier 5 MS/s result remains transport-only).
+- Full warnings-as-errors/development-mode verification after the new
+  parameterized rate contract passed: `407 passed, 1 skipped in 15.06s`; the
+  skip remains the explicitly opt-in physical-USRP pytest.
+- Configured Ruff, Vulture at 90% confidence, Python `compileall`, product
+  shell syntax checks, and `git diff --check` passed for this checkpoint.
+
 ### 2026-09-01T15:36:46+05:00 — bladeRF gain, `main` control, and direct-file checkpoint
 
 - Confirmed the reconnected splitter path with the new 1,200-second,
@@ -69,6 +97,11 @@ links it without rewriting historical observations.
   development/warnings-as-error suite also passed: `400 passed, 1 skipped` in
   10.53 seconds. The primary Spark and laptop worktrees were clean at the same
   commit before this documentation-only record was added.
+- Documentation correction made during follow-up review: the RF run started
+  LCMV-off but auto-armed after healthy PVT at session elapsed 540.123 seconds.
+  It remained on uniform fallback because neither jammer-evidence gate fired,
+  so no covariance-null weights were applied. The earlier shorthand “LCMV was
+  disabled” was inaccurate even though the run was not a nulling test.
 
 ### 2026-08-31T22:57:13+05:00 — Spark attached-hardware checkpoint
 

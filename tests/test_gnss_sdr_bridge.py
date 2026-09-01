@@ -15,7 +15,11 @@ import time
 import numpy as np
 import pytest
 
-from antijamming.config import StreamConfig
+from antijamming.config import (
+    DEFAULT_RUNTIME_CONFIG_PATH,
+    StreamConfig,
+    load_stream_config_file,
+)
 from antijamming.gnss import GnssSdrBridge, SharedU1PhaseCompensationBank
 from antijamming.gnss.sdr_bridge.bridge import GnssFifoWriteStall
 from antijamming.gnss.sdr_bridge.fifo import PER_SOURCE_FIFO_STRIPE_SAMPLES
@@ -1304,6 +1308,35 @@ def test_bridge_gps_l1_filter_keeps_physical_bandwidth_when_rate_changes(tmp_pat
     assert "InputFilter0.bw=1385000" in rendered
     assert "InputFilter0.tw=175000" in rendered
     assert bridge.input_filter_bandwidth_hz == 2_600_000.0
+
+
+@pytest.mark.parametrize("rate_msps", range(4, 11))
+def test_product_profile_propagates_each_4_to_10_msps_rate(
+    tmp_path: Path,
+    rate_msps: int,
+) -> None:
+    """Prove authored/derived rate agreement without claiming realtime capacity."""
+
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    sample_rate = rate_msps * 1_000_000
+    payload["sample_rate"] = sample_rate
+    profile_path = tmp_path / f"x300_realtime_{rate_msps}msps.json"
+    profile_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cfg = load_stream_config_file(profile_path)
+    bridge = GnssSdrBridge(cfg, _loggers())
+    rendered = _render_config_for_test(bridge)
+
+    assert cfg.sample_rate == float(sample_rate)
+    assert cfg.usrp_rx_bandwidth_hz == float(sample_rate)
+    assert cfg.min_sample_rate == float(sample_rate)
+    assert len(bridge._fifo_paths) == cfg.gnss_1c_channel_count == 10
+    assert "GNSS-SDR.num_sources=10" in rendered
+    assert f"GNSS-SDR.internal_fs_sps={sample_rate}" in rendered
+    for source in range(cfg.gnss_1c_channel_count):
+        assert f"InputFilter{source}.sampling_frequency={sample_rate}" in rendered
+        assert f"Resampler{source}.sample_freq_in={sample_rate}" in rendered
+        assert f"Resampler{source}.sample_freq_out={sample_rate}" in rendered
 
 
 def test_bridge_renders_32_dynamic_channels_at_5mhz(tmp_path: Path) -> None:

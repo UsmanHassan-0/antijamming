@@ -19,6 +19,7 @@ silently rewrite an old result to match a later implementation.
 | `failure_provenance_and_regression_2026-08-22.md` | Dated failure and regression evidence ledger |
 | `cleanup_spark_hardware_2026-08-31.md` | Cleanup-branch software, X300/GNSS-SDR runtime, host-profile, and bounded bladeRF screen evidence |
 | `bladerf_gain_main_control_offline_2026-09-01.md` | Confirmed splitter-path bladeRF gain sweep, cleanup versus untouched-`main` FIFO behavior, and direct-file SignalSim/GNSS-SDR validation |
+| `sample_rate_sweep_2026-09-01.md` | Living 4–10 MS/s software and attached-hardware sweep, including the unresolved `main` FIFO-stall comparison |
 
 These records do not collectively prove current hardware behavior. Consult the
 living tracker for current code state and remaining verification boundaries.
