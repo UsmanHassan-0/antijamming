@@ -120,6 +120,7 @@ class GnssSdrBridge(
         self._write_bytes = 0
         self._write_time_total_s = 0.0
         self._write_max_latency_s = 0.0
+        self._fifo_summary_reported = False
         self._write_warn_threshold_s = 0.05
         # Normal ten-source writes complete in a few milliseconds.  A quarter
         # second allows transient scheduler jitter without letting a blocked
@@ -389,6 +390,7 @@ class GnssSdrBridge(
         self._write_bytes = 0
         self._write_time_total_s = 0.0
         self._write_max_latency_s = 0.0
+        self._fifo_summary_reported = False
         self._fifo_source_bytes = [0 for _ in self._fifo_paths]
         self._fifo_max_source_lead_bytes = 0
 
@@ -674,7 +676,10 @@ class GnssSdrBridge(
             stdout_stopped = True
         self._archive_runtime_artifacts(config_only=False)
 
-        if self._write_count > 0 or self._drop_count > 0:
+        if (
+            not self._fifo_summary_reported
+            and (self._write_count > 0 or self._drop_count > 0)
+        ):
             avg_ms = 1000.0 * (self._write_time_total_s / max(1, self._write_count))
             self._log.info(
                 "GNSS FIFO summary: writes=%d bytes=%d drops=%d avg_write_ms=%.2f max_write_ms=%.2f pipe=%s source_byte_spread=%d max_source_lead_samples=%d stripe_samples=%d",
@@ -692,6 +697,7 @@ class GnssSdrBridge(
                 self._fifo_max_source_lead_bytes // np.dtype(np.complex64).itemsize,
                 PER_SOURCE_FIFO_STRIPE_SAMPLES if len(self._fifo_paths) > 1 else 0,
             )
+            self._fifo_summary_reported = True
 
         if process_stopped:
             self._cleanup_fifo()
@@ -699,7 +705,13 @@ class GnssSdrBridge(
             self._err_log.error(
                 "GNSS-SDR cleanup incomplete; retaining process and FIFO ownership for retry."
             )
-        return bool(process_stopped and stdout_stopped and nmea_stopped and udp_stopped)
+        stopped = bool(
+            process_stopped and stdout_stopped and nmea_stopped and udp_stopped
+        )
+        if stopped and self._atexit_registered:
+            atexit.unregister(self.stop)
+            self._atexit_registered = False
+        return stopped
 
     def _archive_runtime_artifacts(self, *, config_only: bool) -> None:
         """Copy the exact per-process GNSS-SDR evidence into this run."""

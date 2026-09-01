@@ -29,9 +29,42 @@ links it without rewriting historical observations.
 | Configuration/input boundaries | Focused and broad regressions passed | Attached-runtime validation |
 | Numerical/DSP boundaries | Focused and broad deterministic regressions passed | OTA correctness remains separate |
 | Documentation | One tracker, consecutive conceptual docs, retained audit index, and provenance map | Maintain these documents with future changes |
-| Hardware integration | Spark X300/GNSS-SDR bounded run passed its recorded counters; bladeRF path unresolved | Confirm cable/splitter/ports before higher-gain bladeRF or jammer testing |
+| Hardware integration | Confirmed splitter path decoded the 1,200-second L1 waveform through cleanup at bladeRF 10 dB; matched `main` reproduced one FIFO stall; direct-file GNSS-SDR decoded the tested 120-second prefix | Repeat cleanup stress with controlled jammer/LCMV; a single schedule does not exclude later FIFO or RF faults |
 
 ## Timestamped change log
+
+### 2026-09-01T15:36:46+05:00 — bladeRF gain, `main` control, and direct-file checkpoint
+
+- Confirmed the reconnected splitter path with the new 1,200-second,
+  50 MS/s L1 waveform. The cleanup branch ran 980.233 seconds with zero FIFO
+  drops, an empty error log, and repeated valid GNSS PVT. Steady bladeRF 10 dB
+  produced eight PRNs averaging about 43.25–43.41 dB-Hz; 15 dB was about
+  46.61–46.89 dB-Hz and 20 dB about 48.93–49.28 dB-Hz. Ten dB is the preferred
+  level for this exact test chain, not a calibrated RF-output claim.
+- Ran an isolated untouched-`main` control at commit `0672377` with the same
+  GNSS-SDR binary, 4 MS/s profile, file restart, and bladeRF 10 dB. It initially
+  tracked the same eight PRNs and produced valid PVT, then reproduced a
+  16,384-byte stall on zero-based FIFO source 9 at the 0.250-second timeout.
+  Its summary recorded one drop. The longer cleanup run did not reproduce that
+  failure; this comparison remains bounded to the two observed schedules.
+- A separate 1,200-second 5 MS/s attached-X300 soak completed with 182,405 raw
+  chunks, zero overflow/timeout/clipping indicator, and 182,404 ten-source FIFO
+  writes with zero drops. This does not establish 32-channel realtime capacity.
+- Ran GNSS-SDR directly on a 120-second prefix with RF, USRP, anti-jamming, and
+  FIFOs absent. It decoded all eight intended PRNs, emitted 86 valid PVT epochs
+  and 171 positions, reached receiver time 120 seconds, and exited normally in
+  62.035 seconds. This establishes the tested waveform prefix independently of
+  the RF chain, not all 1,200 seconds or every ephemeris cutover.
+- Exact commands, paths, counts, hashes, failure text, and claim boundaries are
+  retained in
+  `docs/audits/bladerf_gain_main_control_offline_2026-09-01.md`.
+- Final laptop gates after the evidence/documentation batch: focused GNSS
+  bridge and documentation set `172 passed`; full development/warnings-as-error
+  suite `400 passed, 1 skipped`; coverage suite `400 passed, 1 skipped` at 78%
+  aggregate project-source line coverage. The skip remains the opt-in physical
+  USRP pytest; attached Spark runs are recorded separately rather than hiding
+  that gate. Configured Ruff, Vulture at 90% confidence, `compileall`, product
+  shell syntax, and `git diff --check` all passed.
 
 ### 2026-08-31T22:57:13+05:00 — Spark attached-hardware checkpoint
 

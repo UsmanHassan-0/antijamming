@@ -329,13 +329,18 @@ def test_fifo_stop_during_stall_has_bounded_join_and_no_deadlock(
         thread.join(timeout=1.0)
 
 
-def test_fifo_ten_source_production_chunk_stress_is_byte_exact(
+@pytest.mark.parametrize(
+    ("source_count", "chunk_count"),
+    ((10, 64), (32, 4)),
+    ids=("deployed-10-source-soak", "32-source-scaling-boundary"),
+)
+def test_fifo_multi_source_production_chunk_stress_is_byte_exact(
     tmp_path: Path,
+    source_count: int,
+    chunk_count: int,
 ) -> None:
-    """Exercise the deployed 10-source, 32,768-sample handoff repeatedly."""
+    """Exercise production-sized chunks through dynamic FIFO counts."""
 
-    source_count = 10
-    chunk_count = 64
     sample_count = 32_768
     bridge, read_fds, write_fds = _pipe_backed_bridge(
         tmp_path,
@@ -1299,6 +1304,34 @@ def test_bridge_gps_l1_filter_keeps_physical_bandwidth_when_rate_changes(tmp_pat
     assert "InputFilter0.bw=1385000" in rendered
     assert "InputFilter0.tw=175000" in rendered
     assert bridge.input_filter_bandwidth_hz == 2_600_000.0
+
+
+def test_bridge_renders_32_dynamic_channels_at_5mhz(tmp_path: Path) -> None:
+    """Prove count/rate propagation without claiming realtime capacity."""
+
+    cfg = StreamConfig(
+        sample_rate=5e6,
+        gnss_1c_channel_count=32,
+        gnss_channels_in_acquisition=32,
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+
+    rendered = _render_config_for_test(bridge)
+
+    assert len(bridge._fifo_paths) == 32
+    assert bridge._fifo_paths[-1].name == "gnss_iq_channel_31.fifo"
+    assert "GNSS-SDR.num_sources=32" in rendered
+    assert "Channels_1C.count=32" in rendered
+    assert "Channels.in_acquisition=32" in rendered
+    assert "GNSS-SDR.internal_fs_sps=5000000" in rendered
+    assert "SignalSource31.implementation=Fifo_Signal_Source" in rendered
+    assert "SignalConditioner31.implementation=Signal_Conditioner" in rendered
+    assert "InputFilter31.sampling_frequency=5000000" in rendered
+    assert "Resampler31.sample_freq_in=5000000" in rendered
+    assert "Resampler31.sample_freq_out=5000000" in rendered
+    assert "Channel31.signal=1C" in rendered
+    assert "Channel31.RF_channel_ID=31" in rendered
 
 
 def test_bridge_gps_l1_filter_rejects_rate_below_stopband(tmp_path: Path) -> None:
@@ -2779,6 +2812,36 @@ def test_bridge_stop_retains_live_stdout_thread_until_retry(tmp_path: Path) -> N
     thread.live = False
     assert bridge.stop("retry stop") is True
     assert bridge._stdout_thread is None
+
+
+def test_bridge_successful_stop_reports_fifo_summary_once_and_unregisters_atexit(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    cfg = StreamConfig(
+        gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
+        gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
+    )
+    bridge = GnssSdrBridge(cfg, _loggers())
+    bridge._write_count = 2
+    bridge._write_bytes = 4096
+    bridge._write_time_total_s = 0.002
+    bridge._fifo_source_bytes = [2048, 2048]
+    bridge._atexit_registered = True
+    unregister_calls: list[object] = []
+    monkeypatch.setattr(
+        "antijamming.gnss.sdr_bridge.bridge.atexit.unregister",
+        unregister_calls.append,
+    )
+
+    with caplog.at_level(logging.INFO, logger="test.gnss.gnss"):
+        assert bridge.stop("first stop") is True
+        assert bridge.stop("second stop") is True
+
+    assert sum("GNSS FIFO summary:" in record.message for record in caplog.records) == 1
+    assert unregister_calls == [bridge.stop]
+    assert bridge._atexit_registered is False
 
 
 def test_bridge_stop_retains_unverified_process_until_retry(

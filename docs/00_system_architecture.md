@@ -26,6 +26,19 @@ configured `1C` channels), then reads GNSS-SDR feedback through
 PVT/NMEA/tracking monitor snapshots. Those health fields feed one-run
 segmentation and healthy-reference tracking.
 
+The FIFO count is not hard-coded to ten. `gnss_1c_channel_count` determines
+the number of FIFO paths, GNU Radio signal sources/conditioners, and GPS `1C`
+receiver channels. A FIFO index is a logical GNSS-SDR channel slot whose PRN
+assignment can change during acquisition and reacquisition; it is not a
+permanently named PRN stream. `gnss_channels_in_acquisition` independently
+bounds simultaneous acquisition work and cannot exceed the channel count.
+Changing either count or `sample_rate` requires a full stop/start: startup
+recreates the FIFO set and renders a new receiver flowgraph. A FIFO stall does
+not recreate a pipe or discard samples silently; it raises a bounded handoff
+failure and pauses GNSS-SDR while the four-channel USRP stream remains active.
+Configuration propagation alone does not prove that a larger channel/rate
+combination can run in real time.
+
 GNSS bridge maps use one internal satellite key shape:
 `(normalized_constellation, PRN)`. Every public per-satellite record carries
 `constellation`, numeric `prn`, and a constellation-qualified `satellite_id`;
