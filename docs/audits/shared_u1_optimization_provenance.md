@@ -59,12 +59,22 @@ The product profile now uses dynamic GNSS-SDR channel-to-PRN assignment.
 8. Because all `w_k` rows are scalar multiples of one shared row, realtime IQ
    applies the four-channel beam once and fans out `conjugate(gamma_k)` scalar
    copies. A general matrix multiply remains only for the non-collinear
-   jammer-off transition. GNSS-SDR receives one FIFO per synchronized source
-   slot with `GNSS-SDR.synchronize_signal_sources=true`, so all source branches
-   advance together before common observables/PVT. Production sources are dynamic
-   channel slots: GNSS-SDR may acquire any GPS L1 C/A PRN, and a changed
-   channel assignment discards the old PRN phase state before learning the new
-   one. Pinned sources remain a unit-test facility only.
+   jammer-off transition. GNSS-SDR receives one FIFO per source slot.
+   Production sources are dynamic channel slots: GNSS-SDR may acquire any GPS
+   L1 C/A PRN, and a changed channel assignment discards the old PRN phase
+   state before learning the new one. Pinned sources remain a unit-test
+   facility only.
+9. A later hardware failure audit superseded this document's original
+   `GNSS-SDR.synchronize_signal_sources=true` configuration. That option made
+   GNSS-SDR's 20 ms sample-counter `gr::sync_decimator` consume all ten source
+   branches; one temporarily unscheduled branch stopped the receiver clock,
+   every FIFO reader, and eventually the Python raw queue. The deployed
+   renderer now sets `GNSS-SDR.synchronize_signal_sources=false`, so the sample
+   counter follows conditioner zero. This does not permit silent sample loss:
+   the producer writes equal sample counts in fair 4,096-sample stripes,
+   requires every FIFO to finish each stripe, bounds a stalled reader at 250
+   ms, and reports source-byte spread and maximum lead. Tracking channels carry
+   their own sample counters for observable alignment.
 
 The monitor records GNSS-SDR's reported carrier phase for audit, but it does
 not need that absolute common phase to recover the relative four-channel PRN
@@ -72,6 +82,46 @@ vector. Doppler wipeoff and C/A despreading leave the same common scalar on all
 four channels; the phase-invariant projector removes it. A synthetic one-code-
 period test proves this with an arbitrary carrier phase and more than 40 dB
 wrong-code separation.
+
+## GNSS-SDR source boundary and exact post-vendoring changes
+
+The array calibration, shared measured-U1 beam, `gamma_k` calculation,
+per-PRN continuity transition, and scalar fanout are all implemented in the
+anti-jamming Python runtime **before** FIFO writes. GNSS-SDR receives already
+combined complex64 streams. It does not calculate the array weights, measured
+`u1`, null, or continuity scalar.
+
+Since the GNSS-SDR tree was first vendored in anti-jamming commit `4f352d0`,
+exactly six GNSS-SDR C++ files have changed, in two commits:
+
+- Commit `78d81f9`:
+  - `gps_l1_ca_telemetry_decoder_gs.cc` treats every parity-valid subframe with
+    continuous HOW as valid transport even when it publishes no new navigation
+    object. The former return path counted valid SF4/SF5 and partial ephemeris
+    transitions as decode failures; after three, TOW was cleared and the
+    receiver developed a deterministic navigation/PVT gap.
+  - `rtklib_pvt_gs.cc` applies a newly active channel's accumulated
+    carrier-phase ambiguity offset before the user PPP solver's first attempt,
+    rather than only after a valid solution. This breaks the circular condition
+    in which PPP required an aligned phase before the code performed alignment.
+    It also emits ephemeris, ambiguity-initialization, and PVT-pipeline audit
+    records.
+  - `rtklib_solver.cc` emits RTKLIB error and residual records on captured
+    stdout so the anti-jamming run archive can tie PVT state to the measurements
+    used or rejected.
+- Commit `435945a`:
+  - `gnss_sdr_sample_counter.{h,cc}` accepts a configurable input count instead
+    of exactly one.
+  - `gnss_flowgraph.cc` adds the optional
+    `GNSS-SDR.synchronize_signal_sources` configuration, validates equal item
+    sizes, and can connect all conditioner outputs to that counter. The feature
+    remains in the vendored source but is disabled in the product after the
+    later backpressure failure described above.
+
+The GNSS-SDR carrier-phase ambiguity correction is distinct from the
+anti-jamming per-PRN spatial phase compensation. The former aligns a receiver
+observable with pseudorange for PPP; the latter preserves each PRN's complex
+array response while a shared beam/null changes.
 
 ## Removed work and retained evidence
 
@@ -170,7 +220,7 @@ The offline gate covers:
 - every intermediate jammer-off ramp chunk;
 - scalar fast-path equality and non-collinear transition fallback;
 - GPS C/A code/Doppler correlation and phase-invariant vector recovery;
-- dynamic and pinned synchronized GNSS-SDR configuration, safe PRN
+- dynamic and pinned multi-source GNSS-SDR configuration, safe PRN
   reassignment, and FIFO write ordering;
 - covariance/MUSIC/Bartlett numerical equivalence;
 - prompt/code/carrier/symbol/bit/word/C/N0/PVT audit fields;
