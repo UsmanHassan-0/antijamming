@@ -94,6 +94,9 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_realtime_preserve_max_reference_age_s == 2.0
     assert cfg.lcmv_jammer_activation_min_input_power_jump_db == 3.0
     assert cfg.lcmv_jammer_activation_min_generalized_gain_db == 6.0
+    assert cfg.lcmv_jammer_release_max_input_power_jump_db == 1.5
+    assert cfg.lcmv_jammer_release_max_generalized_gain_db == 3.0
+    assert cfg.lcmv_jammer_release_hold_s == 2.0
     assert cfg.lcmv_weight_transition_s == 1.0
     assert VALID_LCMV_METHODS == {
         "covariance_lcmv_ideal",
@@ -281,6 +284,37 @@ def test_runtime_config_rejects_legacy_lcmv_methods(tmp_path, method) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="Invalid lcmv_test_null_method"):
+        load_stream_config_file(path)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"lcmv_jammer_release_max_input_power_jump_db": 3.0},
+            "release input-power threshold must be lower",
+        ),
+        (
+            {"lcmv_jammer_release_max_generalized_gain_db": 6.0},
+            "release generalized-gain threshold must be lower",
+        ),
+        (
+            {"lcmv_jammer_release_hold_s": -0.1},
+            "release values must be nonnegative",
+        ),
+    ],
+)
+def test_runtime_config_rejects_invalid_lcmv_release_hysteresis(
+    tmp_path,
+    overrides,
+    message,
+) -> None:
+    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload.update(overrides)
+    path = tmp_path / "runtime_with_invalid_lcmv_release.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
         load_stream_config_file(path)
 
 

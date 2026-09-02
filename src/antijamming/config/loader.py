@@ -58,6 +58,9 @@ _OPTIONAL_JSON_DEFAULTS: dict[str, Any] = {
     "lcmv_realtime_preserve_max_reference_age_s": 2.0,
     "lcmv_jammer_activation_min_input_power_jump_db": 3.0,
     "lcmv_jammer_activation_min_generalized_gain_db": 6.0,
+    "lcmv_jammer_release_max_input_power_jump_db": 1.5,
+    "lcmv_jammer_release_max_generalized_gain_db": 3.0,
+    "lcmv_jammer_release_hold_s": 2.0,
     "lcmv_weight_transition_s": 1.0,
     "lcmv_candidate_methods_enabled": True,
     "lcmv_covariance_diagonal_loading_rel": 0.001,
@@ -120,6 +123,7 @@ def load_stream_config_file(path: Path) -> StreamConfig:
 
     payload = _read_runtime_profile(path)
     values = _coerce_runtime_profile(payload)
+    _validate_lcmv_release_values(values)
     return StreamConfig.from_profile_values(values)
 
 
@@ -141,6 +145,10 @@ def apply_stream_config_file(cfg: StreamConfig, path: Path) -> StreamConfig:
 
     if "sample_rate" in payload:
         _apply_sample_rate_followers(cfg)
+
+    _validate_lcmv_release_values(
+        {field: getattr(cfg, field) for field in _json_profile_fields()}
+    )
 
     return cfg
 
@@ -221,6 +229,30 @@ def _apply_sample_rate_followers(cfg: StreamConfig) -> None:
         raise ValueError("sample_rate must be a positive number")
     for key in _SAMPLE_RATE_DERIVED_FIELDS:
         setattr(cfg, key, sample_rate)
+
+
+def _validate_lcmv_release_values(values: dict[str, Any]) -> None:
+    release_input = float(values["lcmv_jammer_release_max_input_power_jump_db"])
+    release_covariance = float(
+        values["lcmv_jammer_release_max_generalized_gain_db"]
+    )
+    release_hold = float(values["lcmv_jammer_release_hold_s"])
+    if release_input < 0.0 or release_covariance < 0.0 or release_hold < 0.0:
+        raise ValueError("Runtime config LCMV jammer release values must be nonnegative")
+    if release_input >= float(
+        values["lcmv_jammer_activation_min_input_power_jump_db"]
+    ):
+        raise ValueError(
+            "Runtime config LCMV jammer release input-power threshold must be lower "
+            "than its activation threshold"
+        )
+    if release_covariance >= float(
+        values["lcmv_jammer_activation_min_generalized_gain_db"]
+    ):
+        raise ValueError(
+            "Runtime config LCMV jammer release generalized-gain threshold must be "
+            "lower than its activation threshold"
+        )
 
 
 def _anchor_runtime_log_paths(cfg: StreamConfig) -> StreamConfig:
