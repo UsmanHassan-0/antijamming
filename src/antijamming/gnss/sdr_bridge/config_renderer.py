@@ -218,8 +218,10 @@ class ConfigRendererMixin:
         count = self._shared_u1_phase_source_count()
         rows: list[str] = []
         for idx in range(count):
-            # Every shared-phase source is a distinct synchronized GNU Radio
-            # branch, whether its PRN is pinned or acquired dynamically.
+            # Every shared-phase source is a distinct, sample-aligned GNU Radio
+            # branch, whether its PRN is pinned or acquired dynamically.  The
+            # global sample-counter synchronization option remains disabled;
+            # equal-count/fair-stripe enforcement is owned by the producer.
             suffix = str(idx)
             output_suffix = f"_channel_{idx:02d}"
             conditioner = f"SignalConditioner{suffix}"
