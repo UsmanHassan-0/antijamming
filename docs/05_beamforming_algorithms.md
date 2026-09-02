@@ -36,10 +36,12 @@ inside-guard candidates prevent a fresh solve. This retained control dependency
 does not turn the MUSIC angle into the measured null vector.
 
 Activation requires both input-power rise and generalized-covariance rise
-against the frozen baseline (profile: 3 and 6 dB). At this rewritten cleanup
-checkpoint, detection remains latched until operator disable. The later
-bounded-release commit is replayed separately; this removal does not introduce
-its thresholds, timer, or control lock.
+against the frozen baseline (profile: 3 and 6 dB). Cleanup keeps historical
+detection separate from currently active protection. With valid evidence,
+protection releases after both lower thresholds (1.5 and 3 dB) hold for two
+seconds; returning to uniform includes the existing phase-bank transition.
+See the living [jammer audit](audits/jammer_latch_audit_2026-09-01.md)
+for exercised schedules and unverified boundaries.
 
 The healthy-vector equality is not a proof of preservation for every PRN.
 Desired-loss and noise-gain metrics remain diagnostics; current preflight does

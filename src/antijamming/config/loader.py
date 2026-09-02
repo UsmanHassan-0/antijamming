@@ -364,6 +364,9 @@ def _validate_runtime_values(values: dict[str, Any]) -> None:
         "lcmv_realtime_preserve_guard_deg",
         "lcmv_jammer_activation_min_input_power_jump_db",
         "lcmv_jammer_activation_min_generalized_gain_db",
+        "lcmv_jammer_release_max_input_power_jump_db",
+        "lcmv_jammer_release_max_generalized_gain_db",
+        "lcmv_jammer_release_hold_s",
         "lcmv_min_predicted_jammer_suppression_db",
         "lcmv_weight_transition_s",
         "lcmv_covariance_diagonal_loading_rel",
@@ -418,6 +421,20 @@ def _validate_runtime_values(values: dict[str, Any]) -> None:
     ):
         raise ValueError(
             "Runtime config LCMV preserve minimum samples must not exceed its window"
+        )
+    if float(values["lcmv_jammer_release_max_input_power_jump_db"]) >= float(
+        values["lcmv_jammer_activation_min_input_power_jump_db"]
+    ):
+        raise ValueError(
+            "Runtime config LCMV jammer release input-power threshold must be lower "
+            "than its activation threshold"
+        )
+    if float(values["lcmv_jammer_release_max_generalized_gain_db"]) >= float(
+        values["lcmv_jammer_activation_min_generalized_gain_db"]
+    ):
+        raise ValueError(
+            "Runtime config LCMV jammer release generalized-gain threshold must be "
+            "lower than its activation threshold"
         )
     if not 0.0 < float(values["gnss_acquisition_pfa"]) < 1.0:
         raise ValueError("Runtime config 'gnss_acquisition_pfa' must be between 0 and 1")

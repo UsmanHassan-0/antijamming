@@ -837,8 +837,30 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
     assert "ACTIVATING: Smooth weight transition 50%" in _plain_text(
         window._lcmv_test_status_label
     )
-    assert "interference-evidence gate latched" in _plain_text(
+    assert "current jammer protection active" in _plain_text(
         window._lcmv_test_status_label
+    )
+
+    window._refresh_lcmv_test_status(
+        {
+            "lcmv_test": {
+                "enabled": True,
+                "mode": "fallback",
+                "fallback_reason": "waiting for new evidence",
+                "music_bearing_deg": 120.0,
+                "spatial_vector_diagnostics": {
+                    "lcmv_jammer_activation_armed": True,
+                    "lcmv_jammer_detected_latched": True,
+                    "lcmv_jammer_protection_active": False,
+                },
+            }
+        }
+    )
+    assert "RELEASED: Uniform recovery" in _plain_text(
+        window._lcmv_test_status_label
+    )
+    assert "not applied (jammer released; uniform recovery)" in _plain_text(
+        window._lcmv_music_candidate_label
     )
 
 

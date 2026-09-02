@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from types import SimpleNamespace
 
@@ -736,6 +737,242 @@ def test_realtime_lcmv_preserves_frozen_vector_and_nulls_measured_u1(
     )
     assert after_drop["lcmv_jammer_activation_evidence_now"] is False
     assert after_drop["lcmv_jammer_detected_latched"] is True
+    assert after_drop["lcmv_jammer_protection_active"] is True
+
+
+def test_jammer_release_requires_valid_low_evidence_for_full_hold(monkeypatch) -> None:
+    cfg = StreamConfig(
+        lcmv_jammer_release_max_input_power_jump_db=1.5,
+        lcmv_jammer_release_max_generalized_gain_db=3.0,
+        lcmv_jammer_release_hold_s=2.0,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    runtime._realtime_preserve_frozen_covariance = np.eye(4, dtype=np.complex128)
+    runtime._realtime_preserve_frozen_raw_power_linear = 1.0
+    runtime._realtime_preserve_frozen_cal_power_linear = 1.0
+    clock = [0.0]
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.time.monotonic",
+        lambda: clock[0],
+    )
+
+    activated = runtime._lcmv_jammer_activation_evidence(
+        covariance=10.0 * np.eye(4, dtype=np.complex128),
+        raw_power_metrics={"raw_avg_channel_power_linear": 10.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 10.0},
+    )
+    assert activated["lcmv_jammer_activation_evidence_now"] is True
+    assert activated["lcmv_jammer_detected_latched"] is True
+    assert activated["lcmv_jammer_protection_active"] is True
+
+    clock[0] = 1.0
+    low_start = runtime._lcmv_jammer_activation_evidence(
+        covariance=np.eye(4, dtype=np.complex128),
+        raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
+    )
+    assert low_start["lcmv_jammer_release_evidence_now"] is True
+    assert low_start["lcmv_jammer_release_candidate_age_s"] == pytest.approx(0.0)
+    assert low_start["lcmv_jammer_protection_active"] is True
+
+    clock[0] = 2.0
+    ambiguous = runtime._lcmv_jammer_activation_evidence(
+        covariance=np.eye(3, dtype=np.complex128),
+        raw_power_metrics=None,
+        cal_power_metrics=None,
+    )
+    assert ambiguous["lcmv_jammer_release_evidence_now"] is False
+    assert ambiguous["lcmv_jammer_protection_active"] is True
+
+    clock[0] = 3.0
+    restarted = runtime._lcmv_jammer_activation_evidence(
+        covariance=np.eye(4, dtype=np.complex128),
+        raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
+    )
+    assert restarted["lcmv_jammer_release_candidate_age_s"] == pytest.approx(0.0)
+
+    clock[0] = 4.0
+    hysteresis_band = runtime._lcmv_jammer_activation_evidence(
+        covariance=2.0 * np.eye(4, dtype=np.complex128),
+        raw_power_metrics={"raw_avg_channel_power_linear": 2.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 2.0},
+    )
+    assert hysteresis_band["lcmv_jammer_activation_evidence_now"] is False
+    assert hysteresis_band["lcmv_jammer_release_evidence_now"] is False
+    assert hysteresis_band["lcmv_jammer_protection_active"] is True
+
+    clock[0] = 5.0
+    runtime._lcmv_jammer_activation_evidence(
+        covariance=np.eye(4, dtype=np.complex128),
+        raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
+    )
+    clock[0] = 7.1
+    released = runtime._lcmv_jammer_activation_evidence(
+        covariance=np.eye(4, dtype=np.complex128),
+        raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
+    )
+    assert released["lcmv_jammer_protection_released_now"] is True
+    assert released["lcmv_jammer_protection_active"] is False
+    assert released["lcmv_jammer_detected_latched"] is True
+
+    clock[0] = 8.0
+    reactivated = runtime._lcmv_jammer_activation_evidence(
+        covariance=10.0 * np.eye(4, dtype=np.complex128),
+        raw_power_metrics={"raw_avg_channel_power_linear": 10.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 10.0},
+    )
+    assert reactivated["lcmv_jammer_activation_evidence_now"] is True
+    assert reactivated["lcmv_jammer_protection_active"] is True
+    assert reactivated["lcmv_jammer_detected_latched"] is True
+
+
+def test_release_is_evaluated_without_music_target_and_fifo_returns_uniform(
+    monkeypatch,
+) -> None:
+    cfg = StreamConfig(
+        lcmv_test_enabled=True,
+        lcmv_jammer_release_hold_s=1.0,
+        lcmv_weight_transition_s=0.0,
+        gnss_shared_u1_phase_transition_s=0.0,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    _install_product_fifo_bank(runtime)
+    runtime._lcmv_jammer_detected_latched = True
+    runtime._lcmv_jammer_protection_active = True
+    runtime._realtime_preserve_frozen_covariance = np.eye(4, dtype=np.complex128)
+    runtime._realtime_preserve_frozen_raw_power_linear = 1.0
+    runtime._realtime_preserve_frozen_cal_power_linear = 1.0
+    runtime._set_shared_measured_u1_protection_weights(
+        np.asarray([1.0, 0.5j, -0.5, -1.0j], dtype=np.complex128)
+    )
+    clock = [10.0]
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.time.monotonic",
+        lambda: clock[0],
+    )
+    x = np.ones((4, 32), dtype=np.complex64)
+
+    for now in (10.0, 11.1):
+        clock[0] = now
+        runtime._update_lcmv_test_from_music(
+            x,
+            float("nan"),
+            float("nan"),
+            raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
+            cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
+            covariance_matrix=np.eye(4, dtype=np.complex128),
+            target_selection_source="no_peak_after_jammer_off",
+        )
+
+    status = runtime._lcmv_status_copy()
+    output = runtime._gnss_shared_u1_phase_output_matrix(x)
+    expected = apply_beamformer(x.astype(np.complex128), uniform_weights(4))
+    assert runtime._lcmv_jammer_detected_latched is True
+    assert runtime._lcmv_jammer_protection_active is False
+    assert runtime._shared_measured_u1_protection_is_available() is False
+    assert status["mode"] == "fallback"
+    assert status["spatial_vector_diagnostics"][
+        "lcmv_jammer_protection_released_now"
+    ] is True
+    assert np.allclose(output, np.tile(expected, (cfg.gnss_1c_channel_count, 1)))
+
+
+def test_operator_disable_waits_for_inflight_lcmv_update_and_wins(
+    monkeypatch,
+) -> None:
+    rng = np.random.default_rng(902)
+    cfg = StreamConfig(
+        lcmv_test_enabled=False,
+        lcmv_realtime_preserve_min_samples=3,
+        lcmv_realtime_preserve_max_circular_std_deg=5.0,
+        lcmv_weight_transition_s=0.0,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    for angle in (39.0, 40.0, 41.0):
+        runtime._update_realtime_bladerf_angle_tracker(
+            {"doa_peaks": [{"angle_deg": angle}]},
+            primary_internal_deg=angle,
+        )
+    preserve = _prime_realtime_bladerf_reference(
+        runtime,
+        cfg,
+        internal_angle_deg=40.0,
+        baseline_power_linear=0.01,
+    )
+    runtime.set_lcmv_test_enabled(True)
+    null_angle = 150.0
+    null_vector = steering_vector(
+        np.asarray([null_angle]), cfg.center_freq_hz, cfg.array_spacing_m
+    ).reshape(-1)
+    desired = rng.standard_normal(512) + 1j * rng.standard_normal(512)
+    jammer = rng.standard_normal(512) + 1j * rng.standard_normal(512)
+    x = (
+        0.5 * preserve[:, None] * desired[None, :]
+        + 2.0 * null_vector[:, None] * jammer[None, :]
+    )
+
+    solver_entered = threading.Event()
+    allow_solver = threading.Event()
+    disable_done = threading.Event()
+    errors: list[BaseException] = []
+    real_solver = covariance_lcmv_vector_null_weights
+
+    def blocked_solver(**kwargs):
+        solver_entered.set()
+        if not allow_solver.wait(timeout=2.0):
+            raise TimeoutError("test did not release blocked LCMV solve")
+        return real_solver(**kwargs)
+
+    monkeypatch.setattr(
+        "antijamming.runtime.backend.covariance_lcmv_vector_null_weights",
+        blocked_solver,
+    )
+
+    def update() -> None:
+        try:
+            runtime._update_lcmv_test_from_music(
+                x,
+                null_angle,
+                internal_angle_to_operator_bearing_deg(null_angle),
+                raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
+                cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
+                target_selection_source="race_regression",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def disable() -> None:
+        try:
+            runtime.set_lcmv_test_enabled(False)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            disable_done.set()
+
+    update_thread = threading.Thread(target=update)
+    update_thread.start()
+    assert solver_entered.wait(timeout=2.0)
+    disable_thread = threading.Thread(target=disable)
+    disable_thread.start()
+    assert disable_done.wait(timeout=0.05) is False
+    allow_solver.set()
+    update_thread.join(timeout=2.0)
+    disable_thread.join(timeout=2.0)
+
+    assert not update_thread.is_alive()
+    assert not disable_thread.is_alive()
+    assert errors == []
+    assert runtime._lcmv_test_enabled is False
+    assert runtime._lcmv_jammer_detected_latched is False
+    assert runtime._lcmv_jammer_protection_active is False
+    assert runtime._shared_measured_u1_protection_is_available() is False
+    assert runtime._lcmv_status_copy()["mode"] == "off"
+    assert np.allclose(runtime._get_beamformer_target_weights_copy(), uniform_weights(4))
 
 
 def test_healthy_reference_updates_during_lcmv_off_healthy_baseline() -> None:

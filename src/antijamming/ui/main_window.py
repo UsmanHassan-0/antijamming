@@ -1945,7 +1945,16 @@ class MainWindow(QMainWindow):
                 spatial.get("lcmv_jammer_detected_latched", False),
             )
         )
-        armed = bool(spatial.get("lcmv_jammer_activation_armed", False)) and not jammer_latched
+        protection_active = bool(
+            status.get(
+                "lcmv_jammer_protection_active",
+                spatial.get("lcmv_jammer_protection_active", jammer_latched),
+            )
+        )
+        armed = bool(spatial.get("lcmv_jammer_activation_armed", False)) and not (
+            protection_active or jammer_latched
+        )
+        released = bool(jammer_latched and not protection_active)
         transition_active = bool(status.get("weight_transition_active", False))
         transition_progress = valid_float(status.get("weight_transition_progress"))
 
@@ -1953,7 +1962,7 @@ class MainWindow(QMainWindow):
             value = "OFF: Uniform beamformer"
             color = INFO
         elif mode == "on":
-            value = "ON: Covariance LCMV null active, interference-evidence gate latched"
+            value = "ON: Covariance LCMV null active, current jammer protection active"
             if transition_active:
                 progress_text = (
                     f" {100.0 * transition_progress:.0f}%"
@@ -1962,7 +1971,7 @@ class MainWindow(QMainWindow):
                 )
                 value = (
                     f"ACTIVATING: Smooth weight transition{progress_text}, "
-                    "interference-evidence gate latched"
+                    "current jammer protection active"
                 )
             active_method = str(
                 status.get("active_lcmv_method")
@@ -1980,13 +1989,17 @@ class MainWindow(QMainWindow):
             color = WARNING
         elif mode == "fallback":
             value = (
-                "ARMED: Uniform output, waiting for jammer evidence"
-                if armed
-                else "FALLBACK: Uniform fallback"
+                "RELEASED: Uniform recovery after jammer evidence cleared"
+                if released
+                else (
+                    "ARMED: Uniform output, waiting for jammer evidence"
+                    if armed
+                    else "FALLBACK: Uniform fallback"
+                )
             )
             if reason:
                 value = f"{value}, {reason.replace('_', ' ')}"
-            color = INFO if armed else WARNING
+            color = INFO if armed or released else WARNING
         else:
             value = str(status.get("description", "--") or "--")
             color = INFO
@@ -2000,11 +2013,13 @@ class MainWindow(QMainWindow):
 
         music_bearing = valid_float(status.get("music_bearing_deg"))
         bearing = music_bearing
-        if armed:
+        if armed or released:
             bearing = None
         bearing_text = f"{bearing:.1f}°" if bearing is not None else "--"
         if armed:
             bearing_text = "not applied (armed uniform)"
+        elif released:
+            bearing_text = "not applied (jammer released; uniform recovery)"
         output_metrics = status.get("output_metrics", {})
         if not isinstance(output_metrics, dict):
             output_metrics = {}

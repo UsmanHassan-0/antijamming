@@ -95,6 +95,9 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_realtime_preserve_max_reference_age_s == 2.0
     assert cfg.lcmv_jammer_activation_min_input_power_jump_db == 3.0
     assert cfg.lcmv_jammer_activation_min_generalized_gain_db == 6.0
+    assert cfg.lcmv_jammer_release_max_input_power_jump_db == 1.5
+    assert cfg.lcmv_jammer_release_max_generalized_gain_db == 3.0
+    assert cfg.lcmv_jammer_release_hold_s == 2.0
     assert cfg.lcmv_weight_transition_s == 1.0
     assert cfg.lcmv_covariance_diagonal_loading_rel == 0.001
     assert cfg.lcmv_covariance_diagonal_loading_abs == 0.0
@@ -395,6 +398,14 @@ def test_runtime_config_rejects_wrong_json_types(
                 "lcmv_realtime_preserve_min_samples": 11,
             },
             "minimum samples must not exceed",
+        ),
+        (
+            {"lcmv_jammer_release_max_input_power_jump_db": 3.0},
+            "release input-power threshold must be lower",
+        ),
+        (
+            {"lcmv_jammer_release_max_generalized_gain_db": 6.0},
+            "release generalized-gain threshold must be lower",
         ),
         ({"gnss_acquisition_pfa": 1.0}, "gnss_acquisition_pfa.*between 0 and 1"),
         (
