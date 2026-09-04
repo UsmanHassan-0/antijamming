@@ -29,6 +29,8 @@
   release, common output and shared-U1 FIFO fanout return to uniform behavior.
 - Operator disable is serialized against an in-flight LCMV update so a DSP
   update that started earlier cannot restore active weights after disable.
+- The headless JSON IPC regression verifies that the nested live-protection and
+  one-update release fields survive NumPy-to-JSON conversion and socket delivery.
 - Verification on the laptop worktree: backend/config/FIFO focus set 94 passed;
   GUI status file 48 passed; complete suite 303 passed and 1 skipped. These are
   deterministic software tests, not jammer-on or RF-hardware proof.

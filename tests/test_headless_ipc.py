@@ -35,6 +35,12 @@ def test_wire_metrics_drop_iq_previews_and_convert_numpy() -> None:
             "doa_raw_spectrum": np.asarray([1.0, np.nan, 3.0]),
             "complex_samples": np.ones((4, 8192), dtype=np.complex64),
             "gnss_snapshot": {"tracking_count": np.int32(2)},
+            "lcmv_test": {
+                "mode": "on",
+                "spatial_vector_diagnostics": {
+                    "lcmv_jammer_protection_active": np.bool_(True),
+                },
+            },
         }
     )
 
@@ -42,6 +48,12 @@ def test_wire_metrics_drop_iq_previews_and_convert_numpy() -> None:
         "ui_metrics_seq": 7,
         "doa_raw_spectrum": [1.0, None, 3.0],
         "gnss_snapshot": {"tracking_count": 2},
+        "lcmv_test": {
+            "mode": "on",
+            "spatial_vector_diagnostics": {
+                "lcmv_jammer_protection_active": True,
+            },
+        },
     }
 
 
@@ -135,6 +147,13 @@ def test_json_ipc_round_trip_does_not_require_backend_or_hardware(tmp_path) -> N
             {
                 "ui_metrics_seq": 11,
                 "doa_raw_spectrum": np.asarray([0.25, 1.0]),
+                "lcmv_test": {
+                    "mode": "fallback",
+                    "spatial_vector_diagnostics": {
+                        "lcmv_jammer_protection_active": False,
+                        "lcmv_jammer_protection_released_now": True,
+                    },
+                },
             }
         )
         _wait_for(
@@ -144,6 +163,16 @@ def test_json_ipc_round_trip_does_not_require_backend_or_hardware(tmp_path) -> N
                 for message in messages
             )
         )
+        wire_metrics = next(
+            message["payload"]
+            for message in messages
+            if message.get("type") == "metrics"
+            and message.get("payload", {}).get("ui_metrics_seq") == 11
+        )
+        assert wire_metrics["lcmv_test"]["spatial_vector_diagnostics"] == {
+            "lcmv_jammer_protection_active": False,
+            "lcmv_jammer_protection_released_now": True,
+        }
     finally:
         client.close()
         server.close()
