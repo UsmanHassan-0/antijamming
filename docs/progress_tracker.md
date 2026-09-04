@@ -131,7 +131,7 @@ links it without rewriting historical observations.
   the RF chain, not all 1,200 seconds or every ephemeris cutover.
 - Exact commands, paths, counts, hashes, failure text, and claim boundaries are
   retained in
-  `docs/audits/bladerf_gain_main_control_offline_2026-09-01.md`.
+  `docs/audits/gnss_pipeline_main_control_2026-09-01.md`.
 - Final laptop gates after the evidence/documentation batch: focused GNSS
   bridge and documentation set `172 passed`; full development/warnings-as-error
   suite `400 passed, 1 skipped`; coverage suite `400 passed, 1 skipped` at 78%

@@ -42,7 +42,7 @@ gain as the settled 4 MS/s comparison. The X300 and GNSS-SDR rate change; the
 ## Existing 4 and 5 MS/s evidence
 
 The detailed RF and direct-file evidence is in
-`docs/audits/bladerf_gain_main_control_offline_2026-09-01.md`.
+`docs/audits/gnss_pipeline_main_control_2026-09-01.md`.
 
 - At 4 MS/s the cleanup branch ran for 980.233 seconds with zero FIFO drops,
   eight tracked PRNs, and repeated valid PVT. The bladeRF settled at 10 dB.
