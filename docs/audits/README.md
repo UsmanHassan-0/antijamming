@@ -20,6 +20,7 @@ silently rewrite an old result to match a later implementation.
 | `cleanup_spark_hardware_2026-08-31.md` | Cleanup-branch software, X300/GNSS-SDR runtime, host-profile, and bounded bladeRF screen evidence |
 | `gnss_pipeline_main_control_2026-09-01.md` | Cleanup versus untouched-`main` GNSS pipeline, FIFO behavior, and attached transport evidence |
 | `sample_rate_sweep_2026-09-01.md` | Living 4–10 MS/s software and attached-hardware sweep, including the unresolved `main` FIFO-stall comparison |
+| `commit_history_rewrite_2026-09-04.md` | Old-to-new commit map and byte-identical tree evidence for Conventional Commit subject classification |
 | `jammer_latch_audit_2026-09-01.md` | Targeted current-product jammer-off release, GNSS FIFO state, UI semantics, concurrency, tests, history, and hardware-evidence audit |
 
 These records do not collectively prove current hardware behavior. Consult the

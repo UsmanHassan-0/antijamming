@@ -33,6 +33,17 @@ links it without rewriting historical observations.
 
 ## Timestamped change log
 
+### 2026-09-04 — classify every project-branch commit
+
+- Rewrote commit subjects on `main`, `per-prn-fifo-experimental`, and the
+  cleanup branch so every subject starts with a Conventional Commit type.
+- Verified that each branch's rewrite-checkpoint tree ID is byte-identical
+  before and after the metadata-only rewrite. Historical run documents retain
+  their original commit IDs; the old-to-new provenance map is in
+  `docs/audits/commit_history_rewrite_2026-09-04.md`.
+- Added the durable commit-type rule to `/home/u/AGENTS.md` for repositories
+  owned by `UsmanHassan-0`.
+
 ### 2026-09-02T19:43:47+05:00 — bounded jammer-protection release
 
 - Cleanup commit `86eca715c18b18dff308588fcc20c9e15e3e5617` separates
