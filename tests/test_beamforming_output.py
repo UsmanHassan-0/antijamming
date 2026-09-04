@@ -1061,7 +1061,7 @@ def test_realtime_lcmv_stays_uniform_for_angle_jump_without_jammer_evidence() ->
     assert status["mode"] == "fallback"
     assert "armed with frozen measured bladeRF U1" in status["fallback_reason"]
     assert spatial["lcmv_jammer_activation_evidence_now"] is False
-    assert spatial["lcmv_jammer_detected_latched"] is False
+    assert spatial["lcmv_jammer_protection_active"] is False
     assert spatial["lcmv_jammer_activation_angle_only_forbidden"] is True
     assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
 
@@ -1135,7 +1135,7 @@ def test_realtime_lcmv_preserves_frozen_bladerf_angle_and_nulls_other_peak() -> 
 
     assert status["mode"] == "on"
     assert spatial["lcmv_jammer_activation_evidence_now"] is True
-    assert spatial["lcmv_jammer_detected_latched"] is True
+    assert spatial["lcmv_jammer_protection_active"] is True
     assert spatial["lcmv_preserve_constraint_mode"] == "realtime_bladerf_measured_u1"
     assert spatial["lcmv_preserve_internal_angle_deg"] == pytest.approx(preserve_angle)
     assert spatial["null_internal_angle_deg"] == pytest.approx(null_angle)
@@ -1150,7 +1150,6 @@ def test_realtime_lcmv_preserves_frozen_bladerf_angle_and_nulls_other_peak() -> 
         cal_power_metrics={"cal_avg_channel_power_linear": 0.01},
     )
     assert after_drop["lcmv_jammer_activation_evidence_now"] is False
-    assert after_drop["lcmv_jammer_detected_latched"] is True
     assert after_drop["lcmv_jammer_protection_active"] is True
 
 
@@ -1176,7 +1175,6 @@ def test_jammer_release_requires_valid_low_evidence_for_full_hold(monkeypatch) -
         cal_power_metrics={"cal_avg_channel_power_linear": 10.0},
     )
     assert activated["lcmv_jammer_activation_evidence_now"] is True
-    assert activated["lcmv_jammer_detected_latched"] is True
     assert activated["lcmv_jammer_protection_active"] is True
 
     clock[0] = 1.0
@@ -1230,7 +1228,6 @@ def test_jammer_release_requires_valid_low_evidence_for_full_hold(monkeypatch) -
     )
     assert released["lcmv_jammer_protection_released_now"] is True
     assert released["lcmv_jammer_protection_active"] is False
-    assert released["lcmv_jammer_detected_latched"] is True
 
     clock[0] = 8.0
     reactivated = runtime._lcmv_jammer_activation_evidence(
@@ -1240,7 +1237,6 @@ def test_jammer_release_requires_valid_low_evidence_for_full_hold(monkeypatch) -
     )
     assert reactivated["lcmv_jammer_activation_evidence_now"] is True
     assert reactivated["lcmv_jammer_protection_active"] is True
-    assert reactivated["lcmv_jammer_detected_latched"] is True
 
 
 def test_release_is_evaluated_without_music_target_and_fifo_returns_uniform(
@@ -1255,7 +1251,6 @@ def test_release_is_evaluated_without_music_target_and_fifo_returns_uniform(
     )
     runtime = BackendRuntime(cfg, _build_loggers())
     _install_product_fifo_bank(runtime)
-    runtime._lcmv_jammer_detected_latched = True
     runtime._lcmv_jammer_protection_active = True
     runtime._realtime_preserve_frozen_covariance = np.eye(4, dtype=np.complex128)
     runtime._realtime_preserve_frozen_raw_power_linear = 1.0
@@ -1285,7 +1280,6 @@ def test_release_is_evaluated_without_music_target_and_fifo_returns_uniform(
     status = runtime._lcmv_status_copy()
     output = runtime._gnss_shared_u1_phase_output_matrix(x)
     expected = apply_beamformer(x.astype(np.complex128), uniform_weights(4))
-    assert runtime._lcmv_jammer_detected_latched is True
     assert runtime._lcmv_jammer_protection_active is False
     assert runtime._shared_measured_u1_protection_is_available() is False
     assert status["mode"] == "fallback"
@@ -1382,7 +1376,6 @@ def test_operator_disable_waits_for_inflight_lcmv_update_and_wins(
     assert not disable_thread.is_alive()
     assert errors == []
     assert runtime._lcmv_test_enabled is False
-    assert runtime._lcmv_jammer_detected_latched is False
     assert runtime._lcmv_jammer_protection_active is False
     assert runtime._shared_measured_u1_protection_is_available() is False
     assert runtime._lcmv_status_copy()["mode"] == "off"
@@ -1459,7 +1452,7 @@ def test_healthy_pvt_auto_arms_lcmv_but_keeps_uniform_until_jammer() -> None:
     status = runtime._lcmv_status_copy()
     assert payload["lcmv_auto_arm_triggered"] is True
     assert runtime._lcmv_test_enabled is True
-    assert runtime._lcmv_jammer_detected_latched is False
+    assert runtime._lcmv_jammer_protection_active is False
     assert status["mode"] == "fallback"
     assert status["spatial_vector_diagnostics"][
         "lcmv_jammer_activation_armed"

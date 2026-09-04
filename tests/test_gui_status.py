@@ -802,7 +802,7 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
                 "music_bearing_deg": 120.0,
                 "spatial_vector_diagnostics": {
                     "lcmv_jammer_activation_armed": True,
-                    "lcmv_jammer_detected_latched": False,
+                    "lcmv_jammer_protection_active": False,
                 },
             }
         }
@@ -821,7 +821,7 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
                 "weight_transition_active": True,
                 "weight_transition_progress": 0.5,
                 "spatial_vector_diagnostics": {
-                    "lcmv_jammer_detected_latched": True,
+                    "lcmv_jammer_protection_active": True,
                 },
             }
         }
@@ -842,8 +842,8 @@ def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
                 "music_bearing_deg": 120.0,
                 "spatial_vector_diagnostics": {
                     "lcmv_jammer_activation_armed": True,
-                    "lcmv_jammer_detected_latched": True,
                     "lcmv_jammer_protection_active": False,
+                    "lcmv_jammer_protection_released_now": True,
                 },
             }
         }
@@ -869,7 +869,7 @@ def test_gui_labels_jammer_excess_suppression_separately_from_total_output(qtbot
                 "null_bearing_deg": 145.0,
                 "weight_transition_active": True,
                 "spatial_vector_diagnostics": {
-                    "lcmv_jammer_detected_latched": True,
+                    "lcmv_jammer_protection_active": True,
                     "jammer_only_suppression_estimate_available": True,
                     "jammer_only_suppression_db": 12.25,
                     "jammer_only_target_suppression_db": 31.75,

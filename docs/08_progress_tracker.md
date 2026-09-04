@@ -18,9 +18,8 @@
 
 ## 2026-09-04 — jammer protection release on `main`
 
-- Implemented separate live and historical state: `lcmv_jammer_protection_active`
-  controls the beam/FIFO path, while `lcmv_jammer_detected_latched` records that
-  an activation occurred during the current armed run.
+- Implemented `lcmv_jammer_protection_active` as the sole live state controlling
+  the beam/FIFO path; removed the obsolete forever-latched detection state.
 - Protection activates only when the existing input-power and generalized-
   covariance upper gates both pass. It releases only after both valid metrics
   remain below lower hysteresis thresholds for the configured hold time.

@@ -2118,22 +2118,18 @@ class MainWindow(QMainWindow):
         spatial = status.get("spatial_vector_diagnostics", {})
         if not isinstance(spatial, dict):
             spatial = {}
-        jammer_latched = bool(
-            status.get(
-                "lcmv_jammer_detected_latched",
-                spatial.get("lcmv_jammer_detected_latched", False),
-            )
-        )
         protection_active = bool(
             status.get(
                 "lcmv_jammer_protection_active",
-                spatial.get("lcmv_jammer_protection_active", jammer_latched),
+                spatial.get("lcmv_jammer_protection_active", False),
             )
         )
-        armed = bool(spatial.get("lcmv_jammer_activation_armed", False)) and not (
-            protection_active or jammer_latched
+        released = bool(
+            spatial.get("lcmv_jammer_protection_released_now", False)
         )
-        released = bool(jammer_latched and not protection_active)
+        armed = bool(spatial.get("lcmv_jammer_activation_armed", False)) and not (
+            protection_active or released
+        )
         transition_active = bool(status.get("weight_transition_active", False))
         transition_progress = valid_float(status.get("weight_transition_progress"))
 

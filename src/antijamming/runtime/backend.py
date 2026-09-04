@@ -297,7 +297,6 @@ class BackendRuntime:
         self._realtime_preserve_frozen_cal_power_linear: float | None = None
         self._realtime_preserve_frozen_reference_age_s: float | None = None
         self._realtime_preserve_frozen_reference_angle_error_deg: float | None = None
-        self._lcmv_jammer_detected_latched: bool = False
         self._lcmv_jammer_protection_active: bool = False
         self._lcmv_jammer_release_candidate_since_monotonic_s: float | None = None
         self._latest_source_count_diagnostics: dict[str, object] = {
@@ -987,7 +986,6 @@ class BackendRuntime:
                 getattr(self._config, "lcmv_weight_transition_s", 1.0)
             ),
             "lcmv_jammer_activation_angle_only_forbidden": True,
-            "lcmv_jammer_detection_history_latches_until_disable": True,
             "lcmv_jammer_protection_release_enabled": True,
             "lcmv_test_max_weight_norm": self._json_float(
                 self._config.lcmv_test_max_weight_norm
@@ -1395,7 +1393,6 @@ class BackendRuntime:
                     "healthy_confidence_score",
                     "music_internal_angle_deg",
                     "music_display_bearing_deg",
-                    "lcmv_jammer_detected_latched",
                     "lcmv_jammer_activation_armed",
                     "lcmv_jammer_activation_evidence_now",
                     "lcmv_jammer_activation_input_power_jump_db",
@@ -1503,12 +1500,12 @@ class BackendRuntime:
         """Describe receiver evidence without claiming physical switch truth."""
 
         run_state = str(spatial.get("run_state_label", "unknown"))
-        jammer_latched = bool(spatial.get("lcmv_jammer_detected_latched", False))
-        protection_active = bool(
-            spatial.get("lcmv_jammer_protection_active", jammer_latched)
-        )
+        protection_active = bool(spatial.get("lcmv_jammer_protection_active", False))
         activation_now = bool(
             spatial.get("lcmv_jammer_activation_evidence_now", False)
+        )
+        released_now = bool(
+            spatial.get("lcmv_jammer_protection_released_now", False)
         )
         if activation_now:
             jammer_state = "likely_present"
@@ -1516,11 +1513,10 @@ class BackendRuntime:
         elif run_state == "jammer_like_event":
             jammer_state = "jammer_like_change"
             jammer_basis = "one-run covariance/power/GNSS inference"
-        elif jammer_latched and not protection_active:
-            jammer_state = "released_historical_detection_retained"
+        elif released_now:
+            jammer_state = "released"
             jammer_basis = (
-                "the historical latch records an earlier event, while the current "
-                "protection state released after sustained low power and covariance"
+                "current protection released after sustained low power and covariance"
             )
         elif protection_active:
             jammer_state = "protection_active_without_current_gate_crossing"
@@ -1677,7 +1673,6 @@ class BackendRuntime:
         self._realtime_preserve_frozen_cal_power_linear = None
         self._realtime_preserve_frozen_reference_age_s = None
         self._realtime_preserve_frozen_reference_angle_error_deg = None
-        self._lcmv_jammer_detected_latched = False
         self._lcmv_jammer_protection_active = False
         self._lcmv_jammer_release_candidate_since_monotonic_s = None
 
@@ -1738,9 +1733,6 @@ class BackendRuntime:
             ),
             "realtime_bladerf_frozen_reference_angle_error_deg": self._json_float(
                 self._realtime_preserve_frozen_reference_angle_error_deg
-            ),
-            "lcmv_jammer_detected_latched": bool(
-                self._lcmv_jammer_detected_latched
             ),
             "lcmv_jammer_protection_active": bool(
                 self._lcmv_jammer_protection_active
@@ -1968,7 +1960,6 @@ class BackendRuntime:
                     self._realtime_preserve_frozen_reference_angle_error_deg = (
                         reference_angle_error_deg
                     )
-                    self._lcmv_jammer_detected_latched = False
                     self._lcmv_jammer_protection_active = False
                     self._lcmv_jammer_release_candidate_since_monotonic_s = None
                     frozen_reason = (
@@ -1990,7 +1981,6 @@ class BackendRuntime:
                     self._realtime_preserve_frozen_reference_angle_error_deg = (
                         reference_angle_error_deg
                     )
-                    self._lcmv_jammer_detected_latched = False
                     self._lcmv_jammer_protection_active = False
                     self._lcmv_jammer_release_candidate_since_monotonic_s = None
                     blockers: list[str] = []
@@ -3202,7 +3192,6 @@ class BackendRuntime:
                 )
         with self._results_lock:
             protection_active = bool(self._lcmv_jammer_protection_active)
-            jammer_latched = bool(self._lcmv_jammer_detected_latched)
         enabled_now = bool(self._lcmv_test_enabled and protection_active)
         common = self._get_beamformer_target_weights_copy()
         protection = self._get_shared_measured_u1_protection_weights_copy()
@@ -3265,7 +3254,6 @@ class BackendRuntime:
                         "event": "shared_u1_phase_compensation_status",
                         "applied_to_gnss_sdr": True,
                         "common_pvt_solver": True,
-                        "jammer_latched": jammer_latched,
                         "jammer_protection_active": protection_active,
                         "enabled_now": enabled_now,
                         "independent_per_prn_lcmv": False,
@@ -4304,7 +4292,7 @@ class BackendRuntime:
         Once active, it releases only when both valid metrics stay below the
         lower thresholds for the configured hold. Ambiguous/missing metrics
         retain active protection and reset the release timer. The historical
-        detection latch remains set until LCMV is disabled.
+        The active state can later reactivate when the upper gates pass again.
         """
 
         with self._results_lock:
@@ -4405,7 +4393,6 @@ class BackendRuntime:
         release_candidate_age_s = None
         with self._results_lock:
             if evidence_now:
-                self._lcmv_jammer_detected_latched = True
                 self._lcmv_jammer_protection_active = True
                 self._lcmv_jammer_release_candidate_since_monotonic_s = None
             elif self._lcmv_jammer_protection_active:
@@ -4425,12 +4412,10 @@ class BackendRuntime:
                     self._lcmv_jammer_release_candidate_since_monotonic_s = None
             else:
                 self._lcmv_jammer_release_candidate_since_monotonic_s = None
-            latched_after = bool(self._lcmv_jammer_detected_latched)
             protection_active_after = bool(self._lcmv_jammer_protection_active)
         return {
             "lcmv_jammer_activation_armed": True,
             "lcmv_jammer_activation_evidence_now": evidence_now,
-            "lcmv_jammer_detected_latched": latched_after,
             "lcmv_jammer_protection_active": protection_active_after,
             "lcmv_jammer_protection_released_now": released_now,
             "lcmv_jammer_release_evidence_now": release_evidence_now,
@@ -5298,7 +5283,9 @@ class BackendRuntime:
                         )
                     )
                     released = bool(
-                        activation_payload.get("lcmv_jammer_detected_latched", False)
+                        activation_payload.get(
+                            "lcmv_jammer_protection_released_now", False
+                        )
                     )
                     reason_prefix = (
                         "uniform output after jammer release; waiting for new evidence "

@@ -267,8 +267,7 @@ class StreamConfig:
     lcmv_jammer_activation_min_input_power_jump_db: float
     lcmv_jammer_activation_min_generalized_gain_db: float
     # Protection releases only after both metrics remain below these lower
-    # hysteresis thresholds for the configured hold. The historical detection
-    # latch remains set until LCMV is disabled.
+    # hysteresis thresholds for the configured hold.
     lcmv_jammer_release_max_input_power_jump_db: float
     lcmv_jammer_release_max_generalized_gain_db: float
     lcmv_jammer_release_hold_s: float
