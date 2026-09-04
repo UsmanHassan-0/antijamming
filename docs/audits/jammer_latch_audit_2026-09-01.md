@@ -6,22 +6,76 @@ This targeted audit inspected the cleanup product at
 `2bdb611605ab88caab162586f0c5d9c5030d2c14`. It traced the checked-in profile,
 activation calculation, common LCMV worker, Shared-U1 GNSS fanout, GUI status,
 focused tests, Git history, and retained hardware records. It did not change
-runtime code and did not exercise attached RF hardware.
+runtime code and did not exercise attached RF hardware. The correction
+amendment below records the later bounded implementation; the original audit
+remains as evidence of the pre-correction state.
 
-Automatic jammer-off protection release is **not implemented on the current
-product branch**. The current detection latch is intentionally sticky until
-LCMV is disabled. A related release design exists only on
+At the inspected pre-correction commit, automatic jammer-off protection
+release was **not implemented**. Its detection latch was intentionally sticky
+until LCMV was disabled. A related release design then existed only on
 `origin/per-prn-fifo-experimental`; it was not ported into the cleanup product.
 
 The audit also reproduced a separate operator-disable race: an in-flight LCMV
 calculation can publish ON status, non-uniform target weights, and GNSS
 protection availability after the operator has disabled LCMV.
 
-## Current product state machine
+## 2026-09-02 correction and software verification amendment
 
-The product profile supplies activation thresholds of 3 dB input-power rise and
-6 dB generalized covariance gain. There is no release threshold, persistence
-count, release hold, or protection-active state in the current schema/profile.
+Cleanup commit `86eca715c18b18dff308588fcc20c9e15e3e5617` implements the
+bounded release correction without merging the per-PRN experimental branch.
+`main` and `per-prn-fifo-experimental` remain unchanged.
+
+The corrected state machine separates two facts:
+
+- `lcmv_jammer_detected_latched` is historical run memory and remains true
+  until LCMV is disabled;
+- `lcmv_jammer_protection_active` controls whether common and GNSS protection
+  is currently applied.
+
+Activation still requires both the configured 3 dB input-power rise and 6 dB
+generalized-covariance gain. Active protection releases only when both metrics
+are valid and remain at or below 1.5 dB and 3 dB, respectively, for two
+seconds. Missing, invalid, or hysteresis-band evidence resets the release timer
+while retaining protection. New activation evidence cancels a pending release
+and can reactivate protection after release. Configuration validation requires
+each release threshold to be lower than its matching activation threshold.
+
+Release evidence is evaluated before MUSIC-target validity and guard exits, so
+a disappearing peak does not prevent release. On release, the common target is
+scheduled back to uniform, Shared-U1 protection availability is cleared, and
+the phase-compensation bank receives a falling transition. The GUI separately
+reports armed-uniform, protection-active, and released-uniform states.
+
+A re-entrant control lock serializes the complete enable/disable transaction
+with a complete LCMV worker update. Disable may wait for an already-running
+solve, but once disable returns that solve cannot republish weights,
+protection, or ON status. A deterministic solver-barrier regression exercises
+that ordering.
+
+Software verification recorded for the implementation commit:
+
+```text
+focused config/beamforming/GUI: 150 passed
+full suite:                     412 passed, 1 skipped
+warnings-as-errors full suite:  412 passed, 1 skipped
+coverage full suite:            412 passed, 1 skipped; 79% aggregate
+Ruff, Vulture >=90%, compileall, shell syntax, diff check: passed
+```
+
+The skip was the explicitly opt-in exclusive USRP smoke test. Deterministic
+tests cover sustained low evidence, ambiguous evidence, hysteresis-band
+chatter, post-release reactivation, release without a MUSIC target, actual FIFO
+return to uniform, GUI state, and operator-disable publication ordering. This
+proves only those inserted software schedules. It does not prove every thread
+interleaving, physical jammer classification, the threshold choices, or a
+physical jammer ON-to-OFF cycle.
+
+## Pre-correction product state machine
+
+At the inspected commit, the product profile supplied activation thresholds of
+3 dB input-power rise and 6 dB generalized covariance gain. There was no
+release threshold, persistence count, release hold, or protection-active state
+in that schema/profile.
 
 | Condition | Current behavior |
 | --- | --- |
@@ -41,12 +95,12 @@ The implementation is explicit:
   `lcmv_test_enabled AND lcmv_jammer_detected_latched`, not from current evidence.
 - `SharedU1PhaseCompensationBank` has a smooth falling transition, but it runs
   only when `enabled_now` becomes false. A physical jammer-off transition does
-  not make that happen on the current branch.
+  did not make that happen in the inspected implementation.
 - `_activate_lcmv_test_fallback` schedules uniform common weights but does not
   clear Shared-U1 protection availability. Consequently, common `fallback`
   status is not proof that the GNSS FIFO is uniform.
 
-## Current-code contract harness
+## Pre-correction code-contract harness
 
 A read-only synthetic harness used the same measured healthy-U1 baseline,
 activation gates, common LCMV solver, and Shared-U1 protection publication as
@@ -65,10 +119,10 @@ MANUAL_DISABLE {'mode': 'off', 'latched': False,
     'common_target_uniform': True, 'fifo_protection_available': False}
 ```
 
-This mechanically establishes the current software transition for the supplied
-synthetic covariances. It does not prove that the two activation thresholds
-correctly identify a physical jammer or that a particular hold time is suitable
-for OTA operation.
+This mechanically establishes the pre-correction software transition for the
+supplied synthetic covariances. It does not prove that the two activation
+thresholds correctly identify a physical jammer or that a particular hold time
+is suitable for OTA operation.
 
 ## Operator-disable publication race
 

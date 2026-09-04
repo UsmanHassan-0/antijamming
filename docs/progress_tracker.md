@@ -33,6 +33,25 @@ links it without rewriting historical observations.
 
 ## Timestamped change log
 
+### 2026-09-02T19:43:47+05:00 — bounded jammer-protection release
+
+- Cleanup commit `86eca715c18b18dff308588fcc20c9e15e3e5617` separates
+  historical jammer detection from current protection. It uses 3/6 dB
+  activation thresholds, lower 1.5/3 dB release thresholds, and a two-second
+  release hold. Release returns both common and GNSS FIFO output toward
+  uniform even if the MUSIC target disappears. The hold and thresholds are
+  implementation provenance, not OTA-tuned values.
+- A re-entrant control lock serializes operator enable/disable with complete
+  LCMV worker publication. A deterministic barrier test verifies that an old
+  in-flight worker cannot republish active state after disable returns.
+- Focused verification passed 150 tests. Full, warnings-as-errors, and coverage
+  runs each passed 412 tests with one opt-in USRP test skipped; aggregate
+  coverage was 79%. Ruff, Vulture, `compileall`, shell syntax, and diff checks
+  passed. These results prove only their exercised software paths and do not
+  prove a physical jammer ON-to-OFF cycle.
+- Detailed implementation boundaries are recorded in
+  `docs/audits/jammer_latch_audit_2026-09-01.md`.
+
 ### 2026-09-01T18:15:24+05:00 — jammer-latch release audit
 
 - Confirmed that the cleanup product has a historical jammer-detection latch,
