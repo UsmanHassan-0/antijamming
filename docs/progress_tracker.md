@@ -60,6 +60,18 @@ links it without rewriting historical observations.
 - The repo-local GNSS-SDR executable remains linked to GNU Radio/UHD 4.6 and
   uses FIFO sources in a separate process. Full-stack migration requires a
   matched GNU Radio and GNSS-SDR rebuild and is not claimed by this change.
+- Branch scope was verified after the port: UHD 4.10 exists only on
+  `cleanup/no-usrp-verification-20260831`. Remote and local `main` were restored
+  to `d8aef5ff2d9ca6e335a355d1d98e07b80aa12300`; its launcher and tree contain
+  no UHD 4.10 activation scripts or references. The temporary build branch was
+  deleted.
+- Post-port laptop verification on the cleanup branch passed 70 focused
+  runtime/default tests and the complete non-hardware suite passed 415 tests
+  with one hardware test deselected. Re-running the same jammer release,
+  no-target uniform recovery, operator-disable race, GUI, headless IPC, and
+  per-PRN jammer-off continuity regressions against `main` passed; `main`'s
+  complete suite passed 303 tests with one hardware test skipped. These are
+  deterministic software results, not a physical jammer ON-to-OFF trial.
 
 ### 2026-09-04 — classify every project-branch commit
 
