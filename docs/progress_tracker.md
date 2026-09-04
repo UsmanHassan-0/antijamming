@@ -33,6 +33,34 @@ links it without rewriting historical observations.
 
 ## Timestamped change log
 
+### 2026-09-04 — source-built UHD 4.10 runtime selection
+
+- Baseline failure: distribution UHD 4.6 rejected X300 serial `35D068E` with
+  FPGA `39.3` because it expected an older radio compatibility revision.
+- Built official UHD tag `v4.10.0.0`, commit
+  `2af4ddb96219a99d2300804830e0971f79557b23`, with PyUHD under the user-local
+  prefix `~/uhd-official-4.10.0.0/install-host` and build directory
+  `~/uhd-official-4.10.0.0/build-host`. No system library was replaced. The
+  source checkout is detached at the pinned commit; its only reported untracked
+  path is the in-tree `install-host/` build output.
+- Spark artifact SHA-256 values after the verified build:
+  `libuhd.so.4.10.0` =
+  `e8c4fdfcfce3a23672db14a2dcdd0bedc49d722743f73806701038545107595e`,
+  `libpyuhd.cpython-312-aarch64-linux-gnu.so` =
+  `86fcab4f285e8bda4366c24bf114bc2dd9583b74a1b06d93ba6f4535ba8d705e`,
+  and `uhd_usrp_probe` =
+  `8b104a59fd4453e873084454d50c5e81a068d30ccc4a086fdeb61745b1ad2b35`.
+- The unchanged anti-jamming backend opened the X300 through source-built
+  PyUHD and completed a 30-second no-jammer runtime: 3,110 raw chunks, zero
+  UHD overflows, zero timeouts, and normal GNSS-SDR startup/shutdown.
+- Added a fail-closed launcher boundary that validates UHD version, module
+  location, and native binding location before GUI/headless startup.
+- A second 20-second no-jammer run used only the checked-in launcher selection
+  and processed 1,878 raw chunks with zero overflows and zero timeouts.
+- The repo-local GNSS-SDR executable remains linked to GNU Radio/UHD 4.6 and
+  uses FIFO sources in a separate process. Full-stack migration requires a
+  matched GNU Radio and GNSS-SDR rebuild and is not claimed by this change.
+
 ### 2026-09-04 — classify every project-branch commit
 
 - Rewrote commit subjects on `main`, `per-prn-fifo-experimental`, and the

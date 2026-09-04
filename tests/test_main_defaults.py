@@ -444,6 +444,8 @@ def test_product_shell_entrypoints_are_parseable() -> None:
             "run_realtime.sh",
             "setup.sh",
             "run_tests.sh",
+            "tools/build_uhd_runtime.sh",
+            "tools/uhd_runtime_env.sh",
         ],
         cwd=REPO_ROOT,
         check=True,

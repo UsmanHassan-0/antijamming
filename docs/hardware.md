@@ -4,6 +4,27 @@ This document records **what UHD and the OS report** for the connected system: m
 
 **Snapshot date:** 2026-08-06.
 
+## UHD runtime
+
+The anti-jamming X300 process uses official UHD `v4.10.0.0`, source commit
+`2af4ddb96219a99d2300804830e0971f79557b23`. The default user-local checkout
+and install paths are:
+
+```text
+~/uhd-official-4.10.0.0
+~/uhd-official-4.10.0.0/install-host
+```
+
+Run `tools/build_uhd_runtime.sh` to clone and build that exact GitHub revision.
+`run_realtime.sh` validates the version and both Python module paths and refuses
+to fall back silently to a distribution PyUHD installation. Override the
+install location with `ANTIJAMMING_UHD_PREFIX` when required.
+
+The repo-local GNSS-SDR process currently consumes FIFO files and remains
+linked to the distribution GNU Radio/UHD 4.6 stack. It runs in a separate
+process. Replacing that stack requires rebuilding GNU Radio and GNSS-SDR
+together; substituting only `libuhd` is not supported.
+
 **Live DGX/X300 update:** The connected path is `enP7s7` with host address
 `192.168.40.1/24`, MTU `9000`, and route
 `192.168.40.2 dev enP7s7 src 192.168.40.1`. The link reports 10,000 Mb/s,

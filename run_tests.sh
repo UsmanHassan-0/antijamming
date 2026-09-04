@@ -24,6 +24,9 @@ case "${MODE}" in
     exec "${PYTHON_BIN}" -m pytest -q -m "not usrp" "$@"
     ;;
   usrp)
+    # shellcheck source=tools/uhd_runtime_env.sh
+    source "${ROOT_DIR}/tools/uhd_runtime_env.sh"
+    antijamming_activate_uhd_runtime "${PYTHON_BIN}"
     echo "[run_tests] Running USRP smoke tests marker..."
     exec "${PYTHON_BIN}" -m pytest -q -m usrp "$@"
     ;;

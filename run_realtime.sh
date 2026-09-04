@@ -33,6 +33,12 @@ if [[ ! -x "${APP_PY}" ]]; then
   APP_PY="python3"
 fi
 
+# Use the source-built UHD selected for the X300 host/FPGA compatibility
+# boundary. Do not silently fall back to the distribution PyUHD module.
+# shellcheck source=tools/uhd_runtime_env.sh
+source "${ROOT_DIR}/tools/uhd_runtime_env.sh"
+antijamming_activate_uhd_runtime "${APP_PY}"
+
 cd "${ROOT_DIR}"
 mkdir -p logs
 
