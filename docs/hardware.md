@@ -4,6 +4,10 @@ This document records **what UHD and the OS report** for the connected system: m
 
 **Snapshot date:** 2026-08-06.
 
+## UHD runtime
+
+Use the distribution UHD packages installed by setup.
+
 **Live DGX/X300 update:** The connected path is `enP7s7` with host address
 `192.168.40.1/24`, MTU `9000`, and route
 `192.168.40.2 dev enP7s7 src 192.168.40.1`. The link reports 10,000 Mb/s,

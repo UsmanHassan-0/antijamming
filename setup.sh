@@ -10,7 +10,8 @@ GNSS_VOLK_PROFILE_BIN="${GNSS_INSTALL_DIR}/volk_gnsssdr_profile"
 VOLK_CONFIG_FILE="${HOME}/.volk/volk_config"
 GNSS_VOLK_CONFIG_FILE="${HOME}/.volk_gnsssdr/volk_gnsssdr_config"
 PHASE_CALIBRATION_FILE="${ROOT_DIR}/configs/calibration/x300_phase_offsets_100khz.json"
-UHD_IMAGE_DIR="${UHD_IMAGE_DIR:-/usr/share/uhd/images}"
+UHD_INSTALL_PREFIX="/usr"
+UHD_IMAGE_DIR="${ROOT_DIR}/.uhd-images"
 USRP_ADDR="${ANTIJAMMING_USRP_ADDR:-}"
 USRP_IFACE="${ANTIJAMMING_USRP_IFACE:-}"
 USRP_NM_PROFILE="${ANTIJAMMING_USRP_NM_PROFILE:-usrp-x300}"
@@ -168,17 +169,15 @@ install_system_dependencies() {
   select_gnss_packages
   gnss_packages=("${GNSS_PACKAGES[@]}")
 
-  # anti-jamming runtime extras: the backend imports Python UHD directly,
-  # and the PyQt GUI/tests import PyQt6. uhd-host supplies UHD image tools
-  # and device probes for the fixed X300/HG Port-1 10GbE profile.
+  # System UHD packages provide Python bindings and image tools.
   local runtime_packages=(
     ethtool
     iproute2
     iputils-ping
     python3-pip
     python3-venv
-    python3-uhd
     python3-pyqt6
+    python3-uhd
     uhd-host
   )
   local all_packages=("${gnss_packages[@]}" "${runtime_packages[@]}")
@@ -213,19 +212,21 @@ setup_python_environment() {
 
 ensure_uhd_images() {
   local hg_image="${UHD_IMAGE_DIR}/usrp_x300_fpga_HG.bit"
+  local image_downloader="${UHD_INSTALL_PREFIX}/bin/uhd_images_downloader"
 
   if [[ -f "${hg_image}" ]]; then
     return 0
   fi
 
-  if ! command -v uhd_images_downloader >/dev/null 2>&1; then
-    echo "uhd_images_downloader not found; uhd-host did not install correctly." >&2
+  if [[ ! -x "${image_downloader}" ]]; then
+    echo "System uhd_images_downloader not found at ${image_downloader}." >&2
     exit 1
   fi
 
   echo "[setup] Downloading X300/HG UHD FPGA image into ${UHD_IMAGE_DIR}."
-  run_privileged mkdir -p "${UHD_IMAGE_DIR}"
-  run_privileged uhd_images_downloader --types 'x3.*' --install-location "${UHD_IMAGE_DIR}" --yes
+  mkdir -p "${UHD_IMAGE_DIR}"
+  env LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    "${image_downloader}" --types 'x3.*' --install-location "${UHD_IMAGE_DIR}" --yes
 }
 
 host_cidr_for_usrp_addr() {
@@ -637,14 +638,16 @@ ensure_x300_host_socket_buffers() {
 
 ensure_x300_hg_image_loaded() {
   local hg_image="${UHD_IMAGE_DIR}/usrp_x300_fpga_HG.bit"
+  local find_devices="${UHD_INSTALL_PREFIX}/bin/uhd_find_devices"
+  local image_loader="${UHD_INSTALL_PREFIX}/bin/uhd_image_loader"
   local probe_text
 
-  if ! command -v uhd_find_devices >/dev/null 2>&1; then
-    echo "uhd_find_devices not found; uhd-host did not install correctly." >&2
+  if [[ ! -x "${find_devices}" ]]; then
+    echo "System uhd_find_devices not found at ${find_devices}." >&2
     exit 1
   fi
-  if ! command -v uhd_image_loader >/dev/null 2>&1; then
-    echo "uhd_image_loader not found; UHD FPGA image management is unavailable." >&2
+  if [[ ! -x "${image_loader}" ]]; then
+    echo "System uhd_image_loader not found at ${image_loader}." >&2
     exit 1
   fi
   if [[ ! -f "${hg_image}" ]]; then
@@ -653,7 +656,8 @@ ensure_x300_hg_image_loaded() {
     exit 1
   fi
 
-  probe_text="$(uhd_find_devices --args "addr=${USRP_ADDR}" 2>&1 || true)"
+  probe_text="$(env LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    "${find_devices}" --args "addr=${USRP_ADDR}" 2>&1 || true)"
   if grep -Eiq '^[[:space:]]*fpga:[[:space:]]*HG[[:space:]]*$' <<<"${probe_text}"; then
     echo "[setup] USRP ${USRP_ADDR} already reports FPGA image HG."
     return 0
@@ -661,7 +665,8 @@ ensure_x300_hg_image_loaded() {
 
   if grep -Eiq '^[[:space:]]*fpga:' <<<"${probe_text}"; then
     echo "[setup] Loading HG FPGA image onto USRP ${USRP_ADDR}."
-    uhd_image_loader --args "type=x300,addr=${USRP_ADDR}" --fpga-path "${hg_image}"
+    env LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+      "${image_loader}" --args "type=x300,addr=${USRP_ADDR}" --fpga-path "${hg_image}"
     echo "[setup] HG FPGA image loader finished. Power-cycle the USRP if UHD requests it."
     return 0
   fi
@@ -722,6 +727,7 @@ verify_setup() {
     exit 1
   fi
 
+
   "${VENV_DIR}/bin/python" - <<'PY'
 modules = ("numpy", "scipy", "h5py", "pyqtgraph", "pytest", "pytestqt", "serial", "PyQt6", "uhd")
 missing = []
@@ -741,13 +747,13 @@ PY
     fi
   done
 
-  if ! command -v uhd_usrp_probe >/dev/null 2>&1; then
-    echo "uhd_usrp_probe not found; uhd-host did not install correctly." >&2
+  if [[ ! -x "${UHD_INSTALL_PREFIX}/bin/uhd_usrp_probe" ]]; then
+    echo "System uhd_usrp_probe not found under ${UHD_INSTALL_PREFIX}/bin." >&2
     exit 1
   fi
 
-  if ! command -v uhd_image_loader >/dev/null 2>&1; then
-    echo "uhd_image_loader not found; UHD FPGA image management is unavailable." >&2
+  if [[ ! -x "${UHD_INSTALL_PREFIX}/bin/uhd_image_loader" ]]; then
+    echo "System uhd_image_loader not found under ${UHD_INSTALL_PREFIX}/bin." >&2
     exit 1
   fi
 
@@ -797,6 +803,7 @@ verify_setup
 echo
 echo "antijamming setup is ready."
 echo "Python: ${VENV_DIR}/bin/python"
+echo "System UHD runtime: ${UHD_INSTALL_PREFIX}"
 echo "Repo-local GNSS-SDR source: ${GNSS_SRC_DIR}"
 echo "Repo-local GNSS-SDR build: ${GNSS_BUILD_BIN}"
 echo "Repo-local phase calibration: ${PHASE_CALIBRATION_FILE}"

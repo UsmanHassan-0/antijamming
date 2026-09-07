@@ -75,3 +75,54 @@ classified commit. The original tips are retained locally under
 - This proves subject classification and final-tree identity. It does not
   re-run historical RF experiments or reclassify the technical validity of
   their conclusions.
+
+## 2026-09-07 amendment — cleanup implementation rewrite
+
+Unlike the metadata-only rewrite above, this user-requested rewrite changes
+behavior: the ideal-null LCMV implementation is removed in the earlier cleanup
+commit. The common target now uses the same measured-U1 solve as protection.
+`full_angle_analysis` is schema version 4. Old measured runs are **not** evidence
+for these changed trees; original hashes and measurements remain in the dated
+records. The experimental branch and main are not part of this rewrite.
+
+| Previous cleanup commit | Rewritten cleanup commit |
+| --- | --- |
+| `4357fcb0308358e8e9b44d35d276defa140222b1` | `a7cb0bcb9b0146dab5732eb98c7a7357e20e9225` |
+| `2826c50e862d270890c3c97fa0e27c05b78f3001` | `f6311c4a382afed2045ff3f1243621ee194a5cc3` |
+| `45ca8cc8421cdb2c91fea9a0bbb5e2c20dd725c3` | `9b2e2e3df008c0ce0a78f8b5d44d77bf4749ee58` |
+| `3336f3ac207135c0cc899ff7aac4bfe01e37da33` | `5402271064e068e616b36ed4046cb9502f324879` |
+| `b0aaa3c104d217896f89130add6499c931b1cfff` | `67ce450bb5a505094821f80ff34651da339c882e` |
+| `474a8389e5fd16e86950f65c78ff792cdc568fa5` | `9333e3c81990bd5fdf2e71ca4bf996e49d7c7829` |
+| `17ec3658faabfd84d44694527d2b4ab2082ad7c1` | `7a02998bef3e0752b70c66dbcdc91f6708c78463` |
+| `d4621888acfc215aa5378561f61c6343bc53140a` | `bc42f7c6243fd6bc693f6d19aa050a96de53a224` |
+| `335ee7ccee5439ab90e4ed24ea40c933f74c8ee8` | `099665c7f66d80406a97598d2c9bb7e6ed59786d` |
+| `c2611a9d9e36b8045644e8bc5c67f630321a22c5` | `e5299f184a8410faa263a23f11286e90fef7102a` |
+| `50b94f12e18ee82fcafce3b0d982ae42a22ca95e` | `46324fc6db2e869dfbc2b848b74a7a28d7f85cc3` |
+| `da58f2a0a9beed9f8c61ee533099cae6ccb1a2a3` | `a9b06ec342619e43d142d1e5a4d9a1706b7601ec` |
+| `5b32a1b5afd52147aca5b7b60d06fdc426c30f58` | `1cf8f017ef4e15be392ff56fa0814d373dc59785` |
+| `6b45b24b43d2e215c687ffabe185e679be206d08` | `6e1da96efe8fc5caedd6bf7a33378c1998adb0d2` |
+
+Local recovery refs:
+
+- `refs/archive/antijamming/pre-ideal-removal-20260907-cleanup` → `6b45b24`.
+- `refs/archive/antijamming/verified-ideal-removal-20260907` → `78924a3`;
+  tested pre-fold implementation snapshot, tree
+  `9ac0c67cbc014aaf8ff9e5e737add4ccc2197c75`.
+- `refs/archive/antijamming/pre-latch-removal-20260907-main` → `d8aef5f`;
+  precautionary preservation only, not evidence main was changed.
+
+All fourteen rewritten commits retain typed subjects and use
+`UsmanHassan-0 <125034497+UsmanHassan-0@users.noreply.github.com>` for author
+and committer. The folded cleanup commit contains the removal description and
+breaking-schema footer. Later FIFO/release/UHD changes were replayed in their
+own commits, with release regressions migrated to the measured solver and label.
+The final code matches the tested snapshot exactly; only new evidence is added
+after the replayed tip. Software results, counterexamples and boundaries are
+recorded in `../progress_tracker.md`, including the still-open malformed-input
+release-timer gap. This is not a claim that every historical commit was retested.
+
+Publication used an explicit lease for cleanup's old remote tip `6b45b24`;
+the push to `6e1da96` succeeded and a subsequent `ls-remote` confirmed it.
+Remote main remained `d8aef5f` and experimental remained `b60344f`. This audit
+amendment follows as a documentation-only commit; Spark's checkout was not
+changed and must not be described as synchronized or hardware-verified.
