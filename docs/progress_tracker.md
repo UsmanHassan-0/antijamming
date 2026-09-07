@@ -11,10 +11,9 @@ links it without rewriting historical observations.
   `0672377aa6c3fa53a11e09747e0cbd300c815579`.
 - Active cleanup branch: `cleanup/no-usrp-verification-20260831`.
 - `main` and `per-prn-fifo-experimental` are outside this branch's mutations.
-- Laptop verification is hardware-free. The identical cleanup commit completed
-  bounded Spark X300/GNSS-SDR testing; the bladeRF screen did not establish a
-  physical path to the selected TwinRX inputs. See
-  `docs/audits/cleanup_spark_hardware_2026-08-31.md`.
+- The September 7 measured-only removal is laptop/software-verified, not
+  Spark/hardware-verified. Historical attached runs exercised the old archived
+  trees; rewriting history does not make those runs evidence for new code.
 - A passing test proves only its named inputs and exercised schedules. It does
   not prove that the repository is generally correct or race-free.
 - Architecture splitting, including `runtime/backend.py`, is deferred.
@@ -23,15 +22,115 @@ links it without rewriting historical observations.
 
 | Area | Current state | Next evidence gate |
 | --- | --- | --- |
-| Proven stale code/config | Known candidates classified and the current removal batch passes software gates | Recheck after attached-runtime findings |
+| Proven stale code/config | Ideal-null solver, exports, rankings, duplicate plot and retired fields removed coherently; targeted software gates passed | No claim that every repository path is free of stale behavior |
 | Thread/resource ownership | Deterministic failure paths and repeated software gates passed | Unknown schedules and hardware timing remain unproven |
 | Concurrent transitions | Selected start/stop/connect/publish schedules regression-tested | Repeated stress; unknown schedules remain unproven |
 | Configuration/input boundaries | Focused and broad regressions passed | Attached-runtime validation |
 | Numerical/DSP boundaries | Focused and broad deterministic regressions passed | OTA correctness remains separate |
+| Jammer release audit | Malformed covariance can bridge the release hold in current main and cleanup; reproduced, not corrected | Main rollback policy needs clarification; exception-path correction remains open |
 | Documentation | One tracker, consecutive conceptual docs, retained audit index, and provenance map | Maintain these documents with future changes |
-| Hardware integration | Confirmed splitter path decoded the 1,200-second L1 waveform through cleanup at bladeRF 10 dB; matched `main` reproduced one FIFO stall; direct-file GNSS-SDR decoded the tested 120-second prefix | Repeat cleanup stress with controlled jammer/LCMV; a single schedule does not exclude later FIFO or RF faults |
+| Hardware integration | Previous archived revisions have bounded RF/transport evidence; no September 7 hardware run or Spark synchronization | Validate the new measured-only common target and final FIFO behavior separately |
 
 ## Timestamped change log
+
+### 2026-09-07 — ideal-null implementation removed; main policy unresolved
+
+- Scope authorized: remove the entire ideal-null implementation on
+  `cleanup/no-usrp-verification-20260831`, starting at `6b45b24`, not merely
+  its selector. The ideal-null removal does not affect `main` or the per-PRN
+  experimental branch. RF hardware and other repositories are not being changed.
+- User approved folding this removal into `4357fcb` and rewriting only its
+  cleanup descendants. The local rewrite is complete: `4357fcb` became
+  `a7cb0bc`; the replayed tip is `6e1da96`. Recovery refs and the complete map
+  are recorded in `audits/commit_history_rewrite_2026-09-04.md`. GitHub's
+  cleanup branch was updated from `6b45b24` to `6e1da96` with an explicit
+  expected-old-tip lease; `ls-remote` confirmed main and experimental unchanged.
+- Added request: audit jammer activation/release in main and cleanup, then
+  remove main's added latch/release port. Located main's contiguous port and
+  dependent changes: `0a6c600`, `c1cbfb1`, `d8aef5f`; the prior main is
+  `5c2a84b`. Returning to that tree restores the historical sticky latch rather
+  than making main latch-free. Cleanup retains bounded release; its exercised
+  regressions passed after solver migration. The experimental branch is untouched.
+- Remove: angle-derived ideal-null solver/export, runtime solve and candidate
+  comparison machinery, ideal-method recommendations in current analysis,
+  ideal-only tests, and obsolete plot/evidence labels.
+- Migrate: common output to the same accepted measured-U1 solution used by the
+  protection bank; diagnostics, GUI/headless payloads, and test doubles must
+  describe measured-vector operation rather than retain an ideal-mode alias.
+- Retain: uniform startup/release/failure output, measured healthy-reference
+  capture, measured-U1 constraints, PRN continuity/fanout, and steering models
+  used by MUSIC/Bartlett and explicitly calculated response scans. The latter
+  are not the removed ideal-null solver or measured OTA suppression.
+- Preserve dated audits as historical evidence. Architecture splitting, removal
+  of MUSIC activation/guard dependencies, and repair of the separately recorded
+  PRN-compensation preservation failure are not implicitly included.
+- Baseline verification: `.aj/bin/python -m pytest -q -m 'not usrp'` passed
+  **415 tests, 1 deselected in 14.89 s** before implementation edits.
+- Main before rollback (`d8aef5f`): focused jammer/release/disable/UI/IPC
+  selection passed **14 tests, 117 deselected in 1.05 s**; full non-hardware
+  suite passed **303 tests, 1 deselected in 10.13 s**. This does not imply
+  physically correct jammer classification or exhaustive timing coverage.
+- Intermediate migration runs: **108 passed, 1 failed** (old test expected a
+  MUSIC-angle null), then **114 passed, 1 failed** (summary test expected the
+  removed candidate-ranking output). Updated the former to check measured-U1
+  constraints with intentionally differing valid MUSIC angles; migrated the
+  latter to measured-only metrics rather than restore either retired behavior.
+- New audit finding, not corrected by ideal-null removal: a covariance
+  conversion exception caught before the release-state update leaves the
+  previous release timer intact. A runtime harness with low valid evidence at
+  t=10, malformed covariance at t=11, and low valid evidence at t=12.1 released
+  protection at 12.1 despite the intervening invalid update. The existing
+  mismatched-dimension test takes a different path and did not expose this.
+  The claim that every invalid update resets the timer is therefore too broad.
+  See the amended jammer audit for the reproducible harness and limits.
+- The malformed-evidence harness also reproduced the same gap on unmodified
+  main `d8aef5f`. No latch correctness claim closes this exception path.
+- User clarified that main does not need a latch. Awaiting whether that means
+  exact rollback (which restores the older sticky latch) or removal of all
+  latch memory with current-evidence-only protection. Main is still unchanged.
+- Implemented: ideal-null solver/export and solve dispatch removed; measured
+  U1 supplies common/protection targets from one solve; one GUI model curve;
+  obsolete null-angle/selected-null-grid fields removed (not empty aliases);
+  current summary no longer ranks/recommends retired methods. Steering scans,
+  MUSIC guard policy, uniform safety and existing PRN compensation remain.
+- Final pre-rewrite code gate: **415 passed, 1 hardware test deselected in
+  23.33 s**, with `PYTHONDEVMODE=1 PYTHONWARNINGS=error`, coverage enabled,
+  **79%** aggregate. Before the final explicit absence regression, the focused
+  DSP/runtime/evidence/UI/summary/IPC/phase-bank set passed **158 in 11.93 s**.
+  Ruff, Vulture >=90%, compileall, shell syntax, and diff checks passed.
+- Negative controls: the new solver/export absence regression and the
+  intentionally wrong-MUSIC-angle runtime regression both failed as expected
+  when executed against a detached, unchanged `6b45b24` source tree.
+- Source/tools/config search found no ideal-null solver/method, ideal-LCMV
+  metrics, or selected-null fields. Remaining test references assert absence;
+  dated audits retain historical evidence. This is targeted contract review,
+  not exhaustive examination of all repository code or thread schedules.
+- Post-rewrite verification at `6e1da96`: the complete source, tests, tools,
+  profiles, vendored receiver and launcher match verified snapshot `78924a3`
+  byte-for-byte (`git diff --exit-code 78924a3 -- src tests tools configs
+  gnss-sdr run_realtime.sh`). The complete warnings-as-errors/development-mode
+  coverage suite passed **415 tests, 1 deselected in 23.34 s; 79% aggregate**.
+  Ruff, Vulture >=90%, compileall, shell syntax and diff checks passed again.
+- Intermediate rewritten cleanup `a7cb0bc` passed **397 tests, 1 deselected
+  in 17.22 s** with warnings-as-errors/development mode. The later release
+  replay migrated its solver-barrier and GUI tests to the measured contract;
+  its focused gate passed **14 tests, 69 deselected in 1.34 s**. Later release,
+  FIFO and UHD implementations were not transplanted into the earlier commit.
+- Retained with active consumers: measured-candidate diagnostics feed current
+  summaries/status; model-coherence diagnostics compare MUSIC steering with
+  measured U1; uniform/fallback and optional startup state handle real lifecycle
+  paths. These are not empty ideal-mode aliases. Historical audits and local
+  recovery refs remain evidence, not runtime product features.
+- Publication initially stopped because no HTTPS credential helper was
+  configured. Retried using the user's previously authorized desktop token
+  through a temporary askpass helper, without storing credentials in Git or
+  project files. The rewrite push succeeded. This evidence is a subsequent
+  documentation-only commit; default-config/documentation tests passed
+  **67 tests in 0.20 s** after the ledger/map edits.
+- Pending: main policy decision. Spark and other repositories remain
+  untouched; no RF bins or hardware settings changed. The local disposable
+  negative-control worktree can be removed after checks; preserved Git refs
+  retain the old source and the verified implementation snapshot.
 
 ### 2026-09-04 — source-built UHD 4.10 runtime selection
 

@@ -70,6 +70,60 @@ proves only those inserted software schedules. It does not prove every thread
 interleaving, physical jammer classification, the threshold choices, or a
 physical jammer ON-to-OFF cycle.
 
+## 2026-09-07 follow-up — malformed evidence can bridge the release hold
+
+This is a newly reproduced software gap, not a correction. The same harness
+reproduced it on main `d8aef5f` before rollback and cleanup based on
+`6b45b24` (including the measured-only migration working tree). Conversion of
+the supplied covariance to complex128 can raise before
+`_lcmv_jammer_activation_evidence` updates the timer. The outer update catches
+that error and publishes fallback but does not clear
+`_lcmv_jammer_release_candidate_since_monotonic_s`.
+
+The following focused harness uses the real runtime entrypoint; no RF runs:
+
+```python
+import logging
+import numpy as np
+from unittest.mock import patch
+from antijamming.config import StreamConfig
+from antijamming.runtime import BackendRuntime
+
+names = ('app hw stream transport handoff phase doa lcmv analysis '
+         'lcmv_pattern spatial_vector gnss health errors').split()
+r = BackendRuntime(StreamConfig(lcmv_test_enabled=True,
+    lcmv_jammer_release_hold_s=2.0), {k: logging.getLogger(k) for k in names})
+r._realtime_preserve_frozen_covariance = np.eye(4, dtype=np.complex128)
+r._realtime_preserve_frozen_raw_power_linear = 1.0
+r._realtime_preserve_frozen_cal_power_linear = 1.0
+r._lcmv_jammer_protection_active = True
+for t, covariance in [(10.0, np.eye(4)), (11.0, 'malformed'), (12.1, np.eye(4))]:
+    with patch('antijamming.runtime.backend.time.monotonic', return_value=t):
+        r._update_lcmv_test_from_music(
+            np.ones((4, 32), dtype=np.complex64), float('nan'), float('nan'),
+            covariance_matrix=covariance,
+            raw_power_metrics={'raw_avg_channel_power_linear': 1.0},
+            cal_power_metrics={'cal_avg_channel_power_linear': 1.0},
+            target_selection_source='audit_missing_target')
+    print(t, r._lcmv_jammer_protection_active,
+          r._lcmv_jammer_release_candidate_since_monotonic_s)
+```
+
+Run from the checkout with `PYTHONPATH=src .aj/bin/python`. Observed output:
+
+```text
+10.0 True 10.0
+11.0 True 10.0
+12.1 False None
+```
+
+If invalid evidence interrupts the required continuous hold, the 12.1 update
+should instead start a new hold and keep protection active. This does not prove
+malformed covariance occurs on attached hardware. It disproves the broader
+software assertion that every invalid update resets the release timer. The
+earlier successful missing-data test supplied a shape mismatch that reached
+the state-update function, unlike this conversion-exception path.
+
 ## Pre-correction product state machine
 
 At the inspected commit, the product profile supplied activation thresholds of
