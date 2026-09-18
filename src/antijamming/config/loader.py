@@ -1,8 +1,7 @@
-"""Runtime profile loading and JSON value coercion."""
+"""Runtime profile loading and JSONC value coercion."""
 
 from __future__ import annotations
 
-import json
 import math
 import types
 from pathlib import Path
@@ -14,6 +13,7 @@ from antijamming.config.schemas.runtime import (
     StreamConfig,
 )
 from antijamming.dsp.phase import VALID_CALIBRATION_CORRECTION_MODES
+from antijamming.jsonc import load
 
 
 _REPO_ANCHORED_PATH_KEYS = (
@@ -88,25 +88,7 @@ def load_stream_config_file(path: Path) -> StreamConfig:
 
 
 def _read_runtime_profile(path: Path) -> dict[str, Any]:
-    def reject_nonstandard_constant(value: str) -> None:
-        raise ValueError(f"non-finite JSON number {value!r}")
-
-    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate JSON key {key!r}")
-            result[key] = value
-        return result
-
-    try:
-        payload = json.loads(
-            path.read_text(encoding="utf-8"),
-            object_pairs_hook=reject_duplicate_keys,
-            parse_constant=reject_nonstandard_constant,
-        )
-    except ValueError as exc:
-        raise ValueError(f"Invalid runtime config {path}: {exc}") from exc
+    payload = load(path)
     if not isinstance(payload, dict):
         raise ValueError(f"Runtime config must be a JSON object: {path}")
     _reject_non_finite_numbers(payload)
