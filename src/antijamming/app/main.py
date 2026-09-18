@@ -281,10 +281,6 @@ def _run_gui(
         app.platformName(),
         win.geometry().getRect(),
     )
-    print(
-        "[run_realtime] GUI window shown. Check logs/app.log if it is not visible.",
-        flush=True,
-    )
     try:
         return app.exec()
     finally:

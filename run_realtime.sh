@@ -82,10 +82,6 @@ route_iface_for_ip() {
   ' <<<"${route_line}"
 }
 
-qt_platform_name() {
-  printf '%s\n' "${QT_QPA_PLATFORM%%:*}"
-}
-
 owned_gnss_sdr_pids() {
   local backend_pids=()
   local backend_pid
@@ -191,7 +187,6 @@ if [[ -z "${QT_QPA_PLATFORM:-}" && -n "${WAYLAND_DISPLAY:-}" ]]; then
 else
   export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 fi
-export MPLBACKEND="${MPLBACKEND:-Agg}"
 export UHD_LOG_CONSOLE_LEVEL="${UHD_LOG_CONSOLE_LEVEL:-error}"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
@@ -199,24 +194,6 @@ export MKL_NUM_THREADS=1
 export BLIS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export ANTIJAM_GNSS_STARTUP_CONSOLE="${ANTIJAM_GNSS_STARTUP_CONSOLE:-1}"
-
-case "$(qt_platform_name)" in
-  offscreen|minimal)
-    ;;
-  wayland)
-    if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
-      echo "[run_realtime] QT_QPA_PLATFORM=wayland but WAYLAND_DISPLAY is not set." >&2
-      exit 2
-    fi
-    ;;
-  *)
-    if [[ -z "${DISPLAY:-}" ]]; then
-      echo "[run_realtime] No X11 display is available in this shell." >&2
-      echo "[run_realtime] Use the configured GNOME RDP desktop at 10.189.184.209:3389, then run from inside that desktop." >&2
-      exit 2
-    fi
-    ;;
-esac
 
 if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
   export UHD_LOG_FILE="${ROOT_DIR}/logs/uhd_console.log"
@@ -226,6 +203,17 @@ else
   unset UHD_LOG_FILE
 fi
 
+# Resolve the diagnostic interface before starting children. A failed profile
+# lookup must not leave the GUI running without this wrapper's wait/cleanup.
+SIDECAR_IFACE=""
+if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" && -r "${SIDECAR_SCRIPT}" ]]; then
+  SIDECAR_IFACE="${ANTIJAM_SIDECAR_IFACE:-}"
+  if [[ -z "${SIDECAR_IFACE}" ]]; then
+    SIDECAR_USRP_IP="$(runtime_usrp_ip)"
+    SIDECAR_IFACE="$(route_iface_for_ip "${SIDECAR_USRP_IP}")"
+  fi
+fi
+
 echo "[run_realtime] Launching realtime anti-jamming GUI..."
 echo "[run_realtime] Runtime profile: ${RUNTIME_CONFIG#${ROOT_DIR}/}"
 if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
@@ -233,16 +221,6 @@ if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
 else
   echo "[run_realtime] Logging: disabled by x300_realtime.jsonc (diagnostic sidecar off)"
 fi
-echo "[run_realtime] Qt platform: ${QT_QPA_PLATFORM}"
-case "$(qt_platform_name)" in
-  offscreen|minimal)
-    echo "[run_realtime] Display target: ${QT_QPA_PLATFORM} (DISPLAY ignored: ${DISPLAY:-unset})"
-    ;;
-  *)
-    echo "[run_realtime] Display target: ${DISPLAY:-${WAYLAND_DISPLAY:-unknown}}"
-    ;;
-esac
-echo "[run_realtime] If the window does not appear, check logs/app.log and logs/errors.log."
 if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
   "${APP_PY}" -m antijamming.app.main "${ORIGINAL_ARGS[@]}" 2>>"${UHD_LOG_FILE}" &
 else
@@ -253,10 +231,6 @@ APP_PID="$!"
 SIDECAR_PID=""
 if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
   if [[ -r "${SIDECAR_SCRIPT}" ]]; then
-    SIDECAR_IFACE="${ANTIJAM_SIDECAR_IFACE:-}"
-    if [[ -z "${SIDECAR_IFACE}" ]]; then
-      SIDECAR_IFACE="$(route_iface_for_ip "$(runtime_usrp_ip)")"
-    fi
     ROOT="${ROOT_DIR}" \
       IFACE="${SIDECAR_IFACE}" \
       INTERVAL="${ANTIJAM_SIDECAR_INTERVAL:-1}" \
