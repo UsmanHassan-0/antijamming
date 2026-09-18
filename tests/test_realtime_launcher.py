@@ -17,8 +17,8 @@ from antijamming.config.paths import REPO_ROOT
 def launcher_tree(tmp_path: Path) -> Path:
     """Run the actual shell and JSONC reader without UHD, a GUI or live processes.
 
-    Only external boundaries are replaced: the GUI entry point,
-    route lookup, process discovery and the diagnostic sidecar. Child stubs exit
+    Only external boundaries are replaced: the GUI entry point, route lookup,
+    process discovery and the diagnostic sidecar. Child stubs exit
     immediately, including when the old launcher abandons its normal wait path.
     """
     shutil.copy2(REPO_ROOT / "run_realtime.sh", tmp_path / "run_realtime.sh")

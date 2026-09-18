@@ -22,6 +22,7 @@ __pycache__/
 .aj/
 .venv/
 .venv-aj/
+.uhd-images/
 .build-python-3.12.12/
 .codex
 .codex-temp/

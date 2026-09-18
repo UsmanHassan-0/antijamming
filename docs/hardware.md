@@ -6,7 +6,40 @@ This document records **what UHD and the OS report** for the connected system: m
 
 ## UHD runtime
 
-Use the distribution UHD packages installed by setup.
+The runtime uses the distribution's UHD and GNU Radio packages. `setup.sh`
+installs `uhd-host`, `libuhd-dev`, `python3-uhd` and `gnuradio-dev` together.
+Ubuntu 24.04 provides UHD 4.6; Ubuntu 26.04 provides UHD 4.9. Added repositories
+and later distribution updates can affect package selection. The repository
+does not force one driver release or build private UHD/GNU Radio checkouts.
+
+The bundled `gnss-sdr/` receiver is still built from its customized source,
+not installed from apt. Setup invalidates cached radio dependency searches,
+checks selected headers/libraries before compilation, and checks the resulting
+native dependency closure and Python imports against the development package's
+selected library. Normal system tools and imports are used without a private
+shell environment, re-execution bootstrap or user-home driver-prefix file.
+
+`setup.sh` downloads release-matched X300 images and probes real compatibility;
+the discovery label `HG` alone does not establish the FPGA release. A successful
+flash returns pending activation, not setup-ready. Power-cycle the USRP only
+after programming completes, then rerun setup for the compatibility check.
+Images are downloaded by `/usr/bin/uhd_images_downloader`, from the installed
+release's manifest, into ignored `.uhd-images/` in this repository. That is
+separate from the image currently active in the USRP. The historical device
+tables below do not establish today's FPGA state.
+
+The receiver continues to consume FIFO streams from the Python application;
+this dependency policy does not select a direct USRP source in GNSS-SDR.
+A running service must be stopped before setup;
+the idle check uses elevated permissions because controllers can run as root.
+This is a preflight check, not an inter-process lock against a new concurrent
+start. Do not start the receiver while setup is running.
+
+System-package changes affect the whole machine, not just a Git branch.
+Existing private installations are not recursively deleted by setup, and
+other applications are not rewritten. A source change alone does not downgrade
+an installed binary or a USRP FPGA. Current verification limits are in the
+[system-runtime audit](audits/system_uhd_runtime.md).
 
 **Live DGX/X300 update:** The connected path is `enP7s7` with host address
 `192.168.40.1/24`, MTU `9000`, and route

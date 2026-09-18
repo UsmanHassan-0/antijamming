@@ -174,8 +174,8 @@ def test_existing_image_does_not_bypass_release_downloader(tmp_path: Path) -> No
     assert "^x3xx_x300_fpga_default$" in result.stdout
 
 
-def test_setup_checks_images_before_device_discovery() -> None:
+def test_setup_selects_system_runtime_before_device_discovery() -> None:
     pipeline = SOURCE.split('\nensure_vendored_gnss_sdr\n', 1)[1]
-    assert pipeline.index("\nensure_uhd_images\n") < pipeline.index(
+    assert pipeline.index("verify_system_uhd") < pipeline.index(
         "\nresolve_x300_host_link\n"
     )

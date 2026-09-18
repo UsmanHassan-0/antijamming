@@ -11,6 +11,8 @@ VOLK_CONFIG_FILE="${HOME}/.volk/volk_config"
 GNSS_VOLK_CONFIG_FILE="${HOME}/.volk_gnsssdr/volk_gnsssdr_config"
 PHASE_CALIBRATION_FILE="${ROOT_DIR}/configs/calibration/x300_phase_offsets_100khz.json"
 UHD_INSTALL_PREFIX="/usr"
+UHD_LIBRARY_DIR="/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+# Keep downloaded images writable and isolated from other UHD installations.
 UHD_IMAGE_DIR="${ROOT_DIR}/.uhd-images"
 USRP_ADDR="${ANTIJAMMING_USRP_ADDR:-}"
 USRP_IFACE="${ANTIJAMMING_USRP_IFACE:-}"
@@ -52,14 +54,13 @@ select_gnss_packages() {
     version_id="${VERSION_ID:-unknown}"
   fi
 
-  # Keep these package sets aligned with the vendored gnss-sdr/README.md.
+  # Use the vendored README's package dependencies and the distribution's
+  # matching UHD/GNU Radio packages, not a hard-coded driver release.
   local gnss_packages_ubuntu_26_plus=(
     build-essential
     cmake
     git
     gnuradio-dev
-    gr-limesdr
-    gr-osmosdr
     libabsl-dev
     libad9361-dev
     libarmadillo-dev
@@ -79,7 +80,6 @@ select_gnss_packages() {
     libprotobuf-dev
     libpugixml-dev
     libssl-dev
-    libuhd-dev
     pkgconf
     protobuf-compiler
     python3-mako
@@ -90,8 +90,6 @@ select_gnss_packages() {
     cmake
     git
     gnuradio-dev
-    gr-limesdr
-    gr-osmosdr
     libad9361-dev
     libarmadillo-dev
     libblas-dev
@@ -114,7 +112,6 @@ select_gnss_packages() {
     libprotobuf-dev
     libpugixml-dev
     libssl-dev
-    libuhd-dev
     pkg-config
     protobuf-compiler
     python3-mako
@@ -151,6 +148,24 @@ package_installed() {
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q " ok installed"
 }
 
+ensure_runtime_idle() {
+  local path
+  # The external controller can launch its receiver as root. An unprivileged
+  # fuser misses that process's mappings and must not certify the runtime idle.
+  command -v fuser >/dev/null || {
+    echo "Missing fuser; install setup's psmisc dependency before continuing." >&2
+    return 1
+  }
+  run_privileged true || return 1
+  for path in "${UHD_LIBRARY_DIR}/libuhd.so" "${GNSS_BUILD_BIN}"; do
+    if [[ -f "${path}" ]] && run_privileged fuser -s "${path}"; then
+      echo "Stop the anti-jamming service and receiver before rebuilding its runtime." >&2
+      echo "Still in use: ${path}" >&2
+      return 1
+    fi
+  done
+}
+
 ensure_vendored_gnss_sdr() {
   if [[ ! -f "${GNSS_SRC_DIR}/CMakeLists.txt" ]]; then
     echo "Expected vendored GNSS-SDR source tree at ${GNSS_SRC_DIR}" >&2
@@ -169,40 +184,56 @@ install_system_dependencies() {
   select_gnss_packages
   gnss_packages=("${GNSS_PACKAGES[@]}")
 
-  # System UHD packages provide Python bindings and image tools.
+  # Application and bundled GNSS-SDR build dependencies. UHD/GNU Radio are
+  # system packages; GNSS-SDR itself is still built only from this repository.
   local runtime_packages=(
     ethtool
     iproute2
     iputils-ping
     ninja-build
+    psmisc
     libboost-all-dev
+    libfftw3-dev
+    libgmp-dev
+    libspdlog-dev
     libusb-1.0-0-dev
+    libvolk-dev
+    libvolk-bin
+    libzmq3-dev
+    pybind11-dev
     python3-dev
+    python3-mako
+    python3-numpy
+    python3-packaging
     python3-pip
     python3-requests
     python3-setuptools
     python3-venv
-    python3-pyqt6
     python3-uhd
+    python3-pyqt6
+    python3-yaml
     uhd-host
+    libuhd-dev
   )
   local all_packages=("${gnss_packages[@]}" "${runtime_packages[@]}")
   local missing_packages=()
   local package
 
+  run_privileged apt-get update
   for package in "${all_packages[@]}"; do
     if ! package_installed "${package}"; then
       missing_packages+=("${package}")
     fi
   done
-  if (( ${#missing_packages[@]} == 0 )); then
-    echo "[setup] System packages already installed; skipping apt install."
-    return
-  fi
-
-  run_privileged apt-get update
   check_apt_packages_available "${missing_packages[@]}"
-  run_privileged apt-get install -y "${missing_packages[@]}"
+  # Request these together even when installed so apt resolves the radio
+  # dependency family consistently after a distribution/branch change.
+  run_privileged apt-get install -y uhd-host libuhd-dev python3-uhd gnuradio-dev \
+    "${missing_packages[@]}"
+
+  # Existing transitive packages are now direct requirements. Otherwise a later
+  # autoremove can break this source installation despite a successful setup.
+  run_privileged apt-mark manual "${all_packages[@]}"
 }
 
 setup_python_environment() {
@@ -216,6 +247,12 @@ setup_python_environment() {
   "${VENV_DIR}/bin/python" -m pip install -r requirements.txt
 }
 
+verify_system_uhd() {
+  /usr/bin/uhd_config_info --version || return
+  "${VENV_DIR}/bin/python" "${ROOT_DIR}/tools/verify_native_stack.py" \
+    --prefix "${UHD_INSTALL_PREFIX}" --python-only
+}
+
 ensure_uhd_images() {
   local hg_image="${UHD_IMAGE_DIR}/usrp_x300_fpga_HG.bit"
   local image_downloader="${UHD_INSTALL_PREFIX}/bin/uhd_images_downloader"
@@ -226,11 +263,10 @@ ensure_uhd_images() {
   fi
 
   # A filename or stale inventory entry does not identify the image release.
-  # The pinned downloader verifies the archive against its release manifest.
+  # The installed downloader verifies the archive against its release manifest.
   echo "[setup] Refreshing release-matched X300 FPGA images in ${UHD_IMAGE_DIR}."
   mkdir -p "${UHD_IMAGE_DIR}"
-  env LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-    "${image_downloader}" --types '^x3xx_x300_fpga_default$' \
+  "${image_downloader}" --types '^x3xx_x300_fpga_default$' \
       --install-location "${UHD_IMAGE_DIR}" --refetch --yes || return "$?"
   if [[ ! -s "${hg_image}" ]]; then
     echo "Downloaded image set has no nonempty X300 HG bitfile." >&2
@@ -740,10 +776,21 @@ ensure_x300_hg_image_loaded() {
 }
 
 build_local_gnss_sdr() {
+  # Cached radio searches survive branch switches and package removal. The
+  # optional LimeSDR finder also runs when its source block is disabled.
   cmake -S "${GNSS_SRC_DIR}" \
     -B "${GNSS_BUILD_DIR}" \
+    -U '*UHD*' -U '*GNURADIO*' -U '*GRLIMESDR*' \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${GNSS_INSTALL_DIR}" \
+    -DCMAKE_PREFIX_PATH="${UHD_INSTALL_PREFIX}" \
+    -DCMAKE_IGNORE_PREFIX_PATH="/usr/local" \
+    -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF \
+    -DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF \
+    -DCMAKE_BUILD_RPATH="${UHD_LIBRARY_DIR}" \
+    -DCMAKE_INSTALL_RPATH="${UHD_LIBRARY_DIR}" \
+    -DUHD_ROOT="${UHD_INSTALL_PREFIX}" \
+    -DGNURADIO_INSTALL_PREFIX="${UHD_INSTALL_PREFIX}" \
     -DENABLE_UHD=ON \
     -DENABLE_OSMOSDR=OFF \
     -DENABLE_LIMESDR=OFF \
@@ -755,6 +802,8 @@ build_local_gnss_sdr() {
     -DENABLE_INSTALL_TESTS=OFF \
     -DENABLE_GNSS_SIM_INSTALL=OFF
 
+  "${VENV_DIR}/bin/python" "${ROOT_DIR}/tools/verify_native_stack.py" \
+    --prefix "${UHD_INSTALL_PREFIX}" --cache "${GNSS_BUILD_DIR}/CMakeCache.txt"
   cmake --build "${GNSS_BUILD_DIR}" -j"$(nproc)"
 }
 
@@ -790,9 +839,10 @@ verify_setup() {
     exit 1
   fi
 
+  verify_system_uhd
 
   "${VENV_DIR}/bin/python" - <<'PY'
-modules = ("numpy", "scipy", "h5py", "pyqtgraph", "pytest", "pytestqt", "serial", "PyQt6", "uhd")
+modules = ("numpy", "scipy", "h5py", "pyqtgraph", "pytest", "pytestqt", "serial", "PyQt6")
 missing = []
 for module in modules:
     try:
@@ -831,6 +881,9 @@ PY
     exit 1
   fi
 
+  "${VENV_DIR}/bin/python" "${ROOT_DIR}/tools/verify_native_stack.py" \
+    --prefix "${UHD_INSTALL_PREFIX}" --binary "${GNSS_BUILD_BIN}" \
+    --cache "${GNSS_BUILD_DIR}/CMakeCache.txt"
   "${GNSS_BUILD_BIN}" --version >/dev/null
 
   if [[ ! -f "${VOLK_CONFIG_FILE}" ]]; then
@@ -850,8 +903,10 @@ PY
 }
 
 ensure_vendored_gnss_sdr
+ensure_runtime_idle
 install_system_dependencies
 setup_python_environment
+verify_system_uhd
 ensure_uhd_images
 resolve_x300_host_link
 persist_runtime_usrp_addr

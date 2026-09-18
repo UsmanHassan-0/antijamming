@@ -33,7 +33,6 @@ if [[ ! -x "${APP_PY}" ]]; then
   APP_PY="python3"
 fi
 
-
 cd "${ROOT_DIR}"
 export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
 mkdir -p logs
