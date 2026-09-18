@@ -656,6 +656,7 @@ ensure_x300_hg_image_loaded() {
   local usrp_probe="${UHD_INSTALL_PREFIX}/bin/uhd_usrp_probe"
   local discovery_text
   local probe_text
+  local probe_status
   local serial
   local flavor
   local image_hash
@@ -710,10 +711,14 @@ ensure_x300_hg_image_loaded() {
       echo "[setup] X300 ${serial}: active HG image initializes with the selected UHD."
       return 0
     fi
-  elif ! grep -Eiq 'compat(ibility)? (number |version )?mismatch|FPGA component .*revision|Expected FPGA compatibility|FPGA.*compatibility.*(expected|actual)' <<<"${probe_text}"; then
-    printf '%s\n' "${probe_text}" >&2
-    echo "USRP initialization failed without a confirmed FPGA mismatch; no write attempted." >&2
-    return 1
+  else
+    probe_status=$?
+    if (( probe_status >= 124 )) \
+      || ! grep -Eiq 'compat(ibility)? (number |version )?mismatch|FPGA component .*revision|Expected FPGA compatibility|FPGA.*compatibility.*(expected|actual)' <<<"${probe_text}"; then
+      printf '%s\n' "${probe_text}" >&2
+      echo "USRP initialization failed or was interrupted; no completed compatibility diagnosis, no write attempted." >&2
+      return 1
+    fi
   fi
   printf '%s\n' "${probe_text}"
   if [[ -f "${pending_path}" ]]; then

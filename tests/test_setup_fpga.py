@@ -105,6 +105,15 @@ def test_noncompatibility_probe_failure_never_flashes(tmp_path: Path, status: in
     assert "uhd_image_loader" not in (tmp_path / "calls").read_text()
 
 
+@pytest.mark.parametrize("status", [124, 137, 143])
+def test_interrupted_probe_never_flashes_even_with_partial_mismatch_output(
+    tmp_path: Path, status: int
+) -> None:
+    result = run_check(tmp_path, probe_status=status, probe_text="compat number mismatch")
+    assert result.returncode == 1
+    assert "uhd_image_loader" not in (tmp_path / "calls").read_text()
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
