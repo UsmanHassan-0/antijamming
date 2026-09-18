@@ -381,8 +381,9 @@
 
   // ---- 8.1 Logging switch and evidence locations ----
 
-  // Optional persistence; live stdout/UDP/NMEA/FIFOs stay active.
-  "logging_enabled": true,
+  // Off for normal operation; enable for saved development logs/run archives.
+  // Live stdout/UDP/NMEA/FIFOs stay active. Existing archives are not deleted.
+  "logging_enabled": false,
 
   "log_dir": "logs",  // Application session evidence directory.
 

@@ -170,7 +170,7 @@ def test_json_ready_mapping_preserves_boolean_types() -> None:
 
 def test_automatic_runtime_evidence_records_weights_inference_and_gnss(tmp_path) -> None:
     loggers = setup_logging(tmp_path)
-    cfg = StreamConfig(log_dir=tmp_path, gain_db=45.0)
+    cfg = StreamConfig(log_dir=tmp_path, gain_db=45.0, logging_enabled=True)
     backend = BackendRuntime(cfg, loggers)
     backend._log_session = reset_session_logs(tmp_path, loggers)
     backend._running = True
@@ -251,7 +251,7 @@ def test_runtime_evidence_compacts_derived_power_and_pvt_aliases() -> None:
 
 def test_spatial_diagnostics_are_not_duplicated_into_analysis_log(tmp_path) -> None:
     loggers = setup_logging(tmp_path)
-    backend = BackendRuntime(StreamConfig(log_dir=tmp_path), loggers)
+    backend = BackendRuntime(StreamConfig(log_dir=tmp_path, logging_enabled=True), loggers)
 
     backend._log_spatial_vector_diagnostics(
         {"event": "spatial_vector_diagnostics", "sequence": 7}
@@ -270,7 +270,7 @@ def test_spatial_diagnostics_are_not_duplicated_into_analysis_log(tmp_path) -> N
 
 def test_full_angle_log_keeps_one_copy_of_each_spectrum(tmp_path) -> None:
     loggers = setup_logging(tmp_path)
-    cfg = StreamConfig(log_dir=tmp_path)
+    cfg = StreamConfig(log_dir=tmp_path, logging_enabled=True)
     backend = BackendRuntime(cfg, loggers)
     scan = np.linspace(0.0, 330.0, 12)
     samples = np.ones((4, 128), dtype=np.complex128)

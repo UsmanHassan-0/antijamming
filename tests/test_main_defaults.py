@@ -129,7 +129,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.gnss_agnss_ref_location == ""
     assert cfg.gnss_agnss_ref_utc_time == ""
     assert cfg.gnss_tow_to_trk is True
-    assert cfg.logging_enabled is True
+    assert cfg.logging_enabled is False
     assert cfg.gnss_1c_channel_count == 10
     assert cfg.gnss_channels_in_acquisition == 10
     assert cfg.ui_update_interval_s == 0.1

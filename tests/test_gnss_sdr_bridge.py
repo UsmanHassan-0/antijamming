@@ -1089,6 +1089,7 @@ def test_bridge_drain_stdout_writes_clean_console_log_parses_and_stays_quiet_by_
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     cfg = StreamConfig(
+        logging_enabled=True,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
     )
@@ -1112,6 +1113,7 @@ def test_bridge_drain_stdout_normalizes_carriage_return_console_records(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     cfg = StreamConfig(
+        logging_enabled=True,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
     )
@@ -1146,6 +1148,7 @@ def test_bridge_drain_stdout_routes_glog_diagnostics_to_receiver_log(
         "Acquisition decision: negative, satellite G 9, test_statistics 21.874, threshold 38.7484\n"
     )
     cfg = StreamConfig(
+        logging_enabled=True,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
     )
@@ -1167,6 +1170,7 @@ def test_bridge_routes_solver_diagnostics_and_fragments_out_of_console_log(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     cfg = StreamConfig(
+        logging_enabled=True,
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
         gnss_sdr_log_dir=_fifo_runtime_dir(tmp_path) / "glog",
     )
@@ -1487,7 +1491,7 @@ def test_bridge_renders_default_gps_l1_baseline_settings(tmp_path: Path) -> None
     assert "PVT.monitor_client_addresses=127.0.0.1" in rendered
     assert "PVT.monitor_udp_port=1111" in rendered
     assert "PVT.enable_protobuf=true" in rendered
-    assert "PVT.log_rtklib_residuals=true" in rendered
+    assert "PVT.log_rtklib_residuals=false" in rendered
     assert "PVT.rtklib_residual_log_period_ms=1000" in rendered
     assert "PVT.nmea_output_file_enabled=false" in rendered
     assert "PVT.nmea_rate_ms=1000" in rendered
