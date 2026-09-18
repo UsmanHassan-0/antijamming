@@ -5,15 +5,23 @@ Separate jammer-off and jammer-on lab runs are useful validation, but the runtim
 The one-run segmentation labels are evidence labels, not physical jammer ON/OFF truth unless an operator marker/log explicitly provides that truth:
 
 - `startup`: not enough healthy reference evidence yet.
-- `healthy_baseline`: PVT current/fixed, enough observations, C/N0 above threshold, and LCMV off under uniform combining.
-- `lcmv_on_no_jammer`: legacy evidence label meaning LCMV was enabled while jammer confidence remained low. In the product preserve mode this must remain an armed uniform fallback, never active covariance weights.
+- `healthy_baseline`: PVT current/fixed, enough observations, C/N0 above threshold, and not yet armed under uniform combining.
+- `lcmv_on_no_jammer`: evidence label for an armed state with healthy GNSS and low vector/receiver-based jammer confidence. This is not the separate power/covariance activation gate, nor proof of physical jammer absence; inspect current protection and applied weights separately.
 - `jammer_like_event`: current dominant vector differs from the healthy reference and GNSS health degrades or jammer-like covariance evidence appears.
 - `recovery`: PVT/C/N0 recover and the current vector moves back toward the healthy reference.
 - `unknown`: evidence is insufficient or mixed.
 
-Healthy-reference tracking stores a smoothed vector, covariance, internal/display angle, timestamp, and confidence. It runs from the DoA loop while LCMV is off and every FIFO uses the shared uniform spatial row. It freezes whenever LCMV is enabled, including its temporary uniform fallback, and also freezes for unhealthy PVT/observations/C/N0, a large angle or power jump, high jammer confidence, or suspicious eigen-gap/effective-rank/peak structure. Logs include `healthy_reference_available`, age, angle, coherence with current `u1`, update reason, freeze reason, `healthy_reference_updated`, `healthy_reference_freeze_reasons`, `lcmv_safe_baseline`, and confidence scores.
+Healthy-reference tracking stores a smoothed vector, covariance, internal/display angle, timestamp, and confidence. It runs from the DoA loop before automatic arming, while every FIFO uses the shared uniform spatial row. It freezes after arming, including uniform fallback/recovery, and also freezes for unhealthy PVT/observations/C/N0, a large angle or power jump, high jammer confidence, or suspicious eigen-gap/effective-rank/peak structure. Logs include `healthy_reference_available`, age, angle, coherence with current `u1`, update reason, freeze reason, `healthy_reference_updated`, `healthy_reference_freeze_reasons`, `lcmv_safe_baseline`, and confidence scores.
 
-For the product flow, enable LCMV only after the live angle cluster and measured healthy U1 are fresh and mutually consistent. The enable action freezes that vector/covariance and leaves the FIFO uniform. A null is applied only after the input-power and generalized-covariance thresholds both pass. `lcmv_jammer_detected_latched` then remains true until disable. The runtime automatically logs and analyzes the event as added-scene covariance suppression. Optional physical jammer ON/OFF markers are required only to upgrade that inference to a proof-grade physically labeled jammer-only measurement.
+The product arms automatically only after the live angle cluster and measured
+healthy U1 are fresh, consistent and backed by healthy GNSS. Arming freezes
+that vector/covariance and leaves the FIFO uniform. There is no manual LCMV
+toggle. A null needs both input-power and generalized-covariance activation
+thresholds. Current protection releases after valid lower evidence persists
+for the hold interval, while `lcmv_jammer_detected_latched` records historical
+detection until the next run. Further jammer evidence can reactivate protection
+without re-arming. The runtime logs inferred added-scene covariance suppression;
+optional physical markers supply additional labeling, not algorithm controls.
 
 Continuous receiver evidence does not require marker buttons. `runtime_evidence.jsonl` automatically stores inferred RF state, LCMV state, all combiner weights and ramp progress, powers, spatial state and GNSS state. The GUI `Record jammer ON/OFF` and `Record bladeRF ON/OFF` buttons are optional physical-ground-truth annotations. They record physical state and an optional note, not transmitter settings or RF power. `tools/mark_rf_event.py` remains available for notes and `jammer_moved`, for example:
 

@@ -224,11 +224,10 @@ class StreamConfig:
     # remain CCW; operator display bearings use top as 0 deg and increase clockwise.
     expected_sources: int
 
-    # When armed, the runtime selects the strongest MUSIC peak outside the
-    # frozen healthy-signal guard. It applies no null until independent power
-    # and covariance evidence latches the jammer, and falls back to uniform on
-    # any invalid condition.
-    lcmv_test_enabled: bool
+    # Automatic arming freezes a healthy reference. A fresh measured-U1 solve
+    # also needs a MUSIC candidate outside its guard and power/covariance
+    # activation evidence. Uniform is the common fallback; an active FIFO bank
+    # may retain its previous valid protection row when a new solve is rejected.
     lcmv_condition_number_limit: float
     lcmv_realtime_preserve_window_samples: int
     lcmv_realtime_preserve_min_samples: int
@@ -240,7 +239,7 @@ class StreamConfig:
     lcmv_jammer_activation_min_generalized_gain_db: float
     # Protection releases only after both metrics remain below these lower
     # hysteresis thresholds for the configured hold. The historical detection
-    # latch remains set until LCMV is disabled.
+    # latch remains set until the next run resets the learned reference.
     lcmv_jammer_release_max_input_power_jump_db: float
     lcmv_jammer_release_max_generalized_gain_db: float
     lcmv_jammer_release_hold_s: float
@@ -251,10 +250,6 @@ class StreamConfig:
     lcmv_max_white_noise_gain_db: float
     lcmv_min_predicted_jammer_suppression_db: float
     lcmv_heavy_diagnostics_interval_s: float
-    one_run_segmentation_enabled: bool
-    # Production lifecycle: collect a uniform healthy reference first, then
-    # arm LCMV automatically. Arming does not apply null weights by itself.
-    lcmv_auto_arm_after_pvt: bool
 
     # -------------------------------------------------------------------------
     # GNSS-SDR Process and Runtime Paths

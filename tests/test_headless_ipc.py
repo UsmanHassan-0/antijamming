@@ -87,9 +87,6 @@ def test_headless_service_stays_idle_until_explicit_start_command(tmp_path) -> N
         def set_expected_sources(self, _count: int) -> None:
             pass
 
-        def set_lcmv_test_enabled(self, _enabled: bool) -> None:
-            pass
-
         def mark_rf_event(self, event: str, **kwargs) -> dict:
             return {"event": event, **kwargs}
 
@@ -135,8 +132,8 @@ def test_headless_rejects_noninteger_source_count(tmp_path, invalid) -> None:
         service._handle_command("set_expected_sources", {"count": invalid})
 
 
-@pytest.mark.parametrize("invalid", [0, 1, "false", None])
-def test_headless_rejects_nonboolean_lcmv_state(tmp_path, invalid) -> None:
+@pytest.mark.parametrize("value", [True, False, 0, 1, "false", None])
+def test_headless_has_no_manual_lcmv_command(tmp_path, value) -> None:
     service = HeadlessRuntimeService(
         object(),  # type: ignore[arg-type]
         {"app": __import__("logging").getLogger("headless-lcmv-type-test")},
@@ -144,8 +141,8 @@ def test_headless_rejects_nonboolean_lcmv_state(tmp_path, invalid) -> None:
         backend_factory=lambda **_kwargs: object(),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(ValueError, match="boolean 'enabled'"):
-        service._handle_command("set_lcmv_test_enabled", {"enabled": invalid})
+    with pytest.raises(ValueError, match="unknown antijamming command"):
+        service._handle_command("set_lcmv_test_enabled", {"enabled": value})
 
 
 def test_headless_backend_monitor_start_failure_rolls_back_backend(

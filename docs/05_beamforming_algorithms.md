@@ -30,7 +30,8 @@ PRN, and a base-row model plot is not the final compensated FIFO response.
 ## Activation, preservation, and release
 
 The runtime learns a stable jammer-off bladeRF angle cluster and healthy
-measured vector/covariance. Enabling LCMV freezes that reference. MUSIC still
+measured vector/covariance. Healthy GNSS and a qualified reference arm LCMV
+automatically and freeze that reference; no manual enable command exists. MUSIC still
 supplies a candidate outside the frozen desired-direction guard; missing or
 inside-guard candidates prevent a fresh solve. This retained control dependency
 does not turn the MUSIC angle into the measured null vector.
@@ -40,6 +41,10 @@ against the frozen baseline (profile: 3 and 6 dB). Cleanup keeps historical
 detection separate from currently active protection. With valid evidence,
 protection releases after both lower thresholds (1.5 and 3 dB) hold for two
 seconds; returning to uniform includes the existing phase-bank transition.
+The runtime stays armed and retains its reference across release/reactivation.
+A new Start-to-Stop session collects a new reference. The config cannot disable
+reference collection or override arming; all activation/release thresholds
+retain their previous values.
 See the living [jammer audit](audits/jammer_latch_audit_2026-09-01.md)
 for exercised schedules and unverified boundaries.
 

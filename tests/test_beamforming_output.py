@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ from antijamming.gnss.shared_u1_phase_compensation import (
     SharedU1PhaseCompensationBank,
 )
 from antijamming.runtime import BackendRuntime
+from antijamming.runtime.ipc import metrics_for_wire
 
 
 def _build_loggers() -> dict[str, logging.Logger]:
@@ -93,6 +95,33 @@ def _prime_realtime_bladerf_reference(
     runtime._healthy_reference_raw_power_linear = baseline_power_linear
     runtime._healthy_reference_cal_power_linear = baseline_power_linear
     return normalized
+
+
+def _arm_from_healthy_reference(runtime: BackendRuntime) -> None:
+    """Exercise the automatic transition with explicit healthy receiver evidence."""
+
+    assert runtime._maybe_auto_arm_lcmv_after_pvt({
+        "healthy_reference_updated": True,
+        "pvt_healthy": True,
+        "observations_healthy": True,
+        "cn0_healthy": True,
+    })
+
+
+def _prepare_automatic_reference(runtime: BackendRuntime) -> None:
+    """Seed a stable synthetic baseline for tests of post-arming behavior."""
+
+    _seed_automatic_reference(runtime)
+    _arm_from_healthy_reference(runtime)
+
+
+def _seed_automatic_reference(runtime: BackendRuntime) -> None:
+    cfg = runtime._config
+    for _ in range(cfg.lcmv_realtime_preserve_min_samples):
+        runtime._update_realtime_bladerf_angle_tracker(
+            {"doa_peaks": [{"angle_deg": 40.0}]}, primary_internal_deg=40.0
+        )
+    _prime_realtime_bladerf_reference(runtime, cfg, internal_angle_deg=40.0)
 
 
 def test_uniform_weights_are_raw_sum_coefficients() -> None:
@@ -427,13 +456,12 @@ def test_backend_gnss_handoff_label_is_uniform_array_sum() -> None:
 
 def test_backend_lcmv_test_missing_music_bearing_falls_back_to_uniform() -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=True,
         lcmv_weight_transition_s=0.0,
         phase_correction_vector=None,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
     _install_product_fifo_bank(runtime)
-    runtime.set_lcmv_test_enabled(True)
+    _prepare_automatic_reference(runtime)
     x = np.array(
         [
             [1 + 0j, 2 + 0j],
@@ -484,7 +512,6 @@ def test_lcmv_status_names_only_the_method_that_is_actually_applied() -> None:
 
 def test_backend_product_fifo_rejects_phase_correction_length_mismatch() -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=True,
         phase_correction_vector=(1 + 0j, 1 + 0j),
     )
     runtime = BackendRuntime(cfg, _build_loggers())
@@ -497,7 +524,6 @@ def test_backend_product_fifo_rejects_phase_correction_length_mismatch() -> None
 
 def test_realtime_bladerf_tracker_wraps_angles_and_freezes_only_when_stable() -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=False,
         lcmv_realtime_preserve_window_samples=8,
         lcmv_realtime_preserve_min_samples=4,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
@@ -522,7 +548,7 @@ def test_realtime_bladerf_tracker_wraps_angles_and_freezes_only_when_stable() ->
         cfg,
         internal_angle_deg=center,
     )
-    runtime.set_lcmv_test_enabled(True)
+    _arm_from_healthy_reference(runtime)
     frozen = runtime._realtime_preserve_tracker_payload()
     armed_status = runtime._lcmv_status_copy()
     frozen_angle = float(frozen["realtime_bladerf_frozen_internal_deg"])
@@ -550,7 +576,6 @@ def test_realtime_bladerf_tracker_wraps_angles_and_freezes_only_when_stable() ->
 
 def test_realtime_lcmv_target_ignores_peaks_inside_frozen_bladerf_guard() -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=False,
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
         lcmv_realtime_preserve_guard_deg=20.0,
@@ -567,7 +592,7 @@ def test_realtime_lcmv_target_ignores_peaks_inside_frozen_bladerf_guard() -> Non
         cfg,
         internal_angle_deg=40.0,
     )
-    runtime.set_lcmv_test_enabled(True)
+    _arm_from_healthy_reference(runtime)
 
     internal, display, source = runtime._select_lcmv_target_from_doa_metrics(
         {
@@ -585,7 +610,6 @@ def test_realtime_lcmv_target_ignores_peaks_inside_frozen_bladerf_guard() -> Non
 
 def test_realtime_lcmv_stays_uniform_for_angle_jump_without_jammer_evidence() -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=False,
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
         lcmv_realtime_preserve_guard_deg=20.0,
@@ -603,7 +627,7 @@ def test_realtime_lcmv_stays_uniform_for_angle_jump_without_jammer_evidence() ->
         internal_angle_deg=40.0,
         baseline_power_linear=1.0,
     )
-    runtime.set_lcmv_test_enabled(True)
+    _arm_from_healthy_reference(runtime)
     x = 0.1 * np.ones((4, 1024), dtype=np.complex128)
 
     runtime._update_lcmv_test_from_music(
@@ -633,7 +657,6 @@ def test_realtime_lcmv_preserves_frozen_vector_and_nulls_measured_u1(
 ) -> None:
     rng = np.random.default_rng(645)
     cfg = StreamConfig(
-        lcmv_test_enabled=False,
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
         lcmv_realtime_preserve_guard_deg=20.0,
@@ -657,7 +680,7 @@ def test_realtime_lcmv_preserves_frozen_vector_and_nulls_measured_u1(
         baseline_power_linear=0.01,
         measured_vector=measured_preserve_vector,
     )
-    runtime.set_lcmv_test_enabled(True)
+    _arm_from_healthy_reference(runtime)
     tracker = runtime._realtime_preserve_tracker_payload()
     preserve_angle = float(tracker["realtime_bladerf_frozen_internal_deg"])
     null_angle = 150.0
@@ -833,7 +856,6 @@ def test_release_is_evaluated_without_music_target_and_fifo_returns_uniform(
     monkeypatch,
 ) -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=True,
         lcmv_jammer_release_hold_s=1.0,
         lcmv_weight_transition_s=0.0,
         gnss_shared_u1_phase_transition_s=0.0,
@@ -841,6 +863,7 @@ def test_release_is_evaluated_without_music_target_and_fifo_returns_uniform(
     )
     runtime = BackendRuntime(cfg, _build_loggers())
     _install_product_fifo_bank(runtime)
+    _prepare_automatic_reference(runtime)
     runtime._lcmv_jammer_detected_latched = True
     runtime._lcmv_jammer_protection_active = True
     runtime._realtime_preserve_frozen_covariance = np.eye(4, dtype=np.complex128)
@@ -881,12 +904,11 @@ def test_release_is_evaluated_without_music_target_and_fifo_returns_uniform(
     assert np.allclose(output, np.tile(expected, (cfg.gnss_1c_channel_count, 1)))
 
 
-def test_operator_disable_waits_for_inflight_lcmv_update_and_wins(
+def test_run_reset_waits_for_inflight_lcmv_update_and_clears_protection(
     monkeypatch,
 ) -> None:
     rng = np.random.default_rng(902)
     cfg = StreamConfig(
-        lcmv_test_enabled=False,
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
         lcmv_weight_transition_s=0.0,
@@ -904,7 +926,7 @@ def test_operator_disable_waits_for_inflight_lcmv_update_and_wins(
         internal_angle_deg=40.0,
         baseline_power_linear=0.01,
     )
-    runtime.set_lcmv_test_enabled(True)
+    _arm_from_healthy_reference(runtime)
     null_angle = 150.0
     null_vector = steering_vector(
         np.asarray([null_angle]), cfg.center_freq_hz, cfg.array_spacing_m
@@ -918,7 +940,7 @@ def test_operator_disable_waits_for_inflight_lcmv_update_and_wins(
 
     solver_entered = threading.Event()
     allow_solver = threading.Event()
-    disable_done = threading.Event()
+    reset_done = threading.Event()
     errors: list[BaseException] = []
     real_solver = covariance_lcmv_vector_null_weights
 
@@ -946,28 +968,31 @@ def test_operator_disable_waits_for_inflight_lcmv_update_and_wins(
         except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)
 
-    def disable() -> None:
+    def reset_run() -> None:
         try:
-            runtime.set_lcmv_test_enabled(False)
+            runtime._reset_lcmv_for_run()
         except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)
         finally:
-            disable_done.set()
+            reset_done.set()
 
     update_thread = threading.Thread(target=update)
+    reset_thread = threading.Thread(target=reset_run)
     update_thread.start()
-    assert solver_entered.wait(timeout=2.0)
-    disable_thread = threading.Thread(target=disable)
-    disable_thread.start()
-    assert disable_done.wait(timeout=0.05) is False
-    allow_solver.set()
-    update_thread.join(timeout=2.0)
-    disable_thread.join(timeout=2.0)
+    try:
+        assert solver_entered.wait(timeout=2.0)
+        reset_thread.start()
+        assert reset_done.wait(timeout=0.05) is False
+    finally:
+        allow_solver.set()
+        update_thread.join(timeout=2.0)
+        if reset_thread.ident is not None:
+            reset_thread.join(timeout=2.0)
 
     assert not update_thread.is_alive()
-    assert not disable_thread.is_alive()
+    assert not reset_thread.is_alive()
     assert errors == []
-    assert runtime._lcmv_test_enabled is False
+    assert runtime._lcmv_armed is False
     assert runtime._lcmv_jammer_detected_latched is False
     assert runtime._lcmv_jammer_protection_active is False
     assert runtime._shared_measured_u1_protection_is_available() is False
@@ -977,7 +1002,6 @@ def test_operator_disable_waits_for_inflight_lcmv_update_and_wins(
 
 def test_healthy_reference_updates_during_lcmv_off_healthy_baseline() -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=False,
         phase_correction_vector=None,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
@@ -1008,8 +1032,6 @@ def test_healthy_reference_updates_during_lcmv_off_healthy_baseline() -> None:
 
 def test_healthy_pvt_auto_arms_lcmv_but_keeps_uniform_until_jammer() -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=False,
-        lcmv_auto_arm_after_pvt=True,
         lcmv_realtime_preserve_min_samples=3,
         lcmv_realtime_preserve_max_circular_std_deg=5.0,
         phase_correction_vector=None,
@@ -1041,7 +1063,7 @@ def test_healthy_pvt_auto_arms_lcmv_but_keeps_uniform_until_jammer() -> None:
 
     status = runtime._lcmv_status_copy()
     assert payload["lcmv_auto_arm_triggered"] is True
-    assert runtime._lcmv_test_enabled is True
+    assert runtime._lcmv_armed is True
     assert runtime._lcmv_jammer_detected_latched is False
     assert status["mode"] == "fallback"
     assert status["spatial_vector_diagnostics"][
@@ -1050,32 +1072,255 @@ def test_healthy_pvt_auto_arms_lcmv_but_keeps_uniform_until_jammer() -> None:
     assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
 
 
-def test_lcmv_auto_arm_waits_for_pvt_and_respects_manual_off() -> None:
-    cfg = StreamConfig(
-        lcmv_test_enabled=False,
-        lcmv_auto_arm_after_pvt=True,
-        phase_correction_vector=None,
-    )
-    runtime = BackendRuntime(cfg, _build_loggers())
-    runtime.set_lcmv_test_enabled(False)
+@pytest.mark.parametrize("missing", [
+    "healthy_reference_updated", "pvt_healthy", "observations_healthy", "cn0_healthy",
+])
+def test_automatic_arming_requires_every_health_gate(missing) -> None:
+    runtime = BackendRuntime(StreamConfig(), _build_loggers())
+    _seed_automatic_reference(runtime)
+    state = {
+        "healthy_reference_updated": True,
+        "pvt_healthy": True,
+        "observations_healthy": True,
+        "cn0_healthy": True,
+    }
+    state[missing] = False
+    assert runtime._maybe_auto_arm_lcmv_after_pvt(state) is False
+    assert runtime._lcmv_armed is False
+    assert runtime._realtime_preserve_frozen_vector is None
+    assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
 
-    armed = runtime._maybe_auto_arm_lcmv_after_pvt(
-        {
+
+@pytest.mark.parametrize(("field", "invalid"), [
+    ("_healthy_reference_vector", None),
+    ("_healthy_reference_vector", np.empty(0)),
+    ("_healthy_reference_vector", np.zeros(4)),
+    ("_healthy_reference_vector", np.full(4, np.nan)),
+    ("_healthy_reference_vector", np.full(4, 1e308)),
+    ("_healthy_reference_covariance", None),
+    ("_healthy_reference_covariance", np.eye(3)),
+    ("_healthy_reference_covariance", np.full((4, 4), np.nan)),
+    ("_healthy_reference_updated_monotonic_s", 97.0),
+    ("_healthy_reference_updated_monotonic_s", 101.0),
+    ("_healthy_reference_updated_monotonic_s", None),
+    ("_healthy_reference_confidence", 0.79),
+    ("_healthy_reference_confidence", float("inf")),
+    ("_healthy_reference_internal_angle_deg", 180.0),
+    ("_realtime_preserve_stable", False),
+])
+def test_automatic_arming_rejects_unusable_reference(field, invalid, monkeypatch):
+    monkeypatch.setattr("antijamming.runtime.backend.time.monotonic", lambda: 100.0)
+    runtime = BackendRuntime(StreamConfig(), _build_loggers())
+    _seed_automatic_reference(runtime)
+    setattr(runtime, field, invalid)
+    assert not runtime._maybe_auto_arm_lcmv_after_pvt({
+        "healthy_reference_updated": True,
+        "pvt_healthy": True,
+        "observations_healthy": True,
+        "cn0_healthy": True,
+    })
+    assert runtime._lcmv_armed is False
+    assert runtime._realtime_preserve_frozen_vector is None
+    assert not runtime._shared_measured_u1_protection_is_available()
+
+
+def test_stop_request_prevents_automatic_arming():
+    runtime = BackendRuntime(StreamConfig(), _build_loggers())
+    _seed_automatic_reference(runtime)
+    runtime._stop_requested.set()
+    assert not runtime._maybe_auto_arm_lcmv_after_pvt({
+        "healthy_reference_updated": True,
+        "pvt_healthy": True,
+        "observations_healthy": True,
+        "cn0_healthy": True,
+    })
+    assert runtime._lcmv_armed is False
+
+
+def test_automatic_arming_once_per_run_owns_reference_and_reset_relearns():
+    runtime = BackendRuntime(StreamConfig(), _build_loggers())
+    for _ in range(3):
+        _seed_automatic_reference(runtime)
+        vector = runtime._healthy_reference_vector
+        covariance = runtime._healthy_reference_covariance
+        _arm_from_healthy_reference(runtime)
+        frozen = runtime._realtime_preserve_frozen_vector.copy()
+        assert not np.shares_memory(vector, runtime._realtime_preserve_frozen_vector)
+        assert not np.shares_memory(
+            covariance, runtime._realtime_preserve_frozen_covariance
+        )
+        vector[:] = 0
+        covariance[:] = 0
+        assert np.array_equal(runtime._realtime_preserve_frozen_vector, frozen)
+        runtime._lcmv_jammer_detected_latched = True
+        runtime._lcmv_jammer_protection_active = True
+        assert not runtime._maybe_auto_arm_lcmv_after_pvt({
             "healthy_reference_updated": True,
             "pvt_healthy": True,
             "observations_healthy": True,
             "cn0_healthy": True,
-        }
-    )
+        })
+        assert runtime._lcmv_jammer_protection_active
+        runtime._reset_lcmv_for_run()
+        assert not runtime._lcmv_armed
+        assert not runtime._lcmv_jammer_detected_latched
+        assert not runtime._lcmv_jammer_protection_active
+        assert runtime._healthy_reference_vector is None
+        assert runtime._healthy_reference_covariance is None
+        assert runtime._realtime_preserve_frozen_vector is None
+        assert runtime._realtime_preserve_frozen_covariance is None
+        assert not runtime._realtime_preserve_stable
+        assert not runtime._shared_measured_u1_protection_is_available()
+        assert np.allclose(runtime._get_beamformer_weights_copy(), uniform_weights(4))
 
-    assert armed is False
-    assert runtime._lcmv_auto_arm_suppressed_by_operator is True
-    assert runtime._lcmv_test_enabled is False
+
+def test_automatic_arming_is_serialized_and_publishes_only_once(monkeypatch):
+    runtime = BackendRuntime(StreamConfig(), _build_loggers())
+    _seed_automatic_reference(runtime)
+    entered = threading.Event()
+    release = threading.Event()
+    events = []
+    results = []
+    errors = []
+
+    def record(event, **kwargs):
+        events.append(event)
+        entered.set()
+        assert release.wait(2.0)
+
+    monkeypatch.setattr(runtime, "_record_runtime_event", record)
+
+    def arm():
+        try:
+            results.append(runtime._maybe_auto_arm_lcmv_after_pvt({
+                "healthy_reference_updated": True,
+                "pvt_healthy": True,
+                "observations_healthy": True,
+                "cn0_healthy": True,
+            }))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=arm)
+    second = threading.Thread(target=arm)
+    first.start()
+    try:
+        assert entered.wait(2.0)
+        second.start()
+    finally:
+        release.set()
+        first.join(2.0)
+        if second.ident is not None:
+            second.join(2.0)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert sorted(results) == [False, True]
+    assert events == ["lcmv_on"]
+
+
+def test_automatic_arm_status_survives_headless_wire_serialization():
+    runtime = BackendRuntime(StreamConfig(), _build_loggers())
+    _prepare_automatic_reference(runtime)
+    wire = metrics_for_wire({"lcmv_test": runtime._lcmv_status_copy()})
+    received = json.loads(json.dumps(wire, allow_nan=False))["lcmv_test"]
+    assert received["enabled"] is True
+    assert received["mode"] == "fallback"
+    assert received["active_lcmv_method"] == "uniform_array_sum"
+    assert received["spatial_vector_diagnostics"]["lcmv_jammer_activation_armed"]
+    assert not received["spatial_vector_diagnostics"]["lcmv_jammer_protection_active"]
+
+
+def test_automatic_live_contract_arms_releases_and_reactivates_fifo(monkeypatch):
+    """Synthetic health/IQ exercise the runtime, solver and actual FIFO bank."""
+
+    clock = [100.0]
+    monkeypatch.setattr("antijamming.runtime.backend.time.monotonic", lambda: clock[0])
+    cfg = StreamConfig(
+        phase_correction_vector=None,
+        lcmv_realtime_preserve_min_samples=3,
+        lcmv_weight_transition_s=0.0,
+        gnss_shared_u1_phase_transition_s=0.0,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    _install_product_fifo_bank(runtime)
+    runtime._gnss_bridge = SimpleNamespace(snapshot=lambda: {
+        "pvt_current": True, "pvt_gui_status": "FIX",
+        "pvt_observation_count": 10, "avg_tracking_cno_db_hz": 42.0,
+    })
+    rng = np.random.default_rng(20260914)
+    desired = steering_vector(
+        np.asarray([40.0]), cfg.center_freq_hz, cfg.array_spacing_m
+    ).reshape(-1)
+    jammer = steering_vector(
+        np.asarray([150.0]), cfg.center_freq_hz, cfg.array_spacing_m
+    ).reshape(-1)
+    healthy = (
+        0.2 * desired[:, None]
+        * (rng.standard_normal(2048) + 1j * rng.standard_normal(2048))
+        + 0.01 * (rng.standard_normal((4, 2048)) + 1j * rng.standard_normal((4, 2048)))
+    )
+    interfered = healthy + 2.0 * jammer[:, None] * (
+        rng.standard_normal(2048) + 1j * rng.standard_normal(2048)
+    )
+    for angle in (39.0, 40.0, 41.0):
+        runtime._update_realtime_bladerf_angle_tracker(
+            {"doa_peaks": [{"angle_deg": angle}]}, primary_internal_deg=angle
+        )
+    payload = runtime._update_healthy_reference_tracking_from_music(
+        corrected_chunk=healthy,
+        music_internal_deg=40.0,
+        music_bearing_deg=internal_angle_to_operator_bearing_deg(40.0),
+    )
+    assert payload["lcmv_auto_arm_triggered"]
+    assert runtime._lcmv_armed and not runtime._lcmv_jammer_protection_active
+    frozen = runtime._realtime_preserve_frozen_vector.copy()
+    for cycle in range(2):
+        clock[0] = 101.0 + cycle * 5.0
+        runtime._update_lcmv_test_from_music(
+            interfered, 150.0, internal_angle_to_operator_bearing_deg(150.0),
+            target_selection_source="strongest_music_peak_outside_frozen_bladerf_guard",
+        )
+        assert runtime._lcmv_status_copy()["mode"] == "on"
+        assert runtime._lcmv_jammer_protection_active
+        assert runtime._shared_measured_u1_protection_is_available()
+        protected = runtime._gnss_shared_u1_phase_output_matrix(
+            interfered.astype(np.complex64)
+        )
+        expected = apply_beamformer(
+            interfered.astype(np.complex64),
+            runtime._get_shared_measured_u1_protection_weights_copy(),
+        )
+        # Production does complex64 matrix multiplication; the reference helper
+        # accumulates in complex128. Bound float32 rounding, including near zero.
+        np.testing.assert_allclose(
+            protected, np.tile(expected, (cfg.gnss_1c_channel_count, 1)),
+            atol=2e-6, rtol=1e-5,
+        )
+        for delta in (1.0, 3.1):
+            clock[0] = 101.0 + cycle * 5.0 + delta
+            runtime._update_lcmv_test_from_music(
+                healthy, float("nan"), float("nan"),
+                target_selection_source="no_peak_after_jammer_off",
+            )
+            runtime._gnss_shared_u1_phase_output_matrix(healthy.astype(np.complex64))
+        assert runtime._lcmv_armed
+        assert runtime._lcmv_jammer_detected_latched
+        assert not runtime._lcmv_jammer_protection_active
+        assert not runtime._shared_measured_u1_protection_is_available()
+        assert np.array_equal(runtime._realtime_preserve_frozen_vector, frozen)
+        recovered = runtime._gnss_shared_u1_phase_output_matrix(
+            healthy.astype(np.complex64)
+        )
+        expected = apply_beamformer(healthy.astype(np.complex64), uniform_weights(4))
+        np.testing.assert_allclose(
+            recovered, np.tile(expected, (cfg.gnss_1c_channel_count, 1)),
+            atol=2e-6, rtol=1e-5,
+        )
+
 
 
 def test_healthy_reference_does_not_treat_music_local_peaks_as_emitters() -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=False,
         expected_sources=1,
         phase_correction_vector=None,
     )
@@ -1110,10 +1355,11 @@ def test_healthy_reference_does_not_treat_music_local_peaks_as_emitters() -> Non
 
 def test_healthy_reference_freezes_during_lcmv_on_even_with_good_gnss() -> None:
     cfg = StreamConfig(
-        lcmv_test_enabled=True,
         phase_correction_vector=None,
     )
     runtime = BackendRuntime(cfg, _build_loggers())
+    _prepare_automatic_reference(runtime)
+    original_reference = runtime._healthy_reference_vector.copy()
     runtime._set_lcmv_status(enabled=True, mode="on", reason="unit test active null")
     runtime._gnss_bridge = SimpleNamespace(
         snapshot=lambda: {
@@ -1123,13 +1369,13 @@ def test_healthy_reference_freezes_during_lcmv_on_even_with_good_gnss() -> None:
             "avg_tracking_cno_db_hz": 38.0,
         }
     )
-    u1 = np.ones((4,), dtype=np.complex128) / 2.0
+    u1 = original_reference.copy()
     x = np.tile(u1[:, None], (1, 64))
 
     payload = runtime._update_healthy_reference_from_chunk(
         corrected_chunk=x,
-        music_internal_deg=280.0,
-        music_bearing_deg=170.0,
+        music_internal_deg=40.0,
+        music_bearing_deg=internal_angle_to_operator_bearing_deg(40.0),
         u1=u1,
     )
 
@@ -1139,11 +1385,11 @@ def test_healthy_reference_freezes_during_lcmv_on_even_with_good_gnss() -> None:
     assert "lcmv_active_or_not_safe" in str(payload["healthy_reference_freeze_reason"])
     assert "lcmv_active_or_not_safe" in payload["healthy_reference_freeze_reasons"]
     assert payload["run_state_label"] == "lcmv_on_no_jammer"
-    assert runtime._healthy_reference_vector is None
+    assert np.array_equal(runtime._healthy_reference_vector, original_reference)
 
 
 def test_healthy_reference_does_not_treat_no_fix_as_fix() -> None:
-    cfg = StreamConfig(lcmv_test_enabled=False, phase_correction_vector=None)
+    cfg = StreamConfig(phase_correction_vector=None)
     runtime = BackendRuntime(cfg, _build_loggers())
     runtime._gnss_bridge = SimpleNamespace(
         snapshot=lambda: {

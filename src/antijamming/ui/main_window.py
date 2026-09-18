@@ -12,7 +12,6 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QBoxLayout,
-    QCheckBox,
     QLabel,
     QMainWindow,
     QPushButton,
@@ -141,8 +140,6 @@ class MainWindow(QMainWindow):
         self._stream_summary_label = QLabel("Idle\nOutput: Uniform array IQ -> GNSS-SDR")
         self._expected_sources_spin = QSpinBox()
         self._expected_sources_control = self._build_expected_sources_control()
-        self._lcmv_test_checkbox = QCheckBox("LCMV Test Nulling")
-        self._lcmv_test_control = self._build_lcmv_test_control()
         self._rf_event_status_label = QLabel(
             "Optional ground truth: jammer UNKNOWN | bladeRF UNKNOWN"
         )
@@ -153,7 +150,7 @@ class MainWindow(QMainWindow):
         self._operator_jammer_state = "UNKNOWN"
         self._operator_bladerf_state = "UNKNOWN"
         self._rf_event_control = self._build_rf_event_control()
-        self._lcmv_test_status_label = QLabel("LCMV Test Nulling: OFF")
+        self._lcmv_test_status_label = QLabel("LCMV protection: Automatic")
         self._lcmv_music_candidate_label = QLabel(
             "MUSIC guard candidate (not null bearing): --"
         )
@@ -252,7 +249,7 @@ class MainWindow(QMainWindow):
         self._run_btn.clicked.connect(self._toggle_run)
         self._run_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._configure_expected_sources_control()
-        self._configure_lcmv_test_control()
+        self._refresh_lcmv_test_status({})
 
         layout.addWidget(self._build_main_view(), stretch=1)
 
@@ -505,7 +502,6 @@ class MainWindow(QMainWindow):
         )
         antijam_labels = (
             self._expected_sources_control,
-            self._lcmv_test_control,
             self._rf_event_control,
             self._rf_event_status_label,
             self._lcmv_test_status_label,
@@ -1007,13 +1003,7 @@ class MainWindow(QMainWindow):
         self._set_status_row(self._rx_peak_label, "IQ peak", "--", INFO)
         self._set_status_row(self._rx_rms_label, "IQ RMS", "--", INFO)
         self._set_status_row(self._rx_near_full_scale_label, "Near full scale", "--", INFO)
-        self._refresh_lcmv_test_status(
-            {
-                "lcmv_test": self._default_lcmv_test_status(
-                    bool(self._cfg.lcmv_test_enabled)
-                ),
-            }
-        )
+        self._refresh_lcmv_test_status({})
 
     # -------------------------------------------------------------------------
     # Fixed Product Mode Status
@@ -1034,22 +1024,6 @@ class MainWindow(QMainWindow):
         self._expected_sources_spin.setStyleSheet(text_style(color=FG_TEXT, font_weight=700))
         layout.addWidget(label, stretch=1)
         layout.addWidget(self._expected_sources_spin, stretch=0)
-        return container
-
-    def _build_lcmv_test_control(self) -> QWidget:
-        container = QWidget()
-        container.setStyleSheet(transparent_style())
-        layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, container)
-        layout.setContentsMargins(*ZERO_MARGINS)
-        layout.setSpacing(COMPACT_SPACING)
-        self._lcmv_test_checkbox.setObjectName("lcmvTestCheckbox")
-        self._lcmv_test_checkbox.setAccessibleName("LCMV Test Nulling")
-        self._lcmv_test_checkbox.setMinimumHeight(CONTROL_H)
-        self._lcmv_test_checkbox.setStyleSheet(
-            text_style(color=FG_TEXT, font_weight=700)
-        )
-        layout.addWidget(self._lcmv_test_checkbox, stretch=0)
-        layout.addStretch(1)
         return container
 
     def _build_rf_event_control(self) -> QWidget:
@@ -1090,17 +1064,6 @@ class MainWindow(QMainWindow):
         self._expected_sources_spin.valueChanged.connect(self._on_expected_sources_changed)
         self._refresh_source_count_status({})
 
-    def _configure_lcmv_test_control(self) -> None:
-        enabled = bool(self._cfg.lcmv_test_enabled)
-        self._cfg.lcmv_test_enabled = enabled
-        self._lcmv_test_checkbox.setChecked(enabled)
-        self._lcmv_test_checkbox.toggled.connect(self._on_lcmv_test_toggled)
-        self._refresh_lcmv_test_status(
-            {
-                "lcmv_test": self._default_lcmv_test_status(enabled),
-            }
-        )
-
     def _on_expected_sources_changed(self, count: int) -> None:
         max_sources = max(len(self._cfg.channels) - 1, 1)
         normalized = min(max(1, int(count)), max_sources)
@@ -1110,21 +1073,6 @@ class MainWindow(QMainWindow):
             setter(normalized)
         self._log.info("UI action: expected_sources=%d", normalized)
         self._refresh_source_count_status({})
-
-    def _on_lcmv_test_toggled(self, enabled: bool) -> None:
-        active = bool(enabled)
-        self._cfg.lcmv_test_enabled = active
-        setter = getattr(self._worker, "set_lcmv_test_enabled", None)
-        if callable(setter):
-            setter(active)
-        self._log.info("UI action: lcmv_test_enabled=%s", active)
-        self._refresh_lcmv_test_status(
-            {
-                "lcmv_test": self._default_lcmv_test_status(active),
-            }
-        )
-        self._refresh_operator_summaries()
-        self._refresh_system_info()
 
     def _mark_rf_event(self, event: str) -> None:
         marker = str(event)
@@ -1151,9 +1099,9 @@ class MainWindow(QMainWindow):
     def _configured_feed_label(self) -> str:
         if not bool(self._cfg.gnss_sdr_enable):
             return "GNSS-SDR disabled"
-        if bool(self._cfg.lcmv_test_enabled):
-            return "LCMV Test IQ"
-        return "Uniform Array IQ"
+        # This is the fixed handoff architecture, not a claim that nulling is
+        # active. The read-only LCMV status reports arming/protection separately.
+        return "Automatic shared-beam IQ"
 
     def _active_operator_tab_index(self) -> int:
         tabs = getattr(self, "_operator_tabs", None)
@@ -1920,28 +1868,11 @@ class MainWindow(QMainWindow):
     # Status Chip Refresh
     # -------------------------------------------------------------------------
 
-    def _default_lcmv_test_status(self, enabled: bool) -> dict[str, object]:
-        if bool(enabled):
-            return {
-                "enabled": True,
-                "mode": "fallback",
-                "status": "FALLBACK",
-                "description": "Uniform fallback",
-                "fallback_reason": "waiting_for_stable_bladerf_reference",
-            }
-        return {
-            "enabled": False,
-            "mode": "off",
-            "status": "OFF",
-            "description": "Uniform beamformer",
-            "fallback_reason": "",
-        }
-
     def _refresh_lcmv_test_status(self, metrics: dict) -> None:
         status = metrics.get("lcmv_test", {}) if isinstance(metrics, dict) else {}
         if not isinstance(status, dict):
-            status = self._default_lcmv_test_status(bool(self._cfg.lcmv_test_enabled))
-        enabled = bool(status.get("enabled", self._cfg.lcmv_test_enabled))
+            status = {}
+        enabled = bool(status.get("enabled", False))
         mode = str(status.get("mode", "off")).strip().lower()
         reason = str(status.get("fallback_reason", "") or "").strip()
         spatial = status.get("spatial_vector_diagnostics", {})
@@ -1967,7 +1898,11 @@ class MainWindow(QMainWindow):
         transition_progress = valid_float(status.get("weight_transition_progress"))
 
         if not enabled or mode == "off":
-            value = "OFF: Uniform beamformer"
+            value = (
+                "WAITING: Automatic arming after healthy GNSS and stable reference"
+                if status
+                else "Automatic; waiting for backend status"
+            )
             color = INFO
         elif mode == "on":
             value = "ON: Covariance LCMV null active, current jammer protection active"
@@ -2014,7 +1949,7 @@ class MainWindow(QMainWindow):
 
         self._set_status_row(
             self._lcmv_test_status_label,
-            "LCMV Test Nulling",
+            "LCMV protection",
             value,
             color,
         )

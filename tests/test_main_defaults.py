@@ -82,7 +82,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.dsp_update_interval_s == 0.1
     assert cfg.prn_chart_update_interval_s == 0.1
     assert cfg.skyplot_update_interval_s == 0.1
-    assert cfg.lcmv_test_enabled is False
+    assert not hasattr(cfg, "lcmv_test_enabled")
     assert cfg.lcmv_condition_number_limit == 100_000_000.0
     assert cfg.lcmv_realtime_preserve_window_samples == 40
     assert cfg.lcmv_realtime_preserve_min_samples == 20
@@ -102,8 +102,8 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.lcmv_max_white_noise_gain_db == 15.0
     assert cfg.lcmv_min_predicted_jammer_suppression_db == 18.0
     assert cfg.lcmv_heavy_diagnostics_interval_s == 1.0
-    assert cfg.one_run_segmentation_enabled is True
-    assert cfg.lcmv_auto_arm_after_pvt is True
+    assert not hasattr(cfg, "one_run_segmentation_enabled")
+    assert not hasattr(cfg, "lcmv_auto_arm_after_pvt")
     assert cfg.process_every_n_chunks == 15
     assert cfg.samples_per_chunk == 32768
     assert cfg.gnss_feed_queue_maxsize == 512

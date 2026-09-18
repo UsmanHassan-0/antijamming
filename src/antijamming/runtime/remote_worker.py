@@ -97,15 +97,6 @@ class RemoteStreamWorker(QObject):
         except Exception as exc:
             self.failed.emit(f"Could not set MUSIC source count: {exc}")
 
-    def set_lcmv_test_enabled(self, enabled: bool) -> None:
-        try:
-            self._client.command(
-                "set_lcmv_test_enabled",
-                enabled=bool(enabled),
-            )
-        except Exception as exc:
-            self.failed.emit(f"Could not set LCMV test state: {exc}")
-
     def mark_rf_event(
         self,
         event: str,

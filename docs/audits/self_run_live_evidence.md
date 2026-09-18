@@ -27,21 +27,24 @@ The tracking archive uses the configured GNSS-SDR `TrackingMonitor` on UDP 1236 
 
 ## Core preservation and jammer cycle
 
-1. Leave LCMV off while the bladeRF-only baseline builds. Wait for current PVT and stable PRN bars. Use 120 seconds as the pre-jammer observation interval when the file duration permits.
+Updated 2026-09-14 for the automatic-only cleanup branch. This is a procedure,
+not a new hardware measurement; earlier dated runs retain their original controls.
+
+1. Let the bladeRF-only baseline build with uniform output. Wait for current PVT and stable PRN bars. Use 120 seconds as the pre-jammer observation interval when the file duration permits; automatic arming need not wait 120 seconds.
 2. Leave `MUSIC expected sources` at 1 for the bladeRF-only observation.
-3. Enable `LCMV Test Nulling`. This action is logged automatically. In the current measured-preserve mode, enable first freezes the fresh bladeRF U1/covariance and remains on uniform weights until both jammer activation gates pass.
+3. Observe automatic arming in the read-only LCMV protection status. It freezes the fresh bladeRF U1/covariance and remains uniform until both jammer activation gates pass. No LCMV enable command or button exists.
 4. Confirm that PVT, stable PRNs, C/N0, carrier/code tracking, and prompt correlators remain healthy with LCMV armed and the jammer still off.
 5. Physically turn the jammer on. The automatic evidence stream records the input-power jump, generalized-covariance change, activation decision, inferred state, DoA/MUSIC change, weight target and the complete smooth weight ramp. Optionally press `Record jammer ON` if a physically confirmed switch timestamp is needed.
 6. Initially keep MUSIC sources at 1 long enough to record the one-source spectrum. Then change it to 2 to record the two-source spectrum. Each source-count change is logged.
 7. Keep the jammer on for the intended observation interval. The application continuously records PVT snapshots and decimated carrier/code tracking; the GUI does not need to remain on one tab.
-8. Physically turn the jammer off. Automatic evidence continues while the activation latch remains retained and separately reports whether current power-plus-covariance evidence still passes. This distinguishes “earlier jammer-like event remains latched” from “current jammer-like evidence.” Optionally press `Record jammer OFF` for physical ground truth. Keep LCMV enabled and observe whether the wanted signal remains/recovers without a weight discontinuity.
-9. Disable LCMV and allow a fresh jammer-off bladeRF reference to build. Re-enable LCMV, verify preservation again, then repeat the physical jammer ON/marker/OFF/marker cycle. This is the required re-arm/recovery case.
+8. Physically turn the jammer off. Observe current protection releasing after valid lower evidence persists for the configured hold, and output transitioning toward uniform. Historical detection remains latched; it does not force protection to stay active. Optionally record the physical jammer-OFF timestamp. Observe receiver preservation/recovery separately.
+9. Repeat the physical jammer ON/OFF cycle in the same run: new evidence must reactivate protection without a manual command. Separately exercise Stop/Start with the jammer off; the new run must collect and automatically arm a new reference. This distinguishes reactivation from new-run re-arming.
 
 ## Additional robustness cases
 
 Run these only while enough IQ file time remains:
 
-- With LCMV already enabled, stop and restart bladeRF. Automatic power, GNSS and spatial-signature consequences are retained. Optional `Record bladeRF OFF/ON` markers identify the external process actions unambiguously. This does not claim that frozen weights can recreate a playback file after EOF.
+- With LCMV already armed automatically, stop and restart bladeRF. Automatic power, GNSS and spatial-signature consequences are retained. Optional `Record bladeRF OFF/ON` markers identify the external process actions unambiguously. This does not claim that frozen weights can recreate a playback file after EOF.
 - Move the active jammer, then record `tools/mark_rf_event.py --event jammer_moved --notes "physical position description"`. The GUI has ON/OFF buttons; the helper supplies the moved marker and free-form location note.
 - When external transmitter settings change, retain them in the external device's own evidence and use an optional marker note here only to timestamp the physical action.
 

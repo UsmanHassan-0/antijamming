@@ -122,14 +122,6 @@ class HeadlessRuntimeService:
                 raise ValueError("set_expected_sources requires an integer 'count'")
             self._backend.set_expected_sources(count)
             return {"accepted": True, "count": count}
-        if normalized == "set_lcmv_test_enabled":
-            enabled = arguments.get("enabled")
-            if type(enabled) is not bool:
-                raise ValueError(
-                    "set_lcmv_test_enabled requires a boolean 'enabled'"
-                )
-            self._backend.set_lcmv_test_enabled(enabled)
-            return {"accepted": True, "enabled": enabled}
         if normalized == "mark_rf_event":
             event = str(arguments["event"])
             result = self._backend.mark_rf_event(

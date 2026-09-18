@@ -61,7 +61,6 @@ class DummyWorker(QObject):
         self.stopped = False
         self.stop_reasons: list[str] = []
         self.expected_sources = 1
-        self.lcmv_test_enabled = False
         self.rf_events: list[tuple[str, dict[str, object]]] = []
 
     def start(self) -> None:
@@ -76,10 +75,6 @@ class DummyWorker(QObject):
     def set_expected_sources(self, count: int) -> None:
         self.expected_sources = int(count)
         self.status.emit(f"MUSIC sources: {int(count)}")
-
-    def set_lcmv_test_enabled(self, enabled: bool) -> None:
-        self.lcmv_test_enabled = bool(enabled)
-        self.status.emit(f"LCMV Test Nulling: {'ON' if enabled else 'OFF'}")
 
     def mark_rf_event(self, event: str, **kwargs: object) -> None:
         self.rf_events.append((str(event), dict(kwargs)))
@@ -472,7 +467,7 @@ def test_gui_single_run_button_toggles_start_stop(qtbot) -> None:
     assert [scroll.objectName() for scroll in scroll_areas] == ["antijamScrollArea"]
     assert scroll_areas[0].verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
     assert scroll_areas[0].horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    assert _plain_text(window._output_path_label) == "Output: Uniform Array IQ -> GNSS-SDR"
+    assert _plain_text(window._output_path_label) == "Output: Automatic shared-beam IQ -> GNSS-SDR"
     assert _plain_text(window._system_health_label) == "System health: Idle"
 
     window._run_btn.click()
@@ -715,12 +710,12 @@ def test_gui_shows_output_path_and_system_feed_info(qtbot) -> None:
     assert not hasattr(window, "_gnss_source_label")
     assert not hasattr(window, "_doa_angle_combo")
     assert not hasattr(window, "_jammer_detection_checkbox")
-    assert _plain_text(window._output_path_label) == "Output: Uniform Array IQ -> GNSS-SDR"
+    assert _plain_text(window._output_path_label) == "Output: Automatic shared-beam IQ -> GNSS-SDR"
     assert not _is_descendant(window._output_path_label, window._main_view)
     assert not _is_descendant(window._output_path_label, window._receiver_card)
     assert "GNSS feed:" not in _plain_text(window._system_info_label)
     assert "Input feed:" not in _plain_text(window._system_info_label)
-    assert "GNSS-SDR handoff: Uniform Array IQ" in (
+    assert "GNSS-SDR handoff: Automatic shared-beam IQ" in (
         _plain_text(window._system_info_label)
     )
 
@@ -729,7 +724,7 @@ def test_gui_shows_output_path_and_system_feed_info(qtbot) -> None:
     assert cfg.gnss_sdr_enable is True
 
 
-def test_gui_has_fixed_uniform_gnss_handoff(qtbot) -> None:
+def test_gui_has_fixed_automatic_shared_beam_handoff(qtbot) -> None:
     worker = DummyWorker()
     window = MainWindow(StreamConfig(), worker)  # type: ignore[arg-type]
     qtbot.addWidget(window)
@@ -738,13 +733,13 @@ def test_gui_has_fixed_uniform_gnss_handoff(qtbot) -> None:
     assert not hasattr(window, "_gnss_source_combo")
     assert not hasattr(window, "_gnss_source_label")
     assert "MUSIC sources:" in _plain_text(window._system_info_label)
-    assert "GNSS-SDR handoff: Uniform Array IQ" in _plain_text(
+    assert "GNSS-SDR handoff: Automatic shared-beam IQ" in _plain_text(
         window._system_info_label
     )
 
     window._refresh_system_info()
     assert "MUSIC sources:" in _plain_text(window._system_info_label)
-    assert "GNSS-SDR handoff: Uniform Array IQ" in _plain_text(
+    assert "GNSS-SDR handoff: Automatic shared-beam IQ" in _plain_text(
         window._system_info_label
     )
 
@@ -768,32 +763,27 @@ def test_gui_expected_sources_control_updates_runtime(qtbot) -> None:
     assert worker.expected_sources == 3
 
 
-def test_gui_lcmv_test_toggle_defaults_off_and_updates_runtime(qtbot) -> None:
-    cfg = StreamConfig(lcmv_test_enabled=False)
+def test_gui_lcmv_status_is_read_only_without_manual_controls(qtbot) -> None:
+    cfg = StreamConfig()
     worker = DummyWorker()
     window = MainWindow(cfg, worker)  # type: ignore[arg-type]
     qtbot.addWidget(window)
     window.show()
 
-    assert isinstance(window._lcmv_test_checkbox, QCheckBox)
-    assert window._lcmv_test_checkbox.isChecked() is False
-    assert cfg.lcmv_test_enabled is False
-    assert _is_descendant(window._lcmv_test_control, window._antijam_tab)
+    assert not hasattr(window, "_lcmv_test_checkbox")
+    assert not hasattr(window, "_lcmv_test_control")
+    assert not hasattr(window, "_on_lcmv_test_toggled")
+    assert not window._antijam_tab.findChildren(QCheckBox)
+    assert _is_descendant(window._lcmv_test_status_label, window._antijam_tab)
     assert _plain_text(window._lcmv_test_status_label) == (
-        "LCMV Test Nulling: OFF: Uniform beamformer"
+        "LCMV protection: Automatic; waiting for backend status"
     )
     assert _plain_text(window._lcmv_music_candidate_label) == (
         "MUSIC guard candidate (not null bearing): --"
     )
 
-    window._lcmv_test_checkbox.setChecked(True)
-
-    assert cfg.lcmv_test_enabled is True
-    assert worker.lcmv_test_enabled is True
-    assert "LCMV Test IQ" in _plain_text(window._system_info_label)
-    assert _plain_text(window._lcmv_test_status_label) == (
-        "LCMV Test Nulling: FALLBACK: Uniform fallback, waiting for stable bladerf reference"
-    )
+    assert not hasattr(worker, "set_lcmv_test_enabled")
+    assert "Automatic shared-beam IQ" in _plain_text(window._system_info_label)
 
 
 def test_gui_lcmv_status_distinguishes_armed_and_transitioning(qtbot) -> None:
@@ -987,7 +977,7 @@ def test_gui_idle_state_hides_redundant_detail_rows(qtbot) -> None:
     assert "IQ peak:" in operator_text
     assert "IQ RMS:" in operator_text
     assert "Near full scale:" in operator_text
-    assert "LCMV Test Nulling:" in operator_text
+    assert "LCMV protection:" in operator_text
     assert "Nulling strongest MUSIC peak" not in operator_text
     assert "System health:" in operator_text
     assert "Reason:" not in operator_text

@@ -160,9 +160,9 @@ class BackendRuntime:
         self._angle_scan = config.angle_scan_spec()
         self._scan_angles_deg = self._angle_scan.values()
         self._expected_sources = config.expected_sources
-        self._lcmv_test_enabled = bool(config.lcmv_test_enabled)
-        self._lcmv_auto_arm_after_pvt = bool(config.lcmv_auto_arm_after_pvt)
-        self._lcmv_auto_arm_suppressed_by_operator = False
+        # Private run state, never a config/GUI override. A new run must learn
+        # its own healthy reference before it can arm automatic protection.
+        self._lcmv_armed = False
         self._doa_log_interval_s = max(0.0, float(config.doa_log_interval_s))
         # Log timestamps throttle high-rate DSP state so logs remain useful
         # during long streams.
@@ -327,9 +327,9 @@ class BackendRuntime:
         self._beamformer_transition_completed_chunks = 0
         self._beamformer_transition_reason = "initial uniform weights"
         self._latest_lcmv_test = self._lcmv_status_snapshot(
-            enabled=self._lcmv_test_enabled,
-            mode="fallback" if self._lcmv_test_enabled else "off",
-            reason="waiting_for_music_peak" if self._lcmv_test_enabled else "",
+            enabled=self._lcmv_armed,
+            mode="off",
+            reason="waiting_for_healthy_pvt_and_reference",
         )
         self._latest_powers = np.zeros((len(config.channels),), dtype=np.float64)
         self._latest_phase_offsets = np.zeros((len(config.channels),), dtype=np.float64)
@@ -471,17 +471,6 @@ class BackendRuntime:
             self._latest_cal_power_metrics = {}
             self._latest_output_power_metrics = {}
             self._latest_spatial_vector_diagnostics = {}
-            self._healthy_reference_vector = None
-            self._healthy_reference_covariance = None
-            self._healthy_reference_internal_angle_deg = None
-            self._healthy_reference_display_bearing_deg = None
-            self._healthy_reference_updated_monotonic_s = None
-            self._healthy_reference_confidence = 0.0
-            self._healthy_reference_update_reason = ""
-            self._healthy_reference_freeze_reason = "run reset"
-            self._healthy_reference_raw_power_linear = None
-            self._healthy_reference_cal_power_linear = None
-            self._reset_realtime_preserve_tracker_locked("run reset")
             self._latest_phase_offsets = np.zeros((len(self._config.channels),), dtype=np.float64)
             self._latest_phase_offsets_raw = np.zeros((len(self._config.channels),), dtype=np.float64)
             self._latest_phase_offsets_calibrated = np.zeros(
@@ -495,15 +484,7 @@ class BackendRuntime:
             )
             self._latest_doa_raw_spectrum = np.zeros((self._config.doa_points,), dtype=np.float64)
             self._latest_doa_deg = float(self._config.doa_min_deg)
-        if self._lcmv_auto_arm_after_pvt:
-            # Each run must begin with a genuinely uniform, learnable
-            # baseline. The automatic transition is evaluated only after the
-            # new run has its own healthy PVT/U1/covariance evidence.
-            self._lcmv_test_enabled = False
-            self._config.lcmv_test_enabled = False
-            self._lcmv_auto_arm_suppressed_by_operator = False
-        self._set_beamformer_weights(uniform_weights(len(self._config.channels)))
-        self._reset_lcmv_test_for_run()
+        self._reset_lcmv_for_run()
         try:
             if self._config.logging_enabled:
                 self._emit_status("Preparing session logs")
@@ -1010,8 +991,8 @@ class BackendRuntime:
     def _lcmv_runtime_manifest(self) -> dict[str, object]:
         return {
             "event": "lcmv_runtime_manifest",
-            "lcmv_test_enabled": bool(self._lcmv_test_enabled),
-            "lcmv_auto_arm_after_pvt": bool(self._lcmv_auto_arm_after_pvt),
+            "lcmv_armed": bool(self._lcmv_armed),
+            "lcmv_arming_policy": "automatic_after_healthy_pvt",
             "configured_common_lcmv_method": ACTIVE_LCMV_METHOD,
             "preserve_strategy": "realtime_bladerf_measured_u1",
             "target_selection_strategy": "realtime_non_preserve_peak",
@@ -1401,7 +1382,7 @@ class BackendRuntime:
             ),
             "raw_chunk_count": int(self._raw_chunk_count),
             "physical_state_inference": inference,
-            "lcmv_enabled": bool(self._lcmv_test_enabled),
+            "lcmv_enabled": bool(self._lcmv_armed),
             "lcmv_mode": lcmv.get("mode"),
             "active_lcmv_method": lcmv.get("active_lcmv_method"),
             "active_lcmv_weights_source": lcmv.get("active_lcmv_weights_source"),
@@ -1796,7 +1777,7 @@ class BackendRuntime:
 
         primary = self._finite_metric_float(primary_internal_deg)
         with self._results_lock:
-            if self._lcmv_test_enabled:
+            if self._lcmv_armed:
                 self._realtime_preserve_last_update_reason = (
                     "tracker frozen while LCMV is enabled"
                 )
@@ -1883,207 +1864,6 @@ class BackendRuntime:
             )
             return self._realtime_preserve_tracker_payload_locked()
 
-    def set_lcmv_test_enabled(
-        self,
-        enabled: bool,
-        *,
-        source: str = "operator",
-    ) -> None:
-        with self._lcmv_control_lock:
-            self._set_lcmv_test_enabled_locked(enabled, source=source)
-
-    def _set_lcmv_test_enabled_locked(
-        self,
-        enabled: bool,
-        *,
-        source: str,
-    ) -> None:
-        active = bool(enabled)
-        normalized_source = str(source).strip().lower() or "operator"
-        if normalized_source == "operator":
-            self._lcmv_auto_arm_suppressed_by_operator = not active
-        self._set_shared_measured_u1_protection_weights(
-            uniform_weights(len(self._config.channels)), available=False
-        )
-        frozen_reason = ""
-        with self._results_lock:
-            if active:
-                center = self._realtime_preserve_center_internal_deg
-                healthy_vector = (
-                    normalize_complex_vector(self._healthy_reference_vector)
-                    if self._healthy_reference_vector is not None
-                    else np.zeros((0,), dtype=np.complex128)
-                )
-                healthy_covariance = (
-                    np.asarray(self._healthy_reference_covariance, dtype=np.complex128)
-                    if self._healthy_reference_covariance is not None
-                    else np.zeros((0, 0), dtype=np.complex128)
-                )
-                reference_age_s = (
-                    time.monotonic() - self._healthy_reference_updated_monotonic_s
-                    if self._healthy_reference_updated_monotonic_s is not None
-                    else None
-                )
-                reference_angle_error_deg = (
-                    self._angle_distance_deg(
-                        center,
-                        self._healthy_reference_internal_angle_deg,
-                    )
-                    if center is not None
-                    and self._healthy_reference_internal_angle_deg is not None
-                    else None
-                )
-                max_reference_age_s = max(
-                    0.0,
-                    float(self._config.lcmv_realtime_preserve_max_reference_age_s),
-                )
-                max_reference_angle_error_deg = max(
-                    0.0,
-                    float(self._config.lcmv_realtime_preserve_guard_deg),
-                )
-                reference_ready = (
-                    healthy_vector.size == len(self._config.channels)
-                    and healthy_covariance.shape
-                    == (len(self._config.channels), len(self._config.channels))
-                    and reference_age_s is not None
-                    and reference_age_s <= max_reference_age_s
-                    and reference_angle_error_deg is not None
-                    and reference_angle_error_deg <= max_reference_angle_error_deg
-                    and self._healthy_reference_confidence >= 0.8
-                )
-                if self._realtime_preserve_stable and center is not None and reference_ready:
-                    self._realtime_preserve_frozen_internal_deg = float(
-                        center
-                    )
-                    self._realtime_preserve_frozen_display_deg = (
-                        internal_angle_to_operator_bearing_deg(
-                            self._realtime_preserve_frozen_internal_deg
-                        )
-                    )
-                    self._realtime_preserve_frozen_vector = np.array(
-                        healthy_vector,
-                        copy=True,
-                    )
-                    self._realtime_preserve_frozen_covariance = np.array(
-                        healthy_covariance,
-                        copy=True,
-                    )
-                    self._realtime_preserve_frozen_raw_power_linear = (
-                        self._healthy_reference_raw_power_linear
-                    )
-                    self._realtime_preserve_frozen_cal_power_linear = (
-                        self._healthy_reference_cal_power_linear
-                    )
-                    self._realtime_preserve_frozen_reference_age_s = reference_age_s
-                    self._realtime_preserve_frozen_reference_angle_error_deg = (
-                        reference_angle_error_deg
-                    )
-                    self._lcmv_jammer_detected_latched = False
-                    self._lcmv_jammer_protection_active = False
-                    self._lcmv_jammer_release_candidate_since_monotonic_s = None
-                    frozen_reason = (
-                        "armed on uniform weights with frozen measured bladeRF U1 "
-                        f"internal={self._realtime_preserve_frozen_internal_deg:.2f} deg "
-                        f"display={self._realtime_preserve_frozen_display_deg:.2f} deg "
-                        f"reference_age={reference_age_s:.2f} s "
-                        f"angle_error={reference_angle_error_deg:.2f} deg; "
-                        "waiting for jammer evidence"
-                    )
-                else:
-                    self._realtime_preserve_frozen_internal_deg = None
-                    self._realtime_preserve_frozen_display_deg = None
-                    self._realtime_preserve_frozen_vector = None
-                    self._realtime_preserve_frozen_covariance = None
-                    self._realtime_preserve_frozen_raw_power_linear = None
-                    self._realtime_preserve_frozen_cal_power_linear = None
-                    self._realtime_preserve_frozen_reference_age_s = reference_age_s
-                    self._realtime_preserve_frozen_reference_angle_error_deg = (
-                        reference_angle_error_deg
-                    )
-                    self._lcmv_jammer_detected_latched = False
-                    self._lcmv_jammer_protection_active = False
-                    self._lcmv_jammer_release_candidate_since_monotonic_s = None
-                    blockers: list[str] = []
-                    if not self._realtime_preserve_stable or center is None:
-                        blockers.append("live angle cluster is not stable")
-                    if healthy_vector.size != len(self._config.channels):
-                        blockers.append("measured bladeRF U1 is unavailable")
-                    if healthy_covariance.shape != (
-                        len(self._config.channels),
-                        len(self._config.channels),
-                    ):
-                        blockers.append("jammer-off covariance is unavailable")
-                    if reference_age_s is None or reference_age_s > max_reference_age_s:
-                        blockers.append("measured bladeRF U1 is stale")
-                    if (
-                        reference_angle_error_deg is None
-                        or reference_angle_error_deg > max_reference_angle_error_deg
-                    ):
-                        blockers.append("measured U1 does not match the live angle cluster")
-                    if self._healthy_reference_confidence < 0.8:
-                        blockers.append("healthy reference confidence is below 0.8")
-                    frozen_reason = "; ".join(blockers) or "bladeRF reference unavailable"
-            else:
-                self._reset_realtime_preserve_tracker_locked(
-                    "LCMV disabled; collecting a new jammer-off bladeRF angle cluster"
-                )
-        self._lcmv_test_enabled = active
-        self._config.lcmv_test_enabled = active
-        if not active:
-            self._schedule_beamformer_weights(
-                uniform_weights(len(self._config.channels)),
-                reason="operator disabled LCMV; smooth return to uniform",
-            )
-            self._set_lcmv_status(
-                enabled=False,
-                mode="off",
-                reason="",
-            )
-            self._lcmv_log.info(
-                "lcmv_test action=%s enabled=False mode=off "
-                "weights=uniform_array_sum",
-                normalized_source,
-            )
-            self._record_runtime_event(
-                "lcmv_off",
-                source=f"backend_control:{normalized_source}",
-                notes="LCMV disabled; smooth transition to uniform weights scheduled",
-            )
-            self._emit_status("LCMV Test Nulling: OFF")
-            return
-
-        self._set_beamformer_weights(uniform_weights(len(self._config.channels)))
-        enable_diag: dict[str, object] = {}
-        enable_diag = self._realtime_preserve_tracker_payload()
-        enable_diag["lcmv_jammer_activation_armed"] = bool(
-            enable_diag.get("realtime_bladerf_angle_frozen", False)
-        )
-        self._set_lcmv_status(
-            enabled=True,
-            mode="fallback",
-            reason=frozen_reason,
-            spatial_vector_diagnostics=enable_diag,
-        )
-        self._lcmv_log.info(
-            "lcmv_test action=%s enabled=True mode=fallback "
-            "reason=%s weights=uniform_array_sum "
-            "weight_transition=armed_uniform_waiting_for_valid_target",
-            normalized_source,
-            frozen_reason or "waiting_for_music_peak",
-        )
-        self._record_runtime_event(
-            "lcmv_on",
-            source=f"backend_control:{normalized_source}",
-            notes=(
-                frozen_reason
-                or "LCMV armed in uniform fallback while waiting for a valid target"
-            ),
-        )
-        self._emit_status(
-            "LCMV armed automatically after healthy PVT"
-            if normalized_source == "auto_after_pvt"
-            else "LCMV Test Nulling: ON"
-        )
 
     # -------------------------------------------------------------------------
     # Callback Emission
@@ -3174,7 +2954,7 @@ class BackendRuntime:
         with self._results_lock:
             protection_active = bool(self._lcmv_jammer_protection_active)
             jammer_latched = bool(self._lcmv_jammer_detected_latched)
-        enabled_now = bool(self._lcmv_test_enabled and protection_active)
+        enabled_now = bool(self._lcmv_armed and protection_active)
         common = self._get_beamformer_target_weights_copy()
         protection = self._get_shared_measured_u1_protection_weights_copy()
         logical, status = bank.advance(
@@ -3276,39 +3056,47 @@ class BackendRuntime:
         return "shared_prn_phase_continuity_fanout"
 
     # -------------------------------------------------------------------------
-    # Operator-Controlled LCMV Test Mode
+    # Automatic LCMV Protection
     # -------------------------------------------------------------------------
 
-    def _reset_lcmv_test_for_run(self) -> None:
-        self._spatial_diag_seq = 0
-        self._set_shared_measured_u1_protection_weights(
-            uniform_weights(len(self._config.channels)),
-            available=False,
-        )
-        with self._beamformer_lock:
-            self._latest_shared_u1_phase_logical_weights = np.empty(
-                (0, len(self._config.channels)),
-                dtype=np.complex128,
-            )
-        self._last_lcmv_heavy_diag_ts = None
-        self._latest_lcmv_heavy_diag_payload = {
-            "heavy_diagnostics_interval_s": self._json_float(
-                self._config.lcmv_heavy_diagnostics_interval_s
-            ),
-            "heavy_diagnostics_emitted": False,
-            "heavy_diagnostics_skipped_due_to_throttle": False,
-            "last_heavy_diagnostics_age_s": None,
-        }
-        with self._results_lock:
-            self._latest_spatial_vector_diagnostics = {}
-        if self._lcmv_test_enabled:
+    def _reset_lcmv_for_run(self) -> None:
+        """Start uniform and require a new healthy reference for the new run."""
+
+        with self._lcmv_control_lock:
+            self._lcmv_armed = False
+            self._spatial_diag_seq = 0
+            weights = uniform_weights(len(self._config.channels))
+            self._set_beamformer_weights(weights)
+            self._set_shared_measured_u1_protection_weights(weights, available=False)
+            with self._beamformer_lock:
+                self._latest_shared_u1_phase_logical_weights = np.empty(
+                    (0, len(self._config.channels)), dtype=np.complex128
+                )
+            self._last_lcmv_heavy_diag_ts = None
+            self._latest_lcmv_heavy_diag_payload = {
+                "heavy_diagnostics_interval_s": self._json_float(
+                    self._config.lcmv_heavy_diagnostics_interval_s
+                ),
+                "heavy_diagnostics_emitted": False,
+                "heavy_diagnostics_skipped_due_to_throttle": False,
+                "last_heavy_diagnostics_age_s": None,
+            }
+            with self._results_lock:
+                self._latest_spatial_vector_diagnostics = {}
+                self._healthy_reference_vector = None
+                self._healthy_reference_covariance = None
+                self._healthy_reference_internal_angle_deg = None
+                self._healthy_reference_display_bearing_deg = None
+                self._healthy_reference_updated_monotonic_s = None
+                self._healthy_reference_confidence = 0.0
+                self._healthy_reference_update_reason = ""
+                self._healthy_reference_freeze_reason = "run reset"
+                self._healthy_reference_raw_power_linear = None
+                self._healthy_reference_cal_power_linear = None
+                self._reset_realtime_preserve_tracker_locked("run reset")
             self._set_lcmv_status(
-                enabled=True,
-                mode="fallback",
-                reason="waiting_for_music_peak",
+                enabled=False, mode="off", reason="waiting_for_healthy_pvt_and_reference"
             )
-            return
-        self._set_lcmv_status(enabled=False, mode="off", reason="")
 
     def _lcmv_status_snapshot(
         self,
@@ -3965,7 +3753,7 @@ class BackendRuntime:
         pvt_ok = pvt_current and (status_has_fix or pvt_status == "")
         lcmv_status = self._lcmv_status_copy()
         lcmv_safe_baseline = (
-            not self._lcmv_test_enabled
+            not self._lcmv_armed
             and str(lcmv_status.get("mode", "off")) == "off"
         )
         healthy_score = float(
@@ -4150,42 +3938,12 @@ class BackendRuntime:
             "cal_power_jump_db": self._json_float(cal_power_jump_db),
             "suspicious_source_structure": bool(suspicious_source_structure),
             "warning_lcmv_on_while_jammer_confidence_low": bool(
-                self._lcmv_test_enabled and jammer_confidence < 0.25
+                self._lcmv_armed and jammer_confidence < 0.25
             ),
             "warning_active_null_may_target_healthy_reference": bool(
                 healthy_vec.size and coherence is not None and coherence > 0.85
             ),
         }
-
-    def _run_state_payload(
-        self,
-        *,
-        corrected_chunk: np.ndarray,
-        music_internal_deg: float,
-        music_bearing_deg: float,
-        u1: np.ndarray,
-        raw_power_metrics: dict[str, object] | None,
-        cal_power_metrics: dict[str, object] | None,
-        covariance_matrix: np.ndarray | None = None,
-    ) -> dict[str, object]:
-        if not bool(self._config.one_run_segmentation_enabled):
-            return {
-                "run_state_label": "unknown",
-                "run_state_confidence": 0.0,
-                "state_reason": "one-run segmentation disabled",
-                "run_state_reason": "one-run segmentation disabled",
-                "jammer_confidence_score": 0.0,
-                "healthy_confidence_score": 0.0,
-            }
-        return self._update_healthy_reference_from_chunk(
-            corrected_chunk=corrected_chunk,
-            music_internal_deg=music_internal_deg,
-            music_bearing_deg=music_bearing_deg,
-            u1=u1,
-            raw_power_metrics=raw_power_metrics,
-            cal_power_metrics=cal_power_metrics,
-            covariance_matrix=covariance_matrix,
-        )
 
     def _lcmv_jammer_activation_evidence(
         self,
@@ -4201,7 +3959,7 @@ class BackendRuntime:
         Once active, it releases only when both valid metrics stay below the
         lower thresholds for the configured hold. Ambiguous/missing metrics
         retain active protection and reset the release timer. The historical
-        detection latch remains set until LCMV is disabled.
+        detection latch remains set until the next run resets the reference.
         """
 
         with self._results_lock:
@@ -4370,7 +4128,7 @@ class BackendRuntime:
     ) -> dict[str, object]:
         """Track and log the healthy reference while the active combiner is uniform."""
 
-        if self._lcmv_test_enabled:
+        if self._lcmv_armed:
             return {}
         corrected = np.asarray(corrected_chunk, dtype=np.complex128)
         covariance = (
@@ -4390,7 +4148,7 @@ class BackendRuntime:
             if eigenvectors.ndim == 2 and eigenvectors.shape[1] > 0
             else np.zeros((0,), dtype=np.complex128)
         )
-        run_state = self._run_state_payload(
+        run_state = self._update_healthy_reference_from_chunk(
             corrected_chunk=corrected,
             music_internal_deg=music_internal_deg,
             music_bearing_deg=music_bearing_deg,
@@ -4462,12 +4220,7 @@ class BackendRuntime:
         with self._results_lock:
             self._latest_spatial_vector_diagnostics = dict(payload)
         auto_armed = self._maybe_auto_arm_lcmv_after_pvt(run_state)
-        payload["lcmv_auto_arm_after_pvt"] = bool(
-            self._lcmv_auto_arm_after_pvt
-        )
-        payload["lcmv_auto_arm_suppressed_by_operator"] = bool(
-            self._lcmv_auto_arm_suppressed_by_operator
-        )
+        payload["lcmv_arming_policy"] = "automatic_after_healthy_pvt"
         payload["lcmv_auto_arm_triggered"] = bool(auto_armed)
         if auto_armed:
             with self._results_lock:
@@ -4478,80 +4231,127 @@ class BackendRuntime:
         self,
         run_state: dict[str, object],
     ) -> bool:
-        """Freeze the healthy reference and arm LCMV once per live run.
+        """Freeze a qualified healthy reference once per run, without nulling.
 
-        Arming leaves uniform weights on the GNSS stream. The existing jammer
-        evidence/release state remains solely responsible for allowing null
-        weights to become active.
+        The control lock serializes arming, run reset and solver publication.
+        The results lock keeps reference validation and its frozen copy atomic.
+        Jammer activation/release remains separate from this automatic arming.
         """
 
-        if (
-            not self._lcmv_auto_arm_after_pvt
-            or self._lcmv_auto_arm_suppressed_by_operator
-            or self._lcmv_test_enabled
-            or not bool(run_state.get("healthy_reference_updated", False))
-            or not bool(run_state.get("pvt_healthy", False))
-            or not bool(run_state.get("observations_healthy", False))
-            or not bool(run_state.get("cn0_healthy", False))
-        ):
-            return False
+        with self._lcmv_control_lock:
+            if (
+                self._lcmv_armed
+                or self._stop_requested.is_set()
+                or not bool(run_state.get("healthy_reference_updated", False))
+                or not bool(run_state.get("pvt_healthy", False))
+                or not bool(run_state.get("observations_healthy", False))
+                or not bool(run_state.get("cn0_healthy", False))
+            ):
+                return False
 
-        now = time.monotonic()
-        channel_count = len(self._config.channels)
-        max_age_s = max(
-            0.0,
-            float(self._config.lcmv_realtime_preserve_max_reference_age_s),
-        )
-        max_angle_error_deg = max(
-            0.0,
-            float(self._config.lcmv_realtime_preserve_guard_deg),
-        )
-        with self._results_lock:
-            center = self._realtime_preserve_center_internal_deg
-            reference_angle = self._healthy_reference_internal_angle_deg
-            reference_age_s = (
-                now - self._healthy_reference_updated_monotonic_s
-                if self._healthy_reference_updated_monotonic_s is not None
-                else None
+            channel_count = len(self._config.channels)
+            max_age_s = max(
+                0.0, float(self._config.lcmv_realtime_preserve_max_reference_age_s)
             )
-            angle_error_deg = (
-                self._angle_distance_deg(center, reference_angle)
-                if center is not None and reference_angle is not None
-                else None
+            max_angle_error_deg = max(
+                0.0, float(self._config.lcmv_realtime_preserve_guard_deg)
             )
-            vector_ready = bool(
-                self._healthy_reference_vector is not None
-                and np.asarray(self._healthy_reference_vector).size == channel_count
-            )
-            covariance_ready = bool(
-                self._healthy_reference_covariance is not None
-                and np.asarray(self._healthy_reference_covariance).shape
-                == (channel_count, channel_count)
-            )
-            ready = bool(
-                self._realtime_preserve_stable
-                and center is not None
-                and vector_ready
-                and covariance_ready
-                and reference_age_s is not None
-                and 0.0 <= reference_age_s <= max_age_s
-                and angle_error_deg is not None
-                and angle_error_deg <= max_angle_error_deg
-                and self._healthy_reference_confidence >= 0.8
-            )
-        if not ready:
-            return False
+            with self._results_lock:
+                center = self._realtime_preserve_center_internal_deg
+                reference_angle = self._healthy_reference_internal_angle_deg
+                reference_age_s = (
+                    time.monotonic() - self._healthy_reference_updated_monotonic_s
+                    if self._healthy_reference_updated_monotonic_s is not None
+                    else None
+                )
+                angle_error_deg = (
+                    self._angle_distance_deg(center, reference_angle)
+                    if center is not None and reference_angle is not None
+                    else None
+                )
+                vector = (
+                    np.asarray(self._healthy_reference_vector, dtype=np.complex128)
+                    if self._healthy_reference_vector is not None
+                    else np.empty((0,), dtype=np.complex128)
+                )
+                covariance = (
+                    np.asarray(self._healthy_reference_covariance, dtype=np.complex128)
+                    if self._healthy_reference_covariance is not None
+                    else np.empty((0, 0), dtype=np.complex128)
+                )
+                normalized_vector = normalize_complex_vector(vector)
+                ready = (
+                    self._realtime_preserve_stable
+                    and center is not None
+                    and np.isfinite(center)
+                    and vector.shape == (channel_count,)
+                    and normalized_vector.size == channel_count
+                    and covariance.shape == (channel_count, channel_count)
+                    and np.all(np.isfinite(covariance))
+                    and reference_age_s is not None
+                    and 0.0 <= reference_age_s <= max_age_s
+                    and angle_error_deg is not None
+                    and angle_error_deg <= max_angle_error_deg
+                    and np.isfinite(self._healthy_reference_confidence)
+                    and self._healthy_reference_confidence >= 0.8
+                )
+                if not ready:
+                    return False
 
-        self._lcmv_log.info(
-            "lcmv_auto_arm decision=arm_after_healthy_pvt "
-            "output_before_arm=uniform_array_sum pvt_healthy=true "
-            "observations_healthy=true cn0_healthy=true reference_age_s=%.3f "
-            "reference_angle_error_deg=%.3f",
-            float(reference_age_s),
-            float(angle_error_deg),
-        )
-        self.set_lcmv_test_enabled(True, source="auto_after_pvt")
-        return bool(self._lcmv_test_enabled)
+                self._realtime_preserve_frozen_internal_deg = float(center)
+                self._realtime_preserve_frozen_display_deg = (
+                    internal_angle_to_operator_bearing_deg(float(center))
+                )
+                self._realtime_preserve_frozen_vector = np.array(
+                    normalized_vector, copy=True
+                )
+                self._realtime_preserve_frozen_covariance = np.array(covariance, copy=True)
+                self._realtime_preserve_frozen_raw_power_linear = (
+                    self._healthy_reference_raw_power_linear
+                )
+                self._realtime_preserve_frozen_cal_power_linear = (
+                    self._healthy_reference_cal_power_linear
+                )
+                self._realtime_preserve_frozen_reference_age_s = reference_age_s
+                self._realtime_preserve_frozen_reference_angle_error_deg = angle_error_deg
+                self._lcmv_jammer_detected_latched = False
+                self._lcmv_jammer_protection_active = False
+                self._lcmv_jammer_release_candidate_since_monotonic_s = None
+                self._lcmv_armed = True
+
+            # Arming is not activation: all output remains uniform until the
+            # independent power/covariance gates accept jammer evidence.
+            weights = uniform_weights(channel_count)
+            self._set_beamformer_weights(weights)
+            self._set_shared_measured_u1_protection_weights(weights, available=False)
+            reason = (
+                "armed on uniform weights with frozen measured bladeRF U1 "
+                f"internal={center:.2f} deg reference_age={reference_age_s:.2f} s "
+                f"angle_error={angle_error_deg:.2f} deg; waiting for jammer evidence"
+            )
+            diagnostics = self._realtime_preserve_tracker_payload()
+            diagnostics["lcmv_jammer_activation_armed"] = True
+            self._set_lcmv_status(
+                enabled=True,
+                mode="fallback",
+                reason=reason,
+                spatial_vector_diagnostics=diagnostics,
+            )
+            self._lcmv_log.info(
+                "lcmv_auto_arm decision=arm_after_healthy_pvt "
+                "output_before_arm=uniform_array_sum pvt_healthy=true "
+                "observations_healthy=true cn0_healthy=true reference_age_s=%.3f "
+                "reference_angle_error_deg=%.3f",
+                reference_age_s,
+                angle_error_deg,
+            )
+            self._record_runtime_event(
+                "lcmv_on",
+                source="backend_auto_after_pvt",
+                notes=reason,
+            )
+            self._emit_status("LCMV armed automatically after healthy PVT")
+            return True
 
     def _spatial_vector_diagnostics_payload(
         self,
@@ -4913,7 +4713,7 @@ class BackendRuntime:
         covariance_eigenvalues: np.ndarray | None = None,
         covariance_eigenvectors: np.ndarray | None = None,
     ) -> None:
-        if not self._lcmv_test_enabled:
+        if not self._lcmv_armed:
             return
 
         # Jammer release must still be evaluated when MUSIC no longer emits an
@@ -5044,7 +4844,7 @@ class BackendRuntime:
                 if eigenvectors.ndim == 2 and eigenvectors.shape[1] > 0
                 else np.zeros((0,), dtype=np.complex128)
             )
-            run_state_payload = self._run_state_payload(
+            run_state_payload = self._update_healthy_reference_from_chunk(
                 corrected_chunk=corrected,
                 music_internal_deg=music_internal,
                 music_bearing_deg=music_bearing,
