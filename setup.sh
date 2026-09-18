@@ -713,7 +713,9 @@ ensure_x300_hg_image_loaded() {
     fi
   else
     probe_status=$?
-    if (( probe_status >= 124 )) \
+    # UHD_SAFE_MAIN returns -1 (shell status 255) for a diagnosed exception.
+    # timeout/exec/signal statuses must not authorize a flash from partial text.
+    if (( probe_status != 1 && probe_status != 255 )) \
       || ! grep -Eiq 'compat(ibility)? (number |version )?mismatch|FPGA component .*revision|Expected FPGA compatibility|FPGA.*compatibility.*(expected|actual)' <<<"${probe_text}"; then
       printf '%s\n' "${probe_text}" >&2
       echo "USRP initialization failed or was interrupted; no completed compatibility diagnosis, no write attempted." >&2

@@ -85,10 +85,11 @@ def test_hg_requires_real_initialization_before_ready(tmp_path: Path) -> None:
         "Expected FPGA compatibility number 39, but got 38",
     ],
 )
+@pytest.mark.parametrize("probe_status", [1, 255])
 def test_hg_mismatch_writes_verified_image_but_never_reports_ready(
-    tmp_path: Path, message: str
+    tmp_path: Path, message: str, probe_status: int
 ) -> None:
-    result = run_check(tmp_path, probe_status=1, probe_text=message)
+    result = run_check(tmp_path, probe_status=probe_status, probe_text=message)
     calls = (tmp_path / "calls").read_text()
     assert result.returncode == 2
     assert "serial=35D068D,fpga=HG,verify" in calls
