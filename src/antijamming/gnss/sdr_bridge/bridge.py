@@ -157,7 +157,6 @@ class GnssSdrBridge(
         self._nmea_tty_last_monotonic_s: float | None = None
         self._latest_tracking_monitor_by_prn: dict[_SatKey, dict[str, object]] = {}
         self._latest_observables_by_prn: dict[_SatKey, dict[str, object]] = {}
-        self._latest_truth_position = self._load_truth_position()
         self._recent_receiver_events: dict[str, float] = {}
         self._output_io_refresh_ts = 0.0
         self._output_io_metrics: dict[str, object] = {}
@@ -173,7 +172,6 @@ class GnssSdrBridge(
         self._last_snapshot_perf_log_ts = 0.0
 
         # Accuracy display cache.
-        self._truth_warning_logged = False
         self._latest_accuracy: dict[str, object] = {}
         self._latest_accuracy_observed_monotonic_s: float | None = None
 

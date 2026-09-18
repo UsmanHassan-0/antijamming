@@ -1920,12 +1920,12 @@ def test_bridge_expires_pvt_accuracy_cache(tmp_path: Path) -> None:
 
     bridge._pvt_output_seen = True
     bridge._pvt_observed_monotonic_s = now
-    bridge._latest_accuracy = {"fix_type": "3D Fix", "three_d_error_m": 1.5}
+    bridge._latest_accuracy = {"fix_type": "3D Fix", "cep50_m": 1.5}
     bridge._latest_accuracy_observed_monotonic_s = now
     fresh_snapshot = bridge.snapshot()
 
     assert fresh_snapshot["pvt_current"] is True
-    assert fresh_snapshot["accuracy"] == {"fix_type": "3D Fix", "three_d_error_m": 1.5}
+    assert fresh_snapshot["accuracy"] == {"fix_type": "3D Fix", "cep50_m": 1.5}
 
     old = time.monotonic() - PVT_ACCURACY_TIMEOUT_S - 1.0
     bridge._pvt_observed_monotonic_s = old
@@ -2361,9 +2361,6 @@ def test_bridge_pvt_output_seen_requires_pvt_monitor_udp(tmp_path: Path) -> None
 def test_bridge_reads_pvt_monitor_udp_for_accuracy_and_valid_sat_count(tmp_path: Path) -> None:
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
-        gnss_truth_static_lat_deg=33.6844,
-        gnss_truth_static_lon_deg=73.0479,
-        gnss_truth_static_alt_m=540.0,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
     bridge._handle_monitor_pvt_message(
@@ -2403,7 +2400,8 @@ def test_bridge_reads_pvt_monitor_udp_for_accuracy_and_valid_sat_count(tmp_path:
     assert accuracy["pdop"] == pytest.approx(2.4)
     assert accuracy["gdop"] == pytest.approx(2.8)
     assert accuracy["valid_sats"] == pytest.approx(7)
-    assert "horizontal_error_m" in accuracy
+    assert accuracy["cep_reference"] == "run_mean"
+    assert "horizontal_error_m" not in accuracy
     assert "three_d_uncertainty_1sigma_m" not in accuracy
     assert accuracy["pvt_solution"]["ecef_x_m"] == pytest.approx(1.0)
     assert accuracy["pvt_solution"]["rx_time_s"] == pytest.approx(123.0)
@@ -2478,12 +2476,9 @@ def test_bridge_reads_observables_monitor_udp_into_snapshot_and_prn_fields(tmp_p
     assert prn["observable_cno_db_hz"] == pytest.approx(43.25)
 
 
-def test_bridge_builds_pvt_accuracy_snapshot_from_truth_and_dops(tmp_path: Path) -> None:
+def test_bridge_builds_pvt_coordinate_snapshot_and_dops(tmp_path: Path) -> None:
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
-        gnss_truth_static_lat_deg=33.6844,
-        gnss_truth_static_lon_deg=73.0479,
-        gnss_truth_static_alt_m=540.0,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
 
@@ -2501,7 +2496,8 @@ def test_bridge_builds_pvt_accuracy_snapshot_from_truth_and_dops(tmp_path: Path)
         ]
     )
     assert accuracy["fix_type"] == "3D Fix"
-    assert accuracy["truth_available"] is True
+    assert accuracy["cep_reference"] == "run_mean"
+    assert accuracy["cep_ready"] is False
     assert accuracy["utm_easting_m"] == pytest.approx(319050.1875)
     assert accuracy["utm_northing_m"] == pytest.approx(3728874.3543)
     assert accuracy["utm_zone"] == "43N"
@@ -2509,7 +2505,7 @@ def test_bridge_builds_pvt_accuracy_snapshot_from_truth_and_dops(tmp_path: Path)
     assert "local_east_m" not in accuracy
     assert "local_north_m" not in accuracy
     assert "local_up_m" not in accuracy
-    assert "horizontal_error_m" in accuracy
+    assert "horizontal_error_m" not in accuracy
     assert "three_d_uncertainty_1sigma_m" not in accuracy
 
 
@@ -2518,18 +2514,15 @@ def test_bridge_reports_empirical_cep_only_after_accuracy_window_is_full(
 ) -> None:
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
-        gnss_truth_static_lat_deg=0.0,
-        gnss_truth_static_lon_deg=0.0,
-        gnss_truth_static_alt_m=0.0,
         gnss_accuracy_window_points=4,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
-    meters_per_lon_at_equator = 111_132.954 - 93.5 + 0.118
+    meters_per_lon_at_equator = np.pi * 6_378_137.0 / 180.0
 
-    def point(east_error_m: float) -> dict[str, float]:
+    def point(east_position_m: float) -> dict[str, float]:
         return {
             "latitude": 0.0,
-            "longitude": east_error_m / meters_per_lon_at_equator,
+            "longitude": east_position_m / meters_per_lon_at_equator,
             "altitude": 0.0,
         }
 
@@ -2546,27 +2539,24 @@ def test_bridge_reports_empirical_cep_only_after_accuracy_window_is_full(
     )
     assert ready["cep_ready"] is True
     assert ready["cep_sample_count"] == 4
-    assert ready["cep50_m"] == pytest.approx(2.0)
-    assert ready["cep95_m"] == pytest.approx(100.0)
+    assert ready["cep50_m"] == pytest.approx(24.5, abs=1e-6)
+    assert ready["cep95_m"] == pytest.approx(73.5, abs=1e-6)
 
     # A fifth fix must be included instead of retaining only the configured
-    # four-point warm-up count. With all five radii the median is 3 m; a
-    # four-point rolling window would incorrectly report 2 m.
+    # four-point warm-up count. The five-fix mean is22m and median radius20m;
+    # the last four alone would instead give24.75m.
     cumulative = bridge._build_accuracy_snapshot(
         [point(3.0), point(1.0), point(100.0), point(2.0), point(4.0)]
     )
     assert cumulative["accuracy_window_points"] == 5
     assert cumulative["cep_sample_count"] == 5
-    assert cumulative["cep50_m"] == pytest.approx(3.0)
-    assert cumulative["cep95_m"] == pytest.approx(100.0)
+    assert cumulative["cep50_m"] == pytest.approx(20.0, abs=1e-6)
+    assert cumulative["cep95_m"] == pytest.approx(78.0, abs=1e-6)
 
 
-def test_bridge_cep_stays_unavailable_without_configured_truth(tmp_path: Path) -> None:
+def test_bridge_cep_is_available_from_received_positions_only(tmp_path: Path) -> None:
     cfg = StreamConfig(
         gnss_sdr_runtime_dir=_fifo_runtime_dir(tmp_path),
-        gnss_truth_static_lat_deg=None,
-        gnss_truth_static_lon_deg=None,
-        gnss_truth_static_alt_m=None,
         gnss_accuracy_window_points=2,
     )
     bridge = GnssSdrBridge(cfg, _loggers())
@@ -2578,11 +2568,11 @@ def test_bridge_cep_stays_unavailable_without_configured_truth(tmp_path: Path) -
         ]
     )
 
-    assert accuracy["truth_available"] is False
-    assert accuracy["cep_ready"] is False
-    assert accuracy["cep_sample_count"] == 0
-    assert "cep50_m" not in accuracy
-    assert "cep95_m" not in accuracy
+    assert "truth_available" not in accuracy
+    assert accuracy["cep_ready"] is True
+    assert accuracy["cep_sample_count"] == 2
+    assert accuracy["cep50_m"] > 0
+    assert accuracy["cep95_m"] == pytest.approx(accuracy["cep50_m"])
 
 
 def test_bridge_reset_runtime_dir_clears_runtime_and_separate_glog_dir(tmp_path: Path) -> None:

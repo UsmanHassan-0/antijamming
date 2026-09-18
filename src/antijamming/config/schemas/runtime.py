@@ -282,14 +282,8 @@ class StreamConfig:
     # alive. Cold FFTW planning after a sample-rate change can take minutes.
     gnss_sdr_startup_timeout_s: float
 
-    # Static truth data used for PVT error display in the GUI/logs.
-    gnss_truth_static_lat_deg: float | None
-    gnss_truth_static_lon_deg: float | None
-    gnss_truth_static_alt_m: float | None
-
-    # PVT truth-error display parameter. The point count is only the minimum
-    # before cumulative CEP is first published; the product profile uses one so
-    # CEP begins with the first valid PVT fix.
+    # Minimum fixes before cumulative horizontal repeatability is published.
+    # At least two are required; this is not a rolling retention limit.
     gnss_accuracy_window_points: int
 
     # Template used to render the GNSS-SDR FIFO receiver config.

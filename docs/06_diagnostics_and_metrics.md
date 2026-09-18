@@ -38,3 +38,36 @@ but are calculated once from the same accepted solve. Retired null-angle fields
 and selected-null-grid metrics are removed; the plot marker identifies only the MUSIC guard candidate.
 Neither target scan contains the per-PRN continuity scalar or intermediate
 transition rows, and neither measures physical suppression.
+
+## PVT position repeatability
+
+CEP50/CEP95 now describe horizontal scatter about the mean of all received
+fixes in the current receiver run. They do not use an authored latitude,
+longitude or altitude, and do not measure error from a surveyed true position.
+They are empirical nearest-rank50th/95th-percentile radii, not a Gaussian
+conversion or a confidence bound on the unknown true location. A constant
+position bias can therefore coexist with very small CEP.
+
+Implementation: convert each WGS84 latitude/longitude to the ellipsoid surface
+in ECEF; project differences onto the first fix's local east/north axes;
+subtract the mean east/north coordinates of the complete run; take each
+horizontal radius and select rank ceil(p*N). Altitude is excluded from this
+horizontal statistic. ECEF avoids the longitude discontinuity at180degrees.
+This local-plane metric is intended for stationary/local reception, not a
+worldwide trajectory. Receiver latitude/longitude/altitude, DOPs and PVT
+observations are still shown unchanged.
+
+`gnss_accuracy_window_points` is the minimum publication count, now at least2
+(profile2), not a rolling retention window. One fix shows warming rather than
+misleading zero spread. All fixes remain stored for the receiver run; no new
+long-duration memory/performance guarantee is claimed. Stale PVT hides CEP;
+stopping clears the cumulative receiver state through the existing lifecycle.
+
+The snapshot declares `cep_reference=run_mean` and
+`cep_metric=horizontal_repeatability`; GUI readiness checks that contract and
+its tooltip states the accuracy limitation. Headless runtime evidence and
+receiver logs carry the same reference/CEP fields. The three configured static
+truth coordinates, truth-availability metadata and absolute ENU/3D/window-error
+outputs are removed, not retained as null aliases. Old configs with those keys
+fail the existing unknown-field validation; external consumers must migrate.
+Dated historical audits/results retain their original metric definitions.

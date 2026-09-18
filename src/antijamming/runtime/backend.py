@@ -1510,22 +1510,19 @@ class BackendRuntime:
             "fix_count",
             "accuracy_scope",
             "cep_sample_count",
+            "cep_min_points",
             "cep_scope",
+            "cep_reference",
+            "cep_metric",
             "cep_ready",
             "fix_type",
             "lat_deg",
             "lon_deg",
             "alt_m",
-            "truth_available",
             "hdop",
             "vdop",
             "pdop",
             "gdop",
-            "east_error_m",
-            "north_error_m",
-            "up_error_m",
-            "horizontal_error_m",
-            "three_d_error_m",
             "cep50_m",
             "cep95_m",
             "accuracy_source",
@@ -6845,8 +6842,7 @@ class BackendRuntime:
             "pvt_gui_status=%s pvt_gui_reason=%s pvt_evidence=%s fix_type=%s "
             "valid_sats=%s solution_status=%s solution_type=%s "
             "lat_deg=%s lon_deg=%s alt_m=%s "
-            "truth_east_error_m=%s truth_north_error_m=%s truth_up_error_m=%s "
-            "truth_h_error_m=%s truth_3d_error_m=%s "
+            "cep_reference=%s cep50_m=%s cep95_m=%s "
             "hdop=%s vdop=%s pdop=%s gdop=%s "
             "receiver_log_mb=%s receiver_log_kbps=%s udp_pvt_packets=%s "
             "udp_observables_packets=%s udp_tracking_packets=%s udp_parse_errors=%s "
@@ -6893,11 +6889,9 @@ class BackendRuntime:
             self._format_optional_float(accuracy.get("lat_deg"), 7),
             self._format_optional_float(accuracy.get("lon_deg"), 7),
             self._format_optional_float(accuracy.get("alt_m"), 2),
-            self._format_optional_float(accuracy.get("east_error_m"), 2),
-            self._format_optional_float(accuracy.get("north_error_m"), 2),
-            self._format_optional_float(accuracy.get("up_error_m"), 2),
-            self._format_optional_float(accuracy.get("horizontal_error_m"), 2),
-            self._format_optional_float(accuracy.get("three_d_error_m"), 2),
+            accuracy.get("cep_reference", "--"),
+            self._format_optional_float(accuracy.get("cep50_m"), 2),
+            self._format_optional_float(accuracy.get("cep95_m"), 2),
             self._format_optional_float(accuracy.get("hdop")),
             self._format_optional_float(accuracy.get("vdop")),
             self._format_optional_float(accuracy.get("pdop")),
@@ -6983,8 +6977,7 @@ class BackendRuntime:
             "receiver_time_s=%s pvt_seen=%s pvt_current=%s pvt_observations=%s "
             "used_count=%d used_pvt=%s fix_type=%s valid_sats=%s "
             "solution_status=%s solution_type=%s lat_deg=%s lon_deg=%s alt_m=%s "
-            "truth_east_error_m=%s truth_north_error_m=%s truth_up_error_m=%s "
-            "truth_h_error_m=%s truth_3d_error_m=%s "
+            "cep_reference=%s cep50_m=%s cep95_m=%s "
             "hdop=%s vdop=%s pdop=%s gdop=%s",
             quality["status"],
             quality["reason"],
@@ -7002,11 +6995,9 @@ class BackendRuntime:
             self._format_optional_float(accuracy.get("lat_deg"), 7),
             self._format_optional_float(accuracy.get("lon_deg"), 7),
             self._format_optional_float(accuracy.get("alt_m"), 2),
-            self._format_optional_float(accuracy.get("east_error_m"), 2),
-            self._format_optional_float(accuracy.get("north_error_m"), 2),
-            self._format_optional_float(accuracy.get("up_error_m"), 2),
-            self._format_optional_float(accuracy.get("horizontal_error_m"), 2),
-            self._format_optional_float(accuracy.get("three_d_error_m"), 2),
+            accuracy.get("cep_reference", "--"),
+            self._format_optional_float(accuracy.get("cep50_m"), 2),
+            self._format_optional_float(accuracy.get("cep95_m"), 2),
             self._format_optional_float(accuracy.get("hdop")),
             self._format_optional_float(accuracy.get("vdop")),
             self._format_optional_float(accuracy.get("pdop")),

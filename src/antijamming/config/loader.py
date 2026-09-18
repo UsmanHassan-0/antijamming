@@ -445,12 +445,8 @@ def _validate_runtime_values(values: dict[str, Any]) -> None:
             "Runtime config 'rx_clipping_fraction_threshold' must be in [0, 1]"
         )
 
-    latitude = values["gnss_truth_static_lat_deg"]
-    longitude = values["gnss_truth_static_lon_deg"]
-    if latitude is not None and not -90.0 <= float(latitude) <= 90.0:
-        raise ValueError("Runtime config truth latitude must be in [-90, 90]")
-    if longitude is not None and not -180.0 <= float(longitude) <= 180.0:
-        raise ValueError("Runtime config truth longitude must be in [-180, 180]")
+    if int(values["gnss_accuracy_window_points"]) < 2:
+        raise ValueError("Runtime config 'gnss_accuracy_window_points' must be at least 2")
 
     ports = (
         "gnss_pvt_monitor_udp_port",

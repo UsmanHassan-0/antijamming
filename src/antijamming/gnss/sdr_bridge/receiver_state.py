@@ -96,7 +96,7 @@ class ReceiverStateMixin:
             "GNSS receiver event: %s receiver_time_s=%s pvt_observations=%s "
             "used_count=%d valid_sats=%s fix_type=%s hdop=%s vdop=%s pdop=%s gdop=%s "
             "lat_deg=%s lon_deg=%s alt_m=%s "
-            "truth_h_error_m=%s truth_3d_error_m=%s",
+            "cep_reference=%s cep50_m=%s cep95_m=%s",
             message,
             receiver_time_s if receiver_time_s is not None else "--",
             pvt_observation_count if pvt_observation_count is not None else "--",
@@ -110,8 +110,9 @@ class ReceiverStateMixin:
             self._format_receiver_event_float(latest_accuracy.get("lat_deg"), 7),
             self._format_receiver_event_float(latest_accuracy.get("lon_deg"), 7),
             self._format_receiver_event_float(latest_accuracy.get("alt_m"), 2),
-            self._format_receiver_event_float(latest_accuracy.get("horizontal_error_m"), 2),
-            self._format_receiver_event_float(latest_accuracy.get("three_d_error_m"), 2),
+            latest_accuracy.get("cep_reference", "--"),
+            self._format_receiver_event_float(latest_accuracy.get("cep50_m"), 2),
+            self._format_receiver_event_float(latest_accuracy.get("cep95_m"), 2),
         )
 
     @staticmethod

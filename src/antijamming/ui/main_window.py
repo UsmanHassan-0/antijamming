@@ -126,6 +126,11 @@ class MainWindow(QMainWindow):
         self._dop_label = QLabel("HDOP/VDOP/PDOP/GDOP: -- / -- / -- / --")
         self._cep50_label = QLabel("CEP50: --")
         self._cep95_label = QLabel("CEP95: --")
+        for label in (self._cep50_label, self._cep95_label):
+            label.setToolTip(
+                "Horizontal repeatability about the mean of all fixes in this run; "
+                "not absolute position accuracy."
+            )
         # Retained as internal status sinks for diagnostics/tests. Satellite
         # counts are already represented by the PRN chart and skyplot, so the
         # labels are deliberately not added to the operator-facing layout.
@@ -1760,17 +1765,20 @@ class MainWindow(QMainWindow):
         accuracy: dict[str, object],
         pvt_current: bool,
     ) -> None:
-        """Show CEP over every valid fix collected in the current run."""
+        """Show mean-centered horizontal scatter, not absolute position error."""
         cep50 = valid_float(accuracy.get("cep50_m")) if pvt_current else None
         cep95 = valid_float(accuracy.get("cep95_m")) if pvt_current else None
         minimum_points = max(
             0,
             int(valid_float(accuracy.get("cep_min_points")) or 0),
         )
-        truth_available = bool(accuracy.get("truth_available", False))
+        repeatability = (
+            accuracy.get("cep_reference") == "run_mean"
+            and accuracy.get("cep_metric") == "horizontal_repeatability"
+        )
         ready = (
             pvt_current
-            and truth_available
+            and repeatability
             and bool(accuracy.get("cep_ready", False))
             and minimum_points > 0
             and cep50 is not None
@@ -1790,7 +1798,7 @@ class MainWindow(QMainWindow):
                 SUCCESS,
             )
             return
-        if pvt_current and truth_available and minimum_points > 0:
+        if pvt_current and repeatability and minimum_points > 0:
             self._set_status_row(self._cep50_label, "CEP50", "warming", INFO)
             self._set_status_row(self._cep95_label, "CEP95", "warming", INFO)
             return

@@ -75,9 +75,6 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
     assert cfg.gnss_agnss_ref_location == ""
     assert cfg.gnss_agnss_ref_utc_time == ""
     assert cfg.gnss_tow_to_trk is True
-    assert cfg.gnss_truth_static_lat_deg == 37.352721
-    assert cfg.gnss_truth_static_lon_deg == -121.915773
-    assert cfg.gnss_truth_static_alt_m == 100.0
     assert cfg.logging_enabled is True
     assert cfg.gnss_1c_channel_count == 10
     assert cfg.gnss_channels_in_acquisition == 10
@@ -164,7 +161,7 @@ def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
         "reimport",
     )
     assert cfg.expected_sources == 1
-    assert cfg.gnss_accuracy_window_points == 1
+    assert cfg.gnss_accuracy_window_points == 2
 
 
 def test_launcher_uses_runtime_logging_switch_for_all_diagnostic_persistence() -> None:

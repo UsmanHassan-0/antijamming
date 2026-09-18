@@ -1,4 +1,4 @@
-"""PVT coordinate and truth-error snapshot helpers."""
+"""PVT coordinates and cumulative horizontal repeatability, not absolute accuracy."""
 
 from __future__ import annotations
 
@@ -7,13 +7,16 @@ import math
 
 class AccuracyMixin:
     def _build_accuracy_snapshot(self, points: list[dict[str, float]]) -> dict[str, object]:
+        if not points:
+            return {}
+        for point in points:
+            if (not all(math.isfinite(point[key]) for key in
+                        ("latitude", "longitude", "altitude"))
+                    or not -90.0 <= point["latitude"] <= 90.0
+                    or not -180.0 <= point["longitude"] <= 180.0):
+                raise ValueError("invalid PVT position")
         latest = points[-1]
-        minimum_count = max(1, int(self._cfg.gnss_accuracy_window_points))
-        run_points = points
-        mean_lat = sum(point["latitude"] for point in run_points) / len(run_points)
-        mean_lon = sum(point["longitude"] for point in run_points) / len(run_points)
-        mean_alt = sum(point["altitude"] for point in run_points) / len(run_points)
-        truth = self._latest_truth_position
+        minimum_count = max(2, int(self._cfg.gnss_accuracy_window_points))
         hdop = latest.get("hdop")
         vdop = latest.get("vdop")
         pdop = latest.get("pdop")
@@ -21,17 +24,18 @@ class AccuracyMixin:
         fix_type = self._fix_type_from_latest_point(latest)
         snapshot: dict[str, object] = {
             "fix_count": len(points),
-            "accuracy_window_points": len(run_points),
+            "accuracy_window_points": len(points),
             "accuracy_scope": "run_cumulative",
-            "cep_sample_count": 0,
+            "cep_sample_count": len(points),
             "cep_min_points": minimum_count,
             "cep_scope": "run_cumulative",
+            "cep_reference": "run_mean",
+            "cep_metric": "horizontal_repeatability",
             "cep_ready": False,
             "fix_type": fix_type,
             "lat_deg": latest["latitude"],
             "lon_deg": latest["longitude"],
             "alt_m": latest["altitude"],
-            "truth_available": truth is not None,
             "hdop": hdop,
             "vdop": vdop,
             "pdop": pdop,
@@ -40,64 +44,15 @@ class AccuracyMixin:
         utm_position = self._utm_from_lat_lon(latest["latitude"], latest["longitude"])
         if utm_position is not None:
             snapshot.update(utm_position)
-        if truth is not None:
-            horizontal_errors_m: list[float] = []
-            for point in run_points:
-                point_east_m, point_north_m, _ = self._enu_error_m(
-                    lat_deg=point["latitude"],
-                    lon_deg=point["longitude"],
-                    alt_m=point["altitude"],
-                    ref=truth,
-                )
-                horizontal_errors_m.append(math.hypot(point_east_m, point_north_m))
-            east_m, north_m, up_m = self._enu_error_m(
-                lat_deg=latest["latitude"],
-                lon_deg=latest["longitude"],
-                alt_m=latest["altitude"],
-                ref=truth,
-            )
-            window_east_m, window_north_m, window_up_m = self._enu_error_m(
-                lat_deg=mean_lat,
-                lon_deg=mean_lon,
-                alt_m=mean_alt,
-                ref=truth,
-            )
-            horizontal_m = math.hypot(east_m, north_m)
-            three_d_m = math.sqrt(east_m * east_m + north_m * north_m + up_m * up_m)
-            window_horizontal_m = math.hypot(window_east_m, window_north_m)
-            window_three_d_m = math.sqrt(
-                window_east_m * window_east_m
-                + window_north_m * window_north_m
-                + window_up_m * window_up_m
-            )
+        if len(points) >= minimum_count:
+            radii = self._horizontal_repeatability_radii_m(points)
             snapshot.update(
                 {
-                    "east_error_m": east_m,
-                    "north_error_m": north_m,
-                    "up_error_m": up_m,
-                    "horizontal_error_m": horizontal_m,
-                    "three_d_error_m": three_d_m,
-                    "window_horizontal_error_m": window_horizontal_m,
-                    "window_three_d_error_m": window_three_d_m,
-                    "cep_sample_count": len(horizontal_errors_m),
+                    "cep50_m": self._empirical_nearest_rank(radii, 0.50),
+                    "cep95_m": self._empirical_nearest_rank(radii, 0.95),
+                    "cep_ready": True,
                 }
             )
-            if len(horizontal_errors_m) >= minimum_count:
-                snapshot.update(
-                    {
-                        "cep50_m": self._empirical_nearest_rank(
-                            horizontal_errors_m,
-                            0.50,
-                        ),
-                        "cep95_m": self._empirical_nearest_rank(
-                            horizontal_errors_m,
-                            0.95,
-                        ),
-                        "cep_ready": True,
-                    }
-                )
-        else:
-            self._maybe_log_truth_warning()
 
         return snapshot
 
@@ -117,29 +72,6 @@ class AccuracyMixin:
         if vdop is not None and pdop is not None and altitude is not None:
             return "3D Fix"
         return "2D Fix"
-
-    def _maybe_log_truth_warning(self) -> None:
-        if self._truth_warning_logged:
-            return
-        self._truth_warning_logged = True
-        self._handoff_log.warning(
-            "GNSS static truth position is incomplete: lat=%s lon=%s alt=%s",
-            self._cfg.gnss_truth_static_lat_deg,
-            self._cfg.gnss_truth_static_lon_deg,
-            self._cfg.gnss_truth_static_alt_m,
-        )
-
-    def _load_truth_position(self) -> dict[str, float] | None:
-        lat = self._to_float(self._cfg.gnss_truth_static_lat_deg)
-        lon = self._to_float(self._cfg.gnss_truth_static_lon_deg)
-        alt = self._to_float(self._cfg.gnss_truth_static_alt_m)
-        if lat is None or lon is None or alt is None:
-            return None
-        return {
-            "latitude": lat,
-            "longitude": lon,
-            "altitude": alt,
-        }
 
     def _to_float(self, value: object) -> float | None:
         try:
@@ -245,21 +177,39 @@ class AccuracyMixin:
             "utm_zone": f"{zone}{hemisphere}",
         }
 
-    def _enu_error_m(
-        self,
-        lat_deg: float,
-        lon_deg: float,
-        alt_m: float,
-        ref: dict[str, float],
-    ) -> tuple[float, float, float]:
-        lat0 = math.radians(ref["latitude"])
-        meters_per_lat = 111_132.954 - 559.822 * math.cos(2 * lat0) + 1.175 * math.cos(4 * lat0)
-        meters_per_lon = (
-            111_132.954 * math.cos(lat0)
-            - 93.5 * math.cos(3 * lat0)
-            + 0.118 * math.cos(5 * lat0)
-        )
-        east = (lon_deg - ref["longitude"]) * meters_per_lon
-        north = (lat_deg - ref["latitude"]) * meters_per_lat
-        up = alt_m - ref["altitude"]
-        return east, north, up
+    @staticmethod
+    def _horizontal_repeatability_radii_m(points: list[dict[str, float]]) -> list[float]:
+        """Center all fixes in one local east/north plane for a stationary run.
+
+        Convert WGS84 lat/lon to ellipsoid-surface ECEF, then project relative
+        to the first fix's tangent axes. Height is intentionally excluded from
+        this horizontal metric. Recenter on the mean of ALL projected fixes,
+        not the first fix and not a known position. ECEF avoids a longitude
+        discontinuity at the dateline. This is local scatter, not a geodesic
+        metric for a worldwide trajectory or an absolute positioning error.
+        """
+        flattening = 1.0 / 298.257_223_563
+        eccentricity_sq = flattening * (2.0 - flattening)
+        lat0 = math.radians(points[0]["latitude"])
+        lon0 = math.radians(points[0]["longitude"])
+        sin_lat, cos_lat = math.sin(lat0), math.cos(lat0)
+        sin_lon, cos_lon = math.sin(lon0), math.cos(lon0)
+        positions = []
+        for point in points:
+            lat = math.radians(point["latitude"])
+            lon = math.radians(point["longitude"])
+            radius = 6_378_137.0 / math.sqrt(1.0 - eccentricity_sq * math.sin(lat)**2)
+            positions.append((radius * math.cos(lat) * math.cos(lon),
+                              radius * math.cos(lat) * math.sin(lon),
+                              radius * (1.0 - eccentricity_sq) * math.sin(lat)))
+
+        x0, y0, z0 = positions[0]
+        east, north = [], []
+        for x, y, z in positions:
+            dx, dy, dz = x - x0, y - y0, z - z0
+            east.append(-sin_lon * dx + cos_lon * dy)
+            north.append(-sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz)
+        mean_east = math.fsum(east) / len(east)
+        mean_north = math.fsum(north) / len(north)
+        return [math.hypot(e - mean_east, n - mean_north)
+                for e, n in zip(east, north, strict=True)]

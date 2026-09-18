@@ -1067,7 +1067,6 @@ def test_gui_clears_fix_and_cep_without_pvt(qtbot) -> None:
                 "pvt_observation_count": 10,
                 "accuracy": {
                     "fix_type": "3D Fix",
-                    "three_d_error_m": 1.2,
                     "valid_sats": 10,
                 }
             }
@@ -1084,7 +1083,6 @@ def test_gui_clears_fix_and_cep_without_pvt(qtbot) -> None:
                 "pvt_output_seen": False,
                 "accuracy": {
                     "fix_type": "3D Fix",
-                    "three_d_error_m": 1.2,
                 },
             }
         }
@@ -1601,7 +1599,7 @@ def test_receiver_projection_prevents_skyplot_tracking_contradictions(qtbot) -> 
             "gnss_snapshot": {
                 "pvt_output_seen": False,
                 "pvt_current": False,
-                "accuracy": {"fix_type": "3D Fix", "three_d_error_m": 0.8},
+                "accuracy": {"fix_type": "3D Fix"},
                 "prns": [
                     _sat(
                         12,
@@ -1682,7 +1680,6 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
                 "pvt_current": True,
                 "accuracy": {
                     "fix_type": "3D Fix",
-                    "three_d_error_m": 1.4,
                 },
                 "prns": [
                     _sat(5, state="tracking", cno_db_hz=41.2, cno_stable=True),
@@ -1727,7 +1724,7 @@ def test_receiver_projection_styles_stable_and_fresh_pvt_skyplot_markers(qtbot) 
             "gnss_snapshot": {
                 "pvt_output_seen": True,
                 "pvt_current": False,
-                "accuracy": {"fix_type": "3D Fix", "three_d_error_m": 1.4},
+                "accuracy": {"fix_type": "3D Fix"},
                 "prns": [
                     _sat(5, state="tracking", cno_db_hz=41.2, cno_stable=True),
                     _sat(
@@ -1779,7 +1776,7 @@ def test_receiver_projection_clears_operator_state_on_error(qtbot) -> None:
             "gnss_snapshot": {
                 "pvt_output_seen": True,
                 "pvt_current": True,
-                "accuracy": {"fix_type": "3D Fix", "three_d_error_m": 1.4},
+                "accuracy": {"fix_type": "3D Fix"},
                 "prns": [
                     _sat(5, state="tracking", cno_db_hz=41.2, cno_stable=True)
                 ],
@@ -1980,11 +1977,6 @@ def test_gui_shows_gnss_fix_accuracy_from_snapshot(qtbot) -> None:
                     "utm_easting_m": 321124.221634667,
                     "utm_northing_m": 3724046.2518229913,
                     "utm_zone": "43N",
-                    "three_d_error_m": 1.92,
-                    "horizontal_error_m": 0.51,
-                    "east_error_m": -0.12,
-                    "north_error_m": 0.49,
-                    "up_error_m": 1.85,
                     "lat_deg": 33.6412345,
                     "lon_deg": 73.0712345,
                     "alt_m": 542.4,
@@ -1998,7 +1990,8 @@ def test_gui_shows_gnss_fix_accuracy_from_snapshot(qtbot) -> None:
                     "cep_sample_count": 30,
                     "cep_min_points": 30,
                     "cep_ready": True,
-                    "truth_available": True,
+                    "cep_reference": "run_mean",
+                    "cep_metric": "horizontal_repeatability",
                 }
             }
         }
@@ -2097,7 +2090,6 @@ def test_gui_marks_current_high_dop_pvt_as_degraded(qtbot) -> None:
                 "pvt_current": True,
                 "accuracy": {
                     "fix_type": "3D Fix",
-                    "three_d_error_m": 12.13,
                     "pdop": 10.97,
                 },
             }
@@ -2116,7 +2108,6 @@ def test_gui_marks_current_high_dop_pvt_as_degraded(qtbot) -> None:
                 "pvt_observation_count": 10,
                 "accuracy": {
                     "fix_type": "3D Fix",
-                    "three_d_error_m": 1030.29,
                     "pdop": 2.10,
                     "valid_sats": 10,
                 },
