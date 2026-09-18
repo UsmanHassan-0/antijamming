@@ -1047,3 +1047,37 @@ The earlier read-only reconnect failure remains separately retained; it is not
 treated as a successful measurement. Remote `rg` was unavailable, so the
 tracking-source lookup used `grep` and a bounded `sed` excerpt. Source review
 is targeted, not a claim of reading all historical log contents.
+
+### Verification and limits
+
+Final deployed software gate: **555 passed, 1 hardware test deselected**:
+
+```bash
+cd /home/qvise/antijamming
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
+  .aj/bin/python -m pytest -q -m 'not usrp'
+```
+
+The 27 setup/runtime cases use actual shell functions and mocked external
+commands. They cover target identity, successful compatibility, mismatch,
+busy/unrelated errors, interruption, failed writes, pending activation and
+recorded-prefix selection. They are not RF acceptance. Broad tests also cover
+logging-off live receiver data with synthetic stdout/NMEA/monitor messages.
+
+Native compilation completed with six jobs and the repository's existing
+Release flags. No replay, antenna test, jammer-on test, phase calibration or
+streaming acceptance was performed. No source cleanup claim is made for the
+still-open malformed-covariance release-hold defect or calibration validation.
+
+At 10:25:02 UTC, after the operator receiver/service had exited, the shipped
+setup FPGA function began writing the identified X300 `35D068D` at
+`192.168.40.2` with device-side verification. That programming operation must
+not be interrupted. Completion/activation is recorded separately below when
+observed; reaching this stage alone is not hardware readiness.
+
+Raw evidence and harnesses:
+`audit-results/nads2-cleanup-deploy.KqhZ7V/`. This includes source snapshots,
+initial failures, per-commit checks, full gates, build/download logs, exact
+binding/image/executable hashes, idle-service output and FPGA loader output.
+GitHub was not pushed during this deployment; source was transferred via Git
+bundles, and every new commit uses the requested Git identity and typed subject.
