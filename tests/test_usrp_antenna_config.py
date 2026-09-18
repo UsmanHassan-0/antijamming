@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import Mock, call
+
 import pytest
 
 from antijamming.config import StreamConfig
@@ -24,7 +26,7 @@ def test_default_twinrx_antenna_map_is_by_physical_channel() -> None:
     ]
 
 
-def test_default_twinrx_lo_sharing_map_matches_two_board_layout() -> None:
+def test_default_twinrx_lo_sharing_exports_only_board_a_first_channel() -> None:
     device = _device_for_config(StreamConfig())
 
     assert [device._rx_lo_source_for_channel(ch) for ch in (0, 1, 2, 3)] == [
@@ -36,9 +38,39 @@ def test_default_twinrx_lo_sharing_map_matches_two_board_layout() -> None:
     assert [device._rx_lo_export_for_channel(ch) for ch in (0, 1, 2, 3)] == [
         True,
         False,
-        True,
+        False,
         False,
     ]
+
+
+@pytest.mark.parametrize(
+    "exports", [(True, False, False, False), (True, False, True, False)]
+)
+def test_configured_lo_map_reaches_uhd_without_an_implicit_board_b_export(
+    exports: tuple[bool, bool, bool, bool],
+) -> None:
+    device = _device_for_config(StreamConfig(rx_lo_exports_by_channel=exports))
+    device._usrp = Mock(
+        spec=("get_rx_lo_sources", "set_rx_lo_source", "set_rx_lo_export_enabled")
+    )
+    sources = ["internal", "companion", "reimport", "reimport"]
+    device._usrp.get_rx_lo_sources.return_value = list(set(sources))
+
+    device._configure_twinrx_lo_sharing()
+
+    expected_calls = []
+    for channel, source in enumerate(sources):
+        expected_calls.extend(
+            [
+                call.get_rx_lo_sources("all", channel),
+                call.set_rx_lo_source(source, "all", channel),
+            ]
+        )
+    expected_calls.extend(
+        call.set_rx_lo_export_enabled(enabled, "all", channel)
+        for channel, enabled in enumerate(exports)
+    )
+    assert device._usrp.mock_calls == expected_calls
 
 
 class _FakeSensor:
