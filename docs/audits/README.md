@@ -10,6 +10,8 @@ silently rewrite an old result to match a later implementation.
 
 | Record | Evidence represented |
 | --- | --- |
+| `launcher_lo_review.md` | Launcher typo/startup ordering and LO-test correction; preserved calibration mismatch and independent defect/timing failures |
+| `automatic_lcmv_control.md` | Automatic-only config/GUI/IPC migration, arming/reset/cycle regressions and limits |
 | `live_test_2026-08-07.md` | Dated live anti-jamming test and observed RF/receiver behavior |
 | `rf_power_sweep_tables.md` | RF power, compression, and J/S calculations and sweep tables |
 | `someone_md_audit.md` | Layer-by-layer audit of the former `someone.md` claims |
