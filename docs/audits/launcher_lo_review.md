@@ -1081,3 +1081,111 @@ initial failures, per-commit checks, full gates, build/download logs, exact
 binding/image/executable hashes, idle-service output and FPGA loader output.
 GitHub was not pushed during this deployment; source was transferred via Git
 bundles, and every new commit uses the requested Git identity and typed subject.
+
+## Setup recovery after autoremove — September 18
+
+Recorded at 2026-09-18T12:25:48Z. This entry supersedes the earlier deployment's
+pending-initialization boundary only for the actual initialization observed
+below; it does not certify RF streaming or migrate the entire dependency stack.
+
+### Baseline and reproduced dependency boundary
+
+NADS 2 is `qvise@192.168.3.127`, hostname `spark-8219`. Its user-selected
+`/home/qvise/Desktop/qvise/antijamming` checkout is clean on
+`cleanup/no-usrp-verification-20260831` at
+`2ba73819dac528d9110d6c3badb968c8417bf8d5`. Laptop and NADS 2 source hashes match:
+
+The 15:15:01–15:15:27 host-local `apt autoremove` record lists
+`python3-ruamel.yaml` among its removals. The package was absent at diagnosis.
+The bundled GNSS-SDR README does not list ruamel; this particular requirement
+belongs to building UHD's Python utilities. The current setup package list
+does not explicitly install it. No source declaration was repaired in this run.
+
+### Authorized recovery and actual result
+
+After the user explicitly requested running setup, installed the missing
+dependency and ran the existing script as qvise, using sudo only for its
+privileged steps:
+
+```bash
+sudo apt-get install -y python3-ruamel.yaml
+cd /home/qvise/Desktop/qvise/antijamming
+ANTIJAMMING_USRP_IFACE=enP7s7 \
+  ANTIJAMMING_USRP_ADDR=192.168.40.2 ./setup.sh
+```
+
+Installed `python3-ruamel.yaml` 0.17.21-1 and
+`python3-ruamel.yaml.clib` 0.2.8-1build1. UHD configuration then reported the
+ruamel dependency satisfied and completed its build/install. The full setup
+returned **0**, recorded independently from the log pipeline's exit status.
+The script's actual compatibility check reported:
+
+```text
+[setup] X300 35D068D: active HG image initializes with the selected UHD.
+```
+
+This run refreshed the release-matched `gd375d68` image download but did not
+flash the USRP, because its active HG image initialized successfully. Setup
+preserved the active wired connection, disabled automatic activation of the
+competing NetworkManager profile `de42e9a2-b8d5-31fa-8c1b-2bb91455379e`, applied
+its 50,000,000-byte socket limits and updated existing user VOLK profiles.
+The runtime address was already correct and was not edited.
+
+Native GNSS-SDR compilation and the script's version/import/file checks
+completed. The built executable is
+`gnss-sdr/build-antijamming/src/main/gnss-sdr`, SHA-256
+`9648a595ab6ae9f66c410a385a7454cb57aa9960d9118860b6c0355cf8788429`.
+No application source change, commit or push occurred during recovery.
+
+### Important remaining boundary: mixed UHD dependencies
+
+The complete log retains a nonfatal missing-Abseil CMake warning, selection of
+glog/gflags, and a nested-make jobserver warning. The profiler's update output
+includes `no architectures to test`; it is not a new benchmark result.
+Large streamed console returns were truncated for display; complete logs were
+saved before display truncation and copied with matching SHA-256 values.
+Review used targeted dependency, warning, build and completion sections, not a
+claim that every log line or every receiver path was semantically verified.
+No new unit-test suite, live GNSS replay, RF streaming or jammer test ran.
+
+### Tramiq comparison and evidence locations
+
+Complete run artifacts are retained at both:
+
+- NADS 2: `/home/qvise/tramiqsdr-start-stop-evidence/20260918/setup-retry.R0kzIs/`.
+- Laptop: `/home/u/tramiqsdr-start-stop-evidence/20260918/setup-retry.R0kzIs/`.
+
+Matched artifact SHA-256 values:
+
+| File | SHA-256 |
+| --- | --- |
+| `dependency-install.log` | `3f3ee05c4e5b0c087c2c77811fe5b23538da806d424bd79f298f6b2ec7166af7` |
+| `setup.log` | `9ee3b2ef12002f63caca03e54fa4f364ff307fd481693d69d6b05ebbdf7c12d5` |
+| `result.txt` | `f2c10ea6bf013c1751ce88ee2f1d4acd0259fc135accc85c218b71d30ee689f8` |
+
+### Acceptance and retained artifacts
+
+Ruff, Vulture at confidence 90, separate-cache compileall and `git diff --check`
+passed. Logs retain the failed attempts as well as subsequent passes; review
+of build output was targeted, not a claim to have manually read every log line.
+The GNU Radio configure/build rounds and GNSS candidate build logs remain in
+the same evidence directory.
+
+Production GNSS-SDR executable SHA-256:
+`34fa7351a1b268d1f48e4e1da764d01d84aaad121348858f2012514b69f29cad`.
+Candidate build SHA-256:
+`ff656d352f8423332f9fca5f34afabcbff10eaa3dff474b19c1db0dc0d57ce34`.
+These differ by build paths/configuration; neither establishes RF equivalence.
+
+After matched-stack acceptance, apt removed exactly `libuhd-dev`,
+`libuhd4.6.0t64`, `libgnuradio-uhd3.10.9t64`, `gnuradio`, `gnuradio-dev`,
+`gr-fosphor`, `gr-limesdr`, `gr-osmosdr`, and `libgnuradio-osmosdr0.2.0t64`.
+These are reinstallable packages; no global autoremove was used. Old unowned
+`/usr/share/uhd/images` assets remain, but the selected downloader/runtime uses
+the explicit source UHD image directory. No claim that every historical UHD
+file anywhere on the machine was removed is made.
+
+### Why Tramiq had worked
+
+No Tramiq changes were made. No new RF streaming, long-duration stability,
+PVT, jammer or non-ARM runtime claim follows from this installation work.
