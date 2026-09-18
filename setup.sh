@@ -174,7 +174,13 @@ install_system_dependencies() {
     ethtool
     iproute2
     iputils-ping
+    ninja-build
+    libboost-all-dev
+    libusb-1.0-0-dev
+    python3-dev
     python3-pip
+    python3-requests
+    python3-setuptools
     python3-venv
     python3-pyqt6
     python3-uhd
@@ -214,19 +220,22 @@ ensure_uhd_images() {
   local hg_image="${UHD_IMAGE_DIR}/usrp_x300_fpga_HG.bit"
   local image_downloader="${UHD_INSTALL_PREFIX}/bin/uhd_images_downloader"
 
-  if [[ -f "${hg_image}" ]]; then
-    return 0
-  fi
-
   if [[ ! -x "${image_downloader}" ]]; then
     echo "System uhd_images_downloader not found at ${image_downloader}." >&2
     exit 1
   fi
 
-  echo "[setup] Downloading X300/HG UHD FPGA image into ${UHD_IMAGE_DIR}."
+  # A filename or stale inventory entry does not identify the image release.
+  # The pinned downloader verifies the archive against its release manifest.
+  echo "[setup] Refreshing release-matched X300 FPGA images in ${UHD_IMAGE_DIR}."
   mkdir -p "${UHD_IMAGE_DIR}"
   env LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-    "${image_downloader}" --types 'x3.*' --install-location "${UHD_IMAGE_DIR}" --yes
+    "${image_downloader}" --types '^x3xx_x300_fpga_default$' \
+      --install-location "${UHD_IMAGE_DIR}" --refetch --yes || return "$?"
+  if [[ ! -s "${hg_image}" ]]; then
+    echo "Downloaded image set has no nonempty X300 HG bitfile." >&2
+    return 1
+  fi
 }
 
 host_cidr_for_usrp_addr() {
@@ -387,7 +396,7 @@ resolve_x300_host_link() {
   local candidate_host_cidr
 
   if ! command -v uhd_find_devices >/dev/null 2>&1; then
-    echo "uhd_find_devices not found; uhd-host did not install correctly." >&2
+    echo "System uhd_find_devices is unavailable in the selected runtime." >&2
     exit 1
   fi
 
@@ -644,7 +653,14 @@ ensure_x300_hg_image_loaded() {
   local hg_image="${UHD_IMAGE_DIR}/usrp_x300_fpga_HG.bit"
   local find_devices="${UHD_INSTALL_PREFIX}/bin/uhd_find_devices"
   local image_loader="${UHD_INSTALL_PREFIX}/bin/uhd_image_loader"
+  local usrp_probe="${UHD_INSTALL_PREFIX}/bin/uhd_usrp_probe"
+  local discovery_text
   local probe_text
+  local serial
+  local flavor
+  local image_hash
+  local pending_path
+  local serials=()
 
   if [[ ! -x "${find_devices}" ]]; then
     echo "System uhd_find_devices not found at ${find_devices}." >&2
@@ -654,30 +670,66 @@ ensure_x300_hg_image_loaded() {
     echo "System uhd_image_loader not found at ${image_loader}." >&2
     exit 1
   fi
-  if [[ ! -f "${hg_image}" ]]; then
+  if [[ ! -x "${usrp_probe}" ]]; then
+    echo "System uhd_usrp_probe not found at ${usrp_probe}." >&2
+    return 1
+  fi
+  if [[ ! -s "${hg_image}" ]]; then
     echo "X300 HG FPGA image not found at ${hg_image}" >&2
     echo "Run setup again after uhd_images_downloader installs UHD images." >&2
     exit 1
   fi
 
-  probe_text="$(env LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-    "${find_devices}" --args "addr=${USRP_ADDR}" 2>&1 || true)"
-  if grep -Eiq '^[[:space:]]*fpga:[[:space:]]*HG[[:space:]]*$' <<<"${probe_text}"; then
-    echo "[setup] USRP ${USRP_ADDR} already reports FPGA image HG."
-    return 0
+  if ! discovery_text="$(timeout 15 env \
+    LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    "${find_devices}" --args "addr=${USRP_ADDR}" 2>&1)"; then
+    printf '%s\n' "${discovery_text}" >&2
+    echo "X300 discovery failed; no FPGA write attempted." >&2
+    return 1
+  fi
+  mapfile -t serials < <(sed -n 's/^[[:space:]]*serial:[[:space:]]*\([[:alnum:]]\+\)[[:space:]]*$/\1/p' <<<"${discovery_text}")
+  flavor="$(sed -n 's/^[[:space:]]*fpga:[[:space:]]*\([A-Z][A-Z]\)[[:space:]]*$/\1/p' <<<"${discovery_text}")"
+  if (( ${#serials[@]} != 1 )) \
+    || ! grep -Eq '^[[:space:]]*product:[[:space:]]*X300[[:space:]]*$' <<<"${discovery_text}" \
+    || [[ ! "${flavor}" =~ ^(HG|XG|HA|XA)$ ]]; then
+    printf '%s\n' "${discovery_text}" >&2
+    echo "Expected one identified X300 and a known image flavor; refusing to flash." >&2
+    return 1
+  fi
+  serial="${serials[0]}"
+  image_hash="$(sha256sum "${hg_image}" | awk '{print $1}')"
+  pending_path="${UHD_IMAGE_DIR}/.antijamming-x300-${serial}.pending"
+
+  # Discovery reports flavor only. Real initialization checks RFNoC block
+  # compatibility, including the Radio revision that HG alone cannot establish.
+  if probe_text="$(timeout 45 env \
+    LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    "${usrp_probe}" --args "type=x300,addr=${USRP_ADDR},serial=${serial}" 2>&1)"; then
+    if [[ "${flavor}" == HG ]]; then
+      rm -f -- "${pending_path}"
+      echo "[setup] X300 ${serial}: active HG image initializes with the selected UHD."
+      return 0
+    fi
+  elif ! grep -Eiq 'compat(ibility)? (number |version )?mismatch|FPGA component .*revision|Expected FPGA compatibility|FPGA.*compatibility.*(expected|actual)' <<<"${probe_text}"; then
+    printf '%s\n' "${probe_text}" >&2
+    echo "USRP initialization failed without a confirmed FPGA mismatch; no write attempted." >&2
+    return 1
+  fi
+  printf '%s\n' "${probe_text}"
+  if [[ -f "${pending_path}" ]]; then
+    echo "An FPGA write is already pending activation for ${serial}." >&2
+    echo "Power-cycle the USRP, then rerun setup; not flashing it again." >&2
+    return 2
   fi
 
-  if grep -Eiq '^[[:space:]]*fpga:' <<<"${probe_text}"; then
-    echo "[setup] Loading HG FPGA image onto USRP ${USRP_ADDR}."
-    env LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-      "${image_loader}" --args "type=x300,addr=${USRP_ADDR}" --fpga-path "${hg_image}"
-    echo "[setup] HG FPGA image loader finished. Power-cycle the USRP if UHD requests it."
-    return 0
-  fi
-
-  echo "[setup] USRP ${USRP_ADDR} did not report an FPGA image through fixed-address UHD probe." >&2
-  echo "[setup] Confirm cabling/IP, then run setup again before launching the GUI." >&2
-  exit 1
+  echo "[setup] Writing release-matched HG image to X300 ${serial}; SHA-256 ${image_hash}."
+  # Never time out or interrupt flash programming. Device-side verify is enabled.
+  env LD_LIBRARY_PATH="${UHD_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    "${image_loader}" --args "type=x300,addr=${USRP_ADDR},serial=${serial},fpga=HG,verify" \
+      --fpga-path "${hg_image}" || return "$?"
+  printf '%s\n' "${image_hash}" >"${pending_path}"
+  echo "HG image written. Setup is NOT ready until the USRP is power-cycled and setup is rerun." >&2
+  return 2
 }
 
 build_local_gnss_sdr() {
