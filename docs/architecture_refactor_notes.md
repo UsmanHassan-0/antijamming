@@ -5,7 +5,7 @@ runtime behavior.
 
 ## Current Source Of Truth
 
-- Runtime values: `configs/antijamming/x300_realtime.json`
+- Runtime values: `configs/antijamming/x300_realtime.jsonc`
 - Runtime schema/types: `src/antijamming/config/schemas/runtime.py`
 - Log root: `logs/`
 

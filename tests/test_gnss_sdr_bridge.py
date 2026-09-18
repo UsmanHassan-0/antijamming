@@ -15,6 +15,7 @@ import time
 import numpy as np
 import pytest
 
+from antijamming import jsonc
 from antijamming.config import (
     DEFAULT_RUNTIME_CONFIG_PATH,
     StreamConfig,
@@ -1227,6 +1228,28 @@ def test_bridge_renders_fifo_config_with_runtime_paths(tmp_path: Path) -> None:
     assert f"SignalSource.sample_type={cfg.gnss_sdr_sample_type}" in rendered
 
 
+def test_profile_comments_do_not_change_rendered_receiver_config(tmp_path: Path) -> None:
+    profile = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
+    settings_only = {key: value for key, value in profile.items() if not key.startswith("_")}
+    path = tmp_path / "settings_only.json"
+    path.write_text(json.dumps(settings_only), encoding="utf-8")
+
+    rendered = []
+    for profile_path in (DEFAULT_RUNTIME_CONFIG_PATH, path):
+        cfg = load_stream_config_file(profile_path)
+        cfg.gnss_sdr_runtime_dir = _fifo_runtime_dir(tmp_path)
+        cfg.gnss_sdr_log_dir = tmp_path / "receiver_logs"
+        bridge = GnssSdrBridge(cfg, _loggers())
+        # Render only: the shared fake PTY path avoids opening a receiver,
+        # hardware, sockets or FIFOs and makes both outputs directly comparable.
+        rendered.append(_render_config_for_test(bridge))
+
+    assert rendered[0] == rendered[1]
+    assert "GNSS-SDR.num_sources=10" in rendered[0]
+    assert "GNSS-SDR.synchronize_signal_sources=false" in rendered[0]
+    assert "_comment_" not in rendered[0]
+
+
 def test_bridge_fifo_config_derives_gps_l1_filter_at_4mhz(tmp_path: Path) -> None:
     cfg = StreamConfig(
         sample_rate=4e6,
@@ -1317,7 +1340,7 @@ def test_product_profile_propagates_each_4_to_10_msps_rate(
 ) -> None:
     """Prove authored/derived rate agreement without claiming realtime capacity."""
 
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     sample_rate = rate_msps * 1_000_000
     payload["sample_rate"] = sample_rate
     profile_path = tmp_path / f"x300_realtime_{rate_msps}msps.json"

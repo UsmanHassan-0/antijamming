@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import threading
 import pytest
 from threadpoolctl import threadpool_info
 
+from antijamming import jsonc
 from antijamming.config import (
     DEFAULT_RUNTIME_CONFIG_PATH,
     REPO_ROOT,
@@ -46,13 +48,65 @@ def test_product_runtime_limits_native_numeric_thread_pools() -> None:
     assert all(int(pool["num_threads"]) == 1 for pool in threadpool_info())
 
 
+def test_runtime_profile_documents_every_setting_in_ordered_sections() -> None:
+    source = DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8")
+    profile = jsonc.loads(source)
+    lines = source.splitlines()
+    assert DEFAULT_RUNTIME_CONFIG_PATH.suffix == ".jsonc"
+    assert not any(key.startswith("_") for key in profile)
+    assert all(len(line) <= 100 for line in lines)
+    prefixes = tuple(f"  // {index}. " for index in range(1, 9))
+    headings = [line for line in lines if line.startswith(prefixes)]
+    assert len(headings) == 8
+    for index, heading in enumerate(headings, start=1):
+        assert f"// {index}. " in heading
+        position = lines.index(heading)
+        border = "  // " + "=" * 60
+        assert lines[position - 1] == lines[position + 1] == border
+        assert lines[position + 2] == ""
+        if index > 1:
+            assert lines[position - 3:position - 1] == ["", ""]
+    subsections = [index for index, line in enumerate(lines) if "// ---- " in line]
+    assert len(subsections) == 26
+    assert all(lines[index - 1] == lines[index + 1] == "" for index in subsections)
+    for key in profile:
+        matches = [
+            index for index, line in enumerate(lines)
+            if line.lstrip().startswith(f'"{key}":')
+        ]
+        assert len(matches) == 1, key
+        index = matches[0]
+        assert "  // " in lines[index] or lines[index - 1].lstrip().startswith("// "), key
+        if "  // " in lines[index]:
+            assert len(lines[index]) <= 88, key
+        else:
+            # Keep a possibly wrapped note attached, with space around its block.
+            comment_start = index - 1
+            while comment_start > 0 and lines[comment_start - 1].lstrip().startswith("// "):
+                comment_start -= 1
+            assert lines[comment_start - 1] == "", key
+            assert lines[index + 1] in ("", "}"), key
+
+
+def test_runtime_profile_comments_do_not_change_loaded_settings(tmp_path: Path) -> None:
+    profile = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
+    settings_only = {key: value for key, value in profile.items() if not key.startswith("_")}
+    path = tmp_path / "settings_only.json"
+    path.write_text(json.dumps(settings_only), encoding="utf-8")
+
+    assert asdict(load_stream_config_file(DEFAULT_RUNTIME_CONFIG_PATH)) == asdict(
+        load_stream_config_file(path)
+    )
+    assert asdict(default_stream_config()) == asdict(default_stream_config(path))
+
+
 def test_default_runtime_spec_file_supplies_hardware_defaults() -> None:
-    profile = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    profile = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     cfg = default_stream_config()
 
     assert DEFAULT_RUNTIME_CONFIG_PATH.exists()
     assert DEFAULT_RUNTIME_CONFIG_PATH.as_posix().endswith(
-        "configs/antijamming/x300_realtime.json"
+        "configs/antijamming/x300_realtime.jsonc"
     )
     assert cfg.array_spacing_m > 0.0
     assert cfg.usrp_addr == profile["usrp_addr"]
@@ -176,7 +230,7 @@ def test_launcher_uses_runtime_logging_switch_for_all_diagnostic_persistence() -
 
 
 def test_runtime_config_rejects_stale_experiment_section(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload["experiment"] = {"name": "legacy_bench_manifest"}
     path = tmp_path / "runtime_with_stale_experiment.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -188,7 +242,7 @@ def test_runtime_config_rejects_stale_experiment_section(tmp_path) -> None:
 def test_runtime_profile_authors_sample_rate_once_and_derives_followers(
     tmp_path,
 ) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     assert "usrp_rx_bandwidth_hz" not in payload
     assert "gnss_sdr_if_bandwidth_hz" not in payload
     assert "min_sample_rate" not in payload
@@ -210,7 +264,7 @@ def test_runtime_profile_authors_sample_rate_once_and_derives_followers(
 def test_runtime_profile_rejects_authored_sample_rate_followers(
     tmp_path, field
 ) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload[field] = payload["sample_rate"]
     path = tmp_path / f"runtime_with_duplicate_{field}.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -220,7 +274,7 @@ def test_runtime_profile_rejects_authored_sample_rate_followers(
 
 
 def test_runtime_config_requires_explicit_calibration_mode(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload.pop("calibration_correction_mode", None)
     path = tmp_path / "runtime_without_calibration_mode.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -230,7 +284,7 @@ def test_runtime_config_requires_explicit_calibration_mode(tmp_path) -> None:
 
 
 def test_runtime_config_rejects_unknown_calibration_mode(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload["calibration_correction_mode"] = "typo_mode"
     path = tmp_path / "runtime_with_unknown_calibration_mode.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -240,7 +294,7 @@ def test_runtime_config_rejects_unknown_calibration_mode(tmp_path) -> None:
 
 
 def test_runtime_config_requires_explicit_gnss_startup_timeout(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload.pop("gnss_sdr_startup_timeout_s", None)
     path = tmp_path / "runtime_without_gnss_startup_timeout.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -250,7 +304,7 @@ def test_runtime_config_requires_explicit_gnss_startup_timeout(tmp_path) -> None
 
 
 def test_runtime_config_rejects_removed_lcmv_method_selector(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload["lcmv_test_null_method"] = "covariance_lcmv_measured_u1"
     path = tmp_path / "runtime_with_removed_lcmv_method_selector.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -259,7 +313,7 @@ def test_runtime_config_rejects_removed_lcmv_method_selector(tmp_path) -> None:
         load_stream_config_file(path)
 
 def test_runtime_config_rejects_removed_lcmv_target_selector(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload["lcmv_target_selection_mode"] = (
         "expected_jammer_range_peak_or_center"
     )
@@ -271,7 +325,7 @@ def test_runtime_config_rejects_removed_lcmv_target_selector(tmp_path) -> None:
 
 
 def test_runtime_config_rejects_removed_usrp_preservation_mode(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload["preserve_usrp_session_on_stop"] = True
     path = tmp_path / "runtime_with_removed_usrp_preservation_mode.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -281,7 +335,7 @@ def test_runtime_config_rejects_removed_usrp_preservation_mode(tmp_path) -> None
 
 
 def test_runtime_config_rejects_removed_optional_local_gnss_mode(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload["gnss_sdr_require_local"] = False
     path = tmp_path / "runtime_with_optional_local_gnss_mode.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -291,7 +345,7 @@ def test_runtime_config_rejects_removed_optional_local_gnss_mode(tmp_path) -> No
 
 
 def test_runtime_config_rejects_removed_second_nmea_persistence_switch(tmp_path) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload["gnss_pvt_nmea_output_file_enable"] = True
     path = tmp_path / "runtime_with_removed_nmea_persistence_switch.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -326,7 +380,7 @@ def test_runtime_config_rejects_non_finite_string_sample_rate(
     tmp_path,
     sample_rate,
 ) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload["sample_rate"] = sample_rate
     path = tmp_path / "nonfinite_string_sample_rate.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -354,7 +408,7 @@ def test_runtime_config_rejects_wrong_json_types(
     value,
     message,
 ) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload[field] = value
     path = tmp_path / f"runtime_with_wrong_{field}_type.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -424,7 +478,7 @@ def test_runtime_config_rejects_inconsistent_values(
     updates,
     message,
 ) -> None:
-    payload = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     payload.update(updates)
     path = tmp_path / "runtime_with_inconsistent_values.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -801,7 +855,7 @@ def test_parse_args_rejects_runtime_flags(monkeypatch) -> None:
 
 
 def test_runtime_config_builds_product_profile_without_cli_overrides() -> None:
-    profile = json.loads(DEFAULT_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    profile = jsonc.load(DEFAULT_RUNTIME_CONFIG_PATH)
     cfg = _runtime_config()
 
     assert cfg.sample_rate == float(profile["sample_rate"])

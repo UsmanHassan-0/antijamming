@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_PY="${ROOT_DIR}/.aj/bin/python"
 ORIGINAL_ARGS=("$@")
 SIDECAR_SCRIPT="${ROOT_DIR}/tools/run_realtime_sidecar.sh"
-RUNTIME_CONFIG="${ROOT_DIR}/configs/antijamming/x300_realtime.json"
+RUNTIME_CONFIG="${ROOT_DIR}/configs/antijamming/x300_realtime.jsonc"
 GNSS_CONFIG_PATH="${ROOT_DIR}/logs/gnss-sdr/runtime/fifo_gps_l1.conf"
 
 while (($# > 0)); do
@@ -23,7 +23,7 @@ while (($# > 0)); do
     *)
       echo "run_realtime.sh only accepts diagnostic control flags:" >&2
       echo "  --auto-start [--auto-stop-after-s SECONDS] [--quit-after-stop]" >&2
-      echo "Edit configs/antijamming/x300_realtime.json for runtime configuration." >&2
+      echo "Edit configs/antijamming/x300_realtime.jsonc for runtime configuration." >&2
       exit 2
       ;;
   esac
@@ -35,13 +35,14 @@ fi
 
 
 cd "${ROOT_DIR}"
+export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
 mkdir -p logs
 
 RUNTIME_LOGGING_ENABLED="$("${APP_PY}" - <<'PY'
-import json
+from antijamming.jsonc import load
 from pathlib import Path
 
-value = json.loads(Path("configs/antijamming/x300_realtime.json").read_text()).get(
+value = load(Path("configs/antijamming/x300_realtime.jsonc")).get(
     "logging_enabled"
 )
 if type(value) is not bool:
@@ -52,11 +53,11 @@ PY
 
 runtime_usrp_ip() {
   "${APP_PY}" - <<'PY'
-import json
+from antijamming.jsonc import load
 import re
 from pathlib import Path
 
-cfg = json.loads(Path("configs/antijamming/x300_realtime.json").read_text())
+cfg = load(Path("configs/antijamming/x300_realtime.jsonc"))
 match = re.search(r"addr=([\d.]+)", str(cfg.get("usrp_addr", "")))
 if match:
     print(match.group(1))
@@ -185,7 +186,6 @@ stop_owned_headless_backend() {
   fi
 }
 
-export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
 if [[ -z "${QT_QPA_PLATFORM:-}" && -n "${WAYLAND_DISPLAY:-}" ]]; then
   export QT_QPA_PLATFORM="wayland"
 else
@@ -231,7 +231,7 @@ echo "[run_realtime] Runtime profile: ${RUNTIME_CONFIG#${ROOT_DIR}/}"
 if [[ "${RUNTIME_LOGGING_ENABLED}" == "1" ]]; then
   echo "[run_realtime] Logging: enabled (UHD=${UHD_LOG_FILE}, sidecar=logs/sidecar/current)"
 else
-  echo "[run_realtime] Logging: disabled by x300_realtime.json (diagnostic sidecar off)"
+  echo "[run_realtime] Logging: disabled by x300_realtime.jsonc (diagnostic sidecar off)"
 fi
 echo "[run_realtime] Qt platform: ${QT_QPA_PLATFORM}"
 case "$(qt_platform_name)" in

@@ -23,7 +23,7 @@ _NUMERIC_THREAD_CONTROLLER = threadpool_limits(limits=_NUMERIC_THREAD_LIMIT)
 def parse_args() -> argparse.Namespace:
     """Parse product launcher controls.
 
-    Runtime configuration still comes from configs/antijamming/x300_realtime.json.
+    Runtime configuration still comes from configs/antijamming/x300_realtime.jsonc.
     These flags only let automated diagnostics start and stop the fixed GUI path.
     """
 

@@ -4,6 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "${ROOT}"
+export PYTHONPATH="${ROOT}/src:${PYTHONPATH:-}"
 
 PY_PID="${1:-}"
 IFACE="${IFACE:-}"
@@ -11,11 +12,11 @@ INTERVAL="${INTERVAL:-1}"
 
 runtime_usrp_ip() {
   python3 - <<'PY'
-import json
+from antijamming.jsonc import load
 import re
 from pathlib import Path
 
-cfg = json.loads(Path("configs/antijamming/x300_realtime.json").read_text())
+cfg = load(Path("configs/antijamming/x300_realtime.jsonc"))
 match = re.search(r"addr=([\d.]+)", str(cfg.get("usrp_addr", "")))
 if match:
     print(match.group(1))

@@ -84,3 +84,75 @@ def test_errors_keep_original_filename_line_and_column(tmp_path: Path) -> None:
     assert (error.value.lineno, error.value.colno) == (4, 6)
     with pytest.raises(ValueError, match=r"bad.jsonc.*line 4 column 6"):
         jsonc.load(path)
+
+
+@pytest.mark.parametrize("script", ["run_realtime.sh", "tools/run_realtime_sidecar.sh"])
+def test_real_shell_profile_readers_accept_comments_without_site_packages(
+    tmp_path: Path, script: str,
+) -> None:
+    path = tmp_path / "configs/antijamming/x300_realtime.jsonc"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        '// profile\n{"logging_enabled": false, /* gate */ '
+        '"usrp_addr": "addr=192.168.40.2"}\n', encoding="utf-8",
+    )
+    source = (REPO_ROOT / script).read_text(encoding="utf-8")
+    blocks = [
+        block for block in re.findall(r"<<'PY'\n(.*?)\nPY", source, flags=re.DOTALL)
+        if "from antijamming.jsonc import load" in block
+    ]
+    assert len(blocks) == (2 if script == "run_realtime.sh" else 1)
+    for block in blocks:
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", block], cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        assert result.stdout.strip() == ("0" if "logging_enabled" in block else "192.168.40.2")
+
+
+def _setup_profile_writer() -> str:
+    source = (REPO_ROOT / "setup.sh").read_text(encoding="utf-8")
+    function = source.split("persist_runtime_usrp_addr() {", 1)[1]
+    return function.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+
+
+def test_setup_writer_preserves_comments_and_edits_only_the_real_address(tmp_path: Path) -> None:
+    source = (
+        '{\n/* Example only:\n"usrp_addr": "addr=1.2.3.4"\n*/\n'
+        '"usrp_addr": "addr=192.168.40.2,recv_frame_size=8000", // actual\n'
+        '"gain_db": 45.0\n}\n'
+    )
+    path = tmp_path / "profile.jsonc"
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o640)
+    environment = {
+        **os.environ, "PYTHONPATH": str(REPO_ROOT / "src"),
+        "ANTIJAMMING_RUNTIME_CONFIG": str(path),
+        "ANTIJAMMING_DETECTED_USRP_ADDR": "192.168.30.2",
+    }
+    for _ in range(2):
+        subprocess.run(
+            [sys.executable, "-S", "-c", _setup_profile_writer()], env=environment,
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        assert path.read_text() == source.replace("addr=192.168.40.2", "addr=192.168.30.2")
+        assert path.stat().st_mode & 0o777 == 0o640
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["profile.jsonc"]
+
+
+def test_setup_writer_does_not_mutate_an_invalid_commented_profile(tmp_path: Path) -> None:
+    path = tmp_path / "invalid.jsonc"
+    source = '{"usrp_addr": "addr=1.2.3.4", /* invalid */ "gain_db": NaN}'
+    path.write_text(source)
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", _setup_profile_writer()],
+        env={
+            **os.environ, "PYTHONPATH": str(REPO_ROOT / "src"),
+            "ANTIJAMMING_RUNTIME_CONFIG": str(path),
+            "ANTIJAMMING_DETECTED_USRP_ADDR": "192.168.30.2",
+        }, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0 and "non-finite JSON number" in result.stderr
+    assert path.read_text() == source
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["invalid.jsonc"]

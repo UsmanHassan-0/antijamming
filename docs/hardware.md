@@ -374,7 +374,7 @@ Live transport interpretation:
 
 ## Application runtime profile in this repository (cross-reference)
 
-Runtime streaming values live in `configs/antijamming/x300_realtime.json`, loaded through `src/antijamming/config/schemas/runtime.py`, including:
+Runtime streaming values live in `configs/antijamming/x300_realtime.jsonc`, loaded through `src/antijamming/config/schemas/runtime.py`, including:
 
 - `usrp_addr` value `addr=192.168.40.2`, the current X300/HG Port-1 10GbE path
 - `recv_frame_size` / `send_frame_size` value **8000** for the jumbo-frame
@@ -442,7 +442,7 @@ This section compares observed behavior before vs after changing host NIC MTU fr
 
 ### Latest measured 30s validation (10 Msps, matched frame sizes)
 
-Command used at the time was an engineering override path. The product launcher now reads runtime values from `configs/antijamming/x300_realtime.json`.
+Command used at the time was an engineering override path. The product launcher now reads runtime values from `configs/antijamming/x300_realtime.jsonc`.
 
 Observed from logs:
 

@@ -1,7 +1,7 @@
 """Typed schema for JSON runtime profiles.
 
 Product runtime values are loaded from
-``configs/antijamming/x300_realtime.json``. This module defines the Python
+``configs/antijamming/x300_realtime.jsonc``. This module defines the Python
 object shape used by the realtime application after loading that JSON profile.
 The schema covers the USRP/X300 RF front-end, TwinRX coherent LO setup, DSP
 update pacing, phase calibration, DoA estimation, uniform IQ combining, and
@@ -25,7 +25,7 @@ from antijamming.dsp.models import AngleScanSpec
 # =============================================================================
 
 # Default product profile used by the realtime X300 application.
-DEFAULT_RUNTIME_CONFIG_PATH = REPO_ROOT / "configs/antijamming/x300_realtime.json"
+DEFAULT_RUNTIME_CONFIG_PATH = REPO_ROOT / "configs/antijamming/x300_realtime.jsonc"
 
 # =============================================================================
 # Stream Runtime Schema

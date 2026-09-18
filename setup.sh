@@ -21,7 +21,7 @@ USRP_MTU="${ANTIJAMMING_USRP_MTU:-9000}"
 USRP_SOCKET_BUFFER_BYTES="${ANTIJAMMING_USRP_SOCKET_BUFFER_BYTES:-50000000}"
 VENV_DIR="${ROOT_DIR}/.aj"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-RUNTIME_CONFIG="${ROOT_DIR}/configs/antijamming/x300_realtime.json"
+RUNTIME_CONFIG="${ROOT_DIR}/configs/antijamming/x300_realtime.jsonc"
 
 cd "${ROOT_DIR}"
 
@@ -446,6 +446,7 @@ persist_runtime_usrp_addr() {
 
   ANTIJAMMING_DETECTED_USRP_ADDR="${USRP_ADDR}" \
   ANTIJAMMING_RUNTIME_CONFIG="${RUNTIME_CONFIG}" \
+  PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}" \
   "${VENV_DIR}/bin/python" - <<'PY'
 import ipaddress
 import json
@@ -455,12 +456,14 @@ import re
 import stat
 import tempfile
 
+from antijamming.jsonc import loads, mask_comments
+
 path = Path(os.environ["ANTIJAMMING_RUNTIME_CONFIG"])
 address = str(
     ipaddress.IPv4Address(os.environ["ANTIJAMMING_DETECTED_USRP_ADDR"])
 )
 source = path.read_text(encoding="utf-8")
-payload = json.loads(source)
+payload = loads(source)
 previous = str(payload.get("usrp_addr", "") or "")
 replacement = f"addr={address}"
 if re.search(r"(?:^|,)addr=[^,]*", previous):
@@ -480,7 +483,8 @@ if updated == previous:
 value_pattern = re.compile(
     r'(?m)^(\s*"usrp_addr"\s*:\s*)("(?:\\.|[^"\\])*")'
 )
-matches = list(value_pattern.finditer(source))
+# Masked comments retain offsets; examples in comments must not be edited.
+matches = list(value_pattern.finditer(mask_comments(source)))
 if len(matches) != 1:
     raise SystemExit(
         f"Expected exactly one usrp_addr string in {path}; found {len(matches)}"
