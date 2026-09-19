@@ -210,13 +210,49 @@ class ProcessMixin:
         return False
 
     def _reset_runtime_dir(self) -> None:
+        """Clear GNSS-SDR session dirs, recovering from root-owned leftovers.
+
+        Tramiq often launches under sudo for USB. That leaves ``tracking`` /
+        ``outputs`` owned by root. A later non-root Start then fails with
+        ``Permission denied: 'tracking'``. Prefer a writable uid-scoped
+        fallback over aborting the backend.
+        """
+
+        runtime_dir = self._ensure_clearable_dir(self._runtime_dir, label="runtime")
+        log_dir = self._ensure_clearable_dir(self._log_dir, label="glog")
+        if runtime_dir != self._runtime_dir or log_dir != self._log_dir:
+            self._set_session_paths(runtime_dir, log_dir)
         self._clear_dir(self._runtime_dir)
         if self._log_dir != self._runtime_dir:
             self._clear_dir(self._log_dir)
 
+    def _writable_fallback_dir(self, configured: Path) -> Path:
+        return (configured.parent / f"{configured.name}.uid{os.getuid()}").resolve()
+
+    def _ensure_clearable_dir(self, configured: Path, *, label: str) -> Path:
+        configured = Path(configured).expanduser().resolve()
+        try:
+            self._clear_dir(configured)
+            return configured
+        except PermissionError as exc:
+            fallback = self._writable_fallback_dir(configured)
+            self._err_log.warning(
+                "GNSS-SDR %s dir %s is not fully writable (%s); using %s. "
+                "Root-owned leftovers usually come from a prior sudo Start; "
+                "optional cleanup: sudo chown -R $(id -u):$(id -g) %s",
+                label,
+                configured,
+                exc,
+                fallback,
+                configured,
+            )
+            self._clear_dir(fallback)
+            return fallback
+
     def _clear_dir(self, base_dir: Path) -> None:
         base_dir.mkdir(parents=True, exist_ok=True)
-        for path in base_dir.iterdir():
+        blocked: list[Path] = []
+        for path in list(base_dir.iterdir()):
             try:
                 if path.is_dir() and not path.is_symlink():
                     shutil.rmtree(path)
@@ -224,3 +260,11 @@ class ProcessMixin:
                     path.unlink()
             except FileNotFoundError:
                 continue
+            except PermissionError:
+                blocked.append(path)
+        if blocked:
+            names = ", ".join(path.name for path in blocked[:5])
+            raise PermissionError(
+                f"[Errno 13] Permission denied: {blocked[0].name!r} "
+                f"(cannot clear {base_dir}: {names})"
+            )

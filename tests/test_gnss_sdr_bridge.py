@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 import queue
+import shutil
 import threading
 import time
 
@@ -2640,17 +2641,27 @@ def test_bridge_reset_runtime_dir_reports_unwritable_configured_path(
         ),
         _loggers(),
     )
+    clear_calls: list[Path] = []
+
     def reject_configured_runtime(path: Path) -> None:
+        clear_calls.append(path)
         if path == configured_runtime.resolve():
             raise PermissionError(errno.EACCES, "Permission denied", str(path / "tracking"))
+        path.mkdir(parents=True, exist_ok=True)
+        for child in list(path.iterdir()):
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
 
     monkeypatch.setattr(bridge, "_clear_dir", reject_configured_runtime)
 
-    with pytest.raises(PermissionError, match="Permission denied"):
-        bridge._reset_runtime_dir()
+    bridge._reset_runtime_dir()
 
-    assert bridge._runtime_dir == configured_runtime.resolve()
+    fallback_runtime = (configured_runtime.parent / f"runtime.uid{os.getuid()}").resolve()
+    assert bridge._runtime_dir == fallback_runtime
     assert bridge._log_dir == configured_log.resolve()
+    assert fallback_runtime in clear_calls
 
 
 class _FakeBridge:
