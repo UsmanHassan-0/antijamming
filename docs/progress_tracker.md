@@ -18,6 +18,313 @@ links it without rewriting historical observations.
   not prove that the repository is generally correct or race-free.
 - Architecture splitting, including `runtime/backend.py`, is deferred.
 
+## Current dashboard
+
+| Area | Current state | Next evidence gate |
+| --- | --- | --- |
+| Launcher / LO-default review | Earlier typo/order and A-only export test corrections retained; desktop-only launcher removes custom display precheck/advice; 59 focused and 525 full software passes | Earlier intermittent 32-source FIFO timing failure is not diagnosed; saved calibration applicability still open |
+| System UHD baseline / compatibility | September 19: Desktop setup, GNSS dependency checks, real GUI Start/Stop and two Tramiq controller cycles pass using system UHD with FPGA 39.2; reconstructed cleanup code passes 594 software tests | Separate portable bundle and RF/PVT remain outside the history/source checks |
+| NADS 2 controller / operator UX | Installed log helpers pass two-cycle, 16-file reset/archive test; 60 retained runs measured; installed rebuild preserves logs | Full live IPC/radio lifecycle, lag cause and bounded retention remain unresolved; remote production unchanged |
+| Script necessity / stale assumptions | Unneeded GUI Matplotlib default and machine-specific desktop hint removed; dependency retained for real vendored consumers | GNSS ownership mismatch, wrong setup calibration selection, source-UHD discovery and sidecar ownership remain open |
+| Proven stale code/config | Ideal-null solver, exports, rankings, duplicate plot and retired fields removed coherently; targeted software gates passed | No claim that every repository path is free of stale behavior |
+| Automatic LCMV control | Manual controls removed; arming/reset and release regressions pass; September 19 invalid-evidence hold correction passes isolated software gates | Physical jammer classification and hardware validation remain open |
+| Thread/resource ownership | Deterministic failure paths and repeated software gates passed | Unknown schedules and hardware timing remain unproven |
+| Concurrent transitions | Selected start/stop/connect/publish schedules regression-tested | Repeated stress; unknown schedules remain unproven |
+| Configuration/input boundaries | Focused and broad regressions passed | Attached-runtime validation |
+| Numerical/DSP boundaries | Focused and broad deterministic regressions passed | OTA correctness remains separate |
+| Jammer release audit | Cleanup exception path corrected; 18 focused cases and 594 broad software tests pass | Main unchanged; hardware jammer-off/PVT recovery and desired-source false triggers remain unverified/unresolved |
+| Documentation | One tracker, consecutive conceptual docs, retained audit index, and provenance map | Maintain these documents with future changes |
+| Hardware integration | Previous archived revisions have bounded RF/transport evidence; no September 7 hardware run or Spark synchronization | Validate the new measured-only common target and final FIFO behavior separately |
+
+### 2026-09-19 — cleanup history reconstruction verification
+
+- Reconstructed source passes 594 tests with the USRP test deselected on the
+  remote host. The actual Desktop checkout passes the same 594 tests. The
+  corrected native check confirms the actual GNSS executable, CMake cache and
+  Python bindings select system UHD and system GNU Radio.
+- Eighteen retained/reconstructed commits have typed, product-oriented
+  subjects and the requested UsmanHassan-0 author/committer identity. Four
+  private-driver-only commits are absent from this suffix. The later runtime-
+  permission and release-hold corrections remain separate commits.
+- Scope: cleanup history and source only. Main and experimental refs are
+  unchanged; installed applications, FPGA and radio settings are not modified
+  by this reconstruction. Force-with-lease publication must reject a changed
+  remote tip. Original history and full earlier evidence remain outside the
+  product repository; older measurements are not relabeled as new tests.
+- Exact source archive, old/new mapping and fresh test outputs are retained
+  in `/home/u/antijamming-uhd46-review.hofabn/` and remotely in
+  `/home/qvise/antijamming-release-check.EqM2f2/`. These tests do not establish
+  physical jammer-off PVT recovery or future distribution-driver compatibility.
+
+### 2026-09-19T10:55Z — cleanup history publication preparation
+
+- Actual Desktop cleanup now includes the release-hold correction; 18 focused
+  regressions and all 594 hardware-free tests pass (one USRP test deselected).
+  Main remains `d8aef5f`; its desired-source motion limitation is not corrected.
+- Reconstruct only the cleanup suffix after `a9b06ec`: remove four private
+  driver-only commits, retain mixed commits' unrelated behavior, and replace
+  machine/release-specific commit wording with typed product descriptions.
+  The distribution package selects the UHD release; no fixed release is
+  requested by setup or required by the native dependency checker.
+- Preserve the colleague's newer GNSS runtime-directory permission recovery
+  and its test together as a separate commit. Preserve the jammer correction
+  separately. Neither change is folded into the dependency migration commit.
+- Original history, dirty patches and source identities are retained outside
+  the product at `/home/u/antijamming-uhd46-review.hofabn/`. Main, experimental,
+  Tramiq packaging and installed binaries are not rewrite targets. Final exact-
+  tree tests and publication checks remain pending at this checkpoint.
+
+### 2026-09-19 — malformed release-evidence correction started
+
+- User explicitly prioritizes anti-jamming cleanup's known malformed-evidence
+  defect, not Tramiq packaging. Laptop and remote cleanup backend match SHA-256
+  `5c8e29eb1ffd28c6a830ddab8a4461be22ed539ed34ad192029574ac2f0a0072`.
+  The exception branch still retains the pending release time; not fixed at
+  this checkpoint. No change to main, experimental, driver or Tramiq is planned.
+- Add regressions through the real locked update and Shared-U1 FIFO bank:
+  conversion failures, malformed IQ, invalid shape and eigensolver failure;
+  cover both an available and missing MUSIC target, uninterrupted hold restart,
+  protection retention and eventual return to uniform output.
+- Verify in isolated remote source first, preserving the failing baseline and
+  focused/broad results. Evidence: `/home/qvise/antijamming-release-check.EqM2f2/`
+  and `/home/u/antijamming-release-review.Ovjjgz/`. Real jammer-off PVT recovery
+  remains a different, unverified hardware boundary.
+- Candidate result: final regressions fail 14/18 on old code (four controls
+  pass) and pass 18/18 with the correction. Full suite passes 594 with one
+  hardware test deselected, repeated with warnings-as-errors; Ruff/Vulture pass.
+  The first fixture's unassigned-PRN assumption was corrected and its failure
+  retained. Final tests trace assigned PRNs through the real compensation bank.
+- Main motion probe: same-power 40-to-150-degree source movement does not
+  activate, but adding 4 dB desired-source power does, without a second source.
+  This is a detector limitation, not an attribution of the user's hardware
+  event. Main's code and thresholds remain unchanged. Details and exact values:
+  [release correction and motion probe](audits/jammer_latch_audit_2026-09-01.md#2026-09-19-correction--invalid-evidence-restarts-the-hold).
+
+### 2026-09-19 — packaged native-stack mismatch isolated
+
+- Desktop system-driver acceptance does not cover the separate portable app.
+  Its parent build script still selects the superseded private installation;
+  three retained build logs confirm that selection. The service log includes
+  the reverse Radio mismatch after the system-matching FPGA activation.
+- A packaging candidate now derives the distribution library instead, checks
+  source CMake/native/Python agreement, copies matching bindings and setup's
+  images, and checks the staged bundle before installation. Missing native
+  dependencies must fail collection instead of being silently omitted.
+- This is in progress, not deployed or hardware-accepted. Preserve colleague
+  output-path corrections and the earlier privilege fix. Packaging provenance
+  and baseline are outside this repo at
+  `/home/u/tramiq-packaging-review.1hgdJw/`. Commit attribution was inspected:
+  the parent packaging change was authored by Ehsaaan; Git alone cannot
+  attribute editing to a particular assistant. No FPGA rewrite is planned.
+- Candidate checkpoint: six focused packaging tests pass, actual staged
+  Python/GNSS native closure passes, and two 40-second real controller/radio
+  cycles pass with 177/176 fresh telemetry polls, bundled libraries, normal-
+  user children and clean shutdown. First intermediate candidates failed the
+  SONAME-alias and missing PyQt5-import checks; both failures are retained.
+- Cursor concurrently rebuilt the parent application using system UHD. Its
+  installed copy still fails the native-closure check because GNU Radio loads
+  from the host rather than the bundle. Do not claim a newly observed RFNoC
+  failure from that check, or equate our separate candidate with that install.
+  Production packaging promotion is withheld to avoid overwriting concurrent
+  edits. No source/installed packaging changes were applied by this task.
+- Identity inspection: current cleanup ancestry includes six Raza_Madni
+  commits, older Usman display-name variants and one malformed initial email;
+  no Codex Integration or Ehsaaan commits were found in anti-jamming refs.
+  Remote checkout inherited the colleague's global identity. Added repo-local
+  UsmanHassan-0/noreply settings, leaving global configuration unchanged.
+
+### 2026-09-19 — sudo controller separation and main jammer-off recheck
+
+- User authorizes fixing Tramiq's launch boundary so its sudo parent starts
+  anti-jamming as the normal user. Candidate is isolated; production deployment
+  is pending. It uses OS child credentials, normal-user log creation, retained
+  PID/session ownership and owner-filtered external-socket discovery. Tramiq's
+  own privilege/launch command and unrelated colleague edits remain unchanged.
+- Focused candidate checks: 55 passed before two added helper regressions.
+  Real controller/headless idle IPC: two root-parent cycles then two normal-
+  parent cycles pass, backend/log/socket UID 1000 and clean exit. Radio Start
+  was deliberately suppressed; this is not RF, PVT or full Pocket acceptance.
+- User clarifies the jammer-off failure occurred on main, not cleanup. A fresh
+  isolated main `d8aef5f` probe reproduces the malformed-conversion release-hold
+  gap. It causes early release, so does not alone explain retained protection.
+  A separate 2 dB-above-baseline case retains protection for 60 simulated
+  seconds despite no current activation evidence, because release needs power
+  at or below 1.5 dB. Valid-low control releases; neither is a physical RF run.
+- No jammer algorithm/threshold or branch ref changed. Actual other-system
+  PVT loss remains unattributed. Evidence and candidate source:
+  `/home/u/tramiq-privilege-review.EGsxLU/`; remote execution evidence:
+  `/home/qvise/tramiq-privilege-review.KCUut6/`. Launch acceptance does not close
+  the separate jammer/PVT finding or the pending UHD history publication.
+- Deployment checkpoint: guarded source and installed Tramiq controller/helper
+  updated. Existing colleague edits preserved. Corrected 1,687 root-owned
+  installed anti-jamming log-tree entries to qvise ownership; none deleted.
+  Production focused tests: 74 passed. Broad candidate: 133 passed, six skips,
+  two failures independently reproduced on unchanged source (TTFF reset and
+  colleague's GPS-only signal profile). No newly failing selected contract.
+- Installed backend/controller passes two root then two normal idle cycles,
+  plus two root repeats with private IPC isolation. All backend UID fields and
+  service-log ownership are 1000, HOME is qvise's, and Stop/exit succeed. The
+  open GUI was not restarted and needs restart to load the new controller.
+  These checks deliberately do not transmit, start USRP or establish PVT.
+  Details: the adjacent Tramiq `docs/antijamming_launch_identity.md`, mirrored
+  under the external evidence directory above. No commit/push or main change.
+- Final deployed Tramiq broad rerun: the same 133 passes, two reproduced
+  baseline failures and six skips. A separate concurrent resource_paths.py
+  change appeared; preserved and excluded from this launch claim. The tested
+  controller/helper hashes still match the candidate and installed copies.
+
+### 2026-09-19 — production controller repeated acceptance
+
+- Two 40-second source-controller Start/Stop cycles complete as qvise, with
+  system UHD maps, native GNSS identities and fresh telemetry. Final close and
+  diagnostic return 0. No transmitter, Pocket stream or jammer was started.
+- Final focused selection: 76 passed. Full hardware-free suite: 576 passed,
+  one USRP test deselected. Ruff, Vulture and diff checks return 0.
+- Runtime folders remain qvise-owned; receiver algorithms and fixed profile
+  remain unchanged. The sudo audit is inspection only and does not certify all
+  Pocket/Tramiq features without privilege. Separate packaged installation and
+  cleanup-history publication are still open; no branch rewrite is yet promoted.
+- Evidence: [controller and regression results](audits/system_uhd_runtime.md#repeated-production-controller-and-final-software-gates).
+
+### 2026-09-19T08:50Z — Desktop launcher and normal setup pass
+
+- Full Desktop setup now exits 0. The real rerun exposed and corrected a stale
+  optional LimeSDR header search; its regression reproduces the finder failure
+  before clearing the cache and passes afterward. No GNSS algorithm changed.
+- Actual GUI launcher Start/Stop: exit 0, 356 metrics, no IPC errors or forced
+  cleanup; GUI, headless and GNSS identities use the system native stack.
+  Offscreen display is diagnostic-only; no PVT/RF accuracy claim follows.
+- The first process observer missed thread-spawned GNSS children; the first
+  controller observer failed on NumPy serialization. Both failures are retained
+  as diagnostic defects, not relabeled product failures. The corrected GUI
+  observer passes; repeated controller checks are running.
+- User-requested sudo inspection confirms UID inheritance and qvise's current
+  USB-node access. No Tramiq launch policy changed. The separate portable bundle
+  still needs migration; checkout acceptance does not cover it.
+- Details: [production and sudo evidence](audits/system_uhd_runtime.md#production-setup-and-gui-boundary-passed--0850-utc).
+
+### 2026-09-19T08:40Z — actual Desktop runtime migration in progress
+
+- Transferred candidate system-runtime source and tests to the Desktop checkout
+  after confirming affected source was unchanged. Removed obsolete private
+  selectors/build helpers and their prefix metadata; unrelated docs preserved.
+- Corrected root ownership only within this checkout's generated `logs/`
+  entries so qvise's GUI can create receiver runtime files. Contents retained.
+- Full setup first stopped at an unrelated Cursor APT connection failure.
+  An IPv4-only package-index retry passed; normal setup is being rerun without
+  a permanent network override. Native rebuild and real GUI/controller checks
+  remain pending. No FPGA write is requested or needed by this repair.
+- Evidence: [system-runtime audit](audits/system_uhd_runtime.md#production-migration-started--0840-utc).
+
+### 2026-09-19T08:36Z — operator power cycle confirmed; production selector remains
+
+- Fresh system probe returns 0 with the intended active FPGA. No further flash
+  was performed. The reported GUI error is consistent with the still-active
+  private-driver selection in production `run_realtime.sh` and its Python
+  bootstrap; the retained service log reports expected Radio revision 1 versus 0.
+- The isolated candidate's previously withheld headless test subsequently ran:
+  service exit 0, no forced cleanup, 318 metrics and system UHD 4.6 in loaded
+  process maps. This does not promote production or establish PRNs/PVT.
+- Production deployment, GUI/controller acceptance, cleanup-history rewrite
+  and publication remain open. Evidence and exact boundaries are in
+  [system-runtime evidence](audits/system_uhd_runtime.md#candidate-headless-lifecycle-and-operator-recheck--0836-utc).
+
+### 2026-09-19 — Tramiq stopped-state diagnosis, deployment still withheld
+
+- Production headless logs show the old runtime selector still chooses the
+  private driver and rejects the newly active system-compatible Radio revision.
+  The normal system probe succeeds; the GUI and terminal do not yet use the
+  same dependency selection. No Tramiq source change is required merely to
+  explain this observed exception.
+- Isolated candidate: 113 focused and 566 full software tests pass, one USRP
+  test deselected. An initial documentation-layout failure was caused by
+  diagnostic files in the staging root, corrected in staging only and rerun.
+- Live headless harness is prepared but not run: another image-loader process
+  is active on NADS 2. No concurrent device initialization is attempted.
+  Production replacement, live acceptance and cleanup-history rewrite remain
+  pending. See [system-runtime evidence](audits/system_uhd_runtime.md).
+
+### 2026-09-19 — NADS 2 baseline first, candidate promotion withheld
+
+- User requires a working system-UHD/USRP/native-receiver baseline before
+  accepting cleanup changes. No cleanup history rewrite, commit, push or
+  production source deployment has occurred in this task.
+- Real system UHD is 4.6, but the X300 probe fails Radio compatibility
+  (expected 0, received 1). Existing native receivers still link to the
+  previous private runtime. Version output is not RF acceptance.
+- Installed the missing matching `libuhd-dev` package; a separate native
+  build passes compilation, actual dependency resolution and version startup
+  against system UHD 4.6. Source and production executable hashes are unchanged.
+  Verified matching-image programming completed at 08:09 UTC; USRP power cycle,
+  and the fresh 08:16 UTC probe now pass (FPGA 39.2 / hash 6a990d9).
+  Live receiver tests remain pending; initialization alone is not RF acceptance.
+- Commands, hashes, diagnostic limitations and updates are retained in
+  [system-runtime evidence](audits/system_uhd_runtime.md#baseline-hardware-gate--2026-09-19).
+
+### 2026-09-19 — system UHD dependency/history change in progress
+
+- User requests normal distribution package installation and removal of
+  private-runtime changes from cleanup history, retaining unrelated changes.
+  Main and experimental refs must remain unchanged. Private shell environment
+  selection/re-execution is removed; direct entrypoints only validate the
+  system tools/imports directly. Setup verifies the matched dependency paths.
+- GNSS-SDR remains the customized repository source build. Ubuntu 24.04
+  provides the requested driver packages; the official Ubuntu 26.04 listing
+  provides UHD 4.9. Neither the package name nor GNSS-SDR's dependency README
+  guarantees version 4.6 on every distribution. The user's clarification
+  supersedes the initial fixed-release draft: let the distribution supply
+  its release and build GNSS-SDR against those matching dependencies.
+- Candidate setup keeps FPGA identification, compatibility, verified-write
+  and power-cycle safeguards. Exact package/tool checks and isolated NADS 2
+  tests are ongoing. No remote production downgrade, native rebuild, USRP
+  programming or new RF acceptance has occurred in this task.
+- Original Git history/documents were retained outside the repository before
+  reconstruction. Detailed commands, test failures and final rewrite map are
+  tracked in [system-runtime evidence](audits/system_uhd_runtime.md).
+
+### 2026-09-18T15:14Z — requested adjacent fusion contracts exercised on NADS 2
+
+- The user explicitly retained suppression of AJ-only fixes until Pocket's
+  first fix. Fresh controls pass for that restriction, Pocket-only output,
+  and AJ-only pass-through after the first Pocket fix. No product code changed.
+- Actual Tramiq fusion/controller probes: 19 named expectations, 9 satisfied
+  and 10 unsatisfied, separating reproduced defects from proposed policy
+  differences. First-pair weighting, ignored older AJ input, arrival-order
+  pairing and plot/CSV disagreement recur. Two 10-Hz sources over 12,000
+  synthetic epochs produce 24,000 records, not one finalized record per epoch.
+  This is 1,200 seconds of synthetic data, not a 20-minute RF/endurance run.
+- Actual isolated Tk page consumes real controller histories in seven
+  scenarios; 63 line-data comparisons pass and reproduce the duplicate curve
+  points. Live difference labels hide for missing fixes. Existing focused
+  tests: 50 passed. Whole Tramiq Python tests: 125 passed, the same pre-existing
+  monolithic TTFF-reset test failed. Source/working-state hashes unchanged.
+- Provenance, expected values, exact commands and bounds:
+  `/home/u/tramiqsdr-start-stop-evidence/20260918/fusion-review.GjORar/review.md`
+  (fresh-contract amendment). Raw scripts, source snapshots, 24,099 input/output
+  event rows, summaries and test/plot evidence are in sibling
+  `fusion-contracts.iXDxmS/`, mirrored from NADS 2 `fusion-contracts.JU9pTa/`.
+  `CONTRACT.md` is only an external test checklist; no application consumes it.
+
+### 2026-09-18T13:57Z — adjacent Tramiq PVT fusion review, no product edits
+
+- User requested discussion of PVT fusion and instantaneous-error versus
+  CEP50 plots. Inspected the dirty NADS 2 Tramiq working tree without changing
+  it; retained source hashes and targeted producer/consumer evidence.
+- Independent probes reproduce first-pair weighting, older-epoch rejection,
+  arrival-order pairing and live-versus-CSV disagreement defects. Its existing
+  focused tests still pass **27 tests**; those tests do not cover the new
+  counterexamples. The active tab displays absolute LLA and self-mean CEP50,
+  not instantaneous error against a known reference. A capped-history redraw
+  defect was established at the source/data-contract boundary, not by a
+  long-duration physical GUI run.
+- This is an audit of the adjacent Tramiq integration, not a change to this
+  repository's DSP or accuracy metric. Detailed evidence is retained in
+  `/home/u/tramiqsdr-start-stop-evidence/20260918/fusion-review.GjORar/review.md`
+  and mirrored on NADS 2 under the corresponding `fusion-review` directory.
+- Strix's reported physical desktop/input freeze remains unresolved even
+  though SSH, X11 and GNOME DBus respond. No reboot or compositor restart
+  performed; all owned RF/receiver tests had already stopped.
+
 ### 2026-09-18T09:43:41Z — development archives are not production logging
 
 - User explicitly clarifies that per-run archives belong to development, not

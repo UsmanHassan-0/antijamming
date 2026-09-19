@@ -1189,3 +1189,123 @@ file anywhere on the machine was removed is made.
 
 No Tramiq changes were made. No new RF streaming, long-duration stability,
 PVT, jammer or non-ARM runtime claim follows from this installation work.
+
+## README, installed commands and saved-output follow-up — September 18
+
+Historical inspection of the superseded installation, not current setup
+instructions. For the distribution-native setup that replaced it, see
+[system runtime evidence](system_uhd_runtime.md). No old command below is an
+instruction to recreate the removed private runtime.
+
+Read-only product inspection at approximately 14:49–14:54 UTC. Target is
+NADS 2 (`qvise@192.168.3.127`), Desktop cleanup checkout `01bb0d7`, not the
+separate `.153` machine or standalone home-directory GNSS-SDR. This follow-up
+does not install packages, change receiver/fusion code, delete outputs, start
+RF or change shell startup files. Only this evidence record and the tracker
+are updated. Existing dirty documentation and Tramiq source are preserved.
+
+### What the bundled README says versus the installation performed
+
+The actual product deliberately uses its bundled/customized GNSS-SDR tree;
+`ensure_vendored_gnss_sdr` refuses to replace a missing tree by cloning current
+upstream. Setup keeps the mathematical/compiler support packages from the
+README, but substitutes the coherent source-built UHD/GNU Radio pair described
+above for distro radio packages. `python3-ruamel.yaml` is a dependency of the
+UHD source build's Python utilities, not an item in this GNSS-SDR README list.
+No apt GNSS-SDR installation or global GNSS-SDR install was performed for this
+migration. This is an explicit product build policy, not something the README
+mandates.
+
+The `-U` options clear cached UHD/GNU Radio searches; the prefix options
+select headers/libraries; RPATH options record where the executable finds
+those libraries at runtime. These are not changes to receiver algorithms.
+Native GNSS-SDR unit/system tests are explicitly disabled in this production
+recipe: the recorded 579 Python tests must not be called GNSS-SDR C++ test
+coverage. Setup runs `volk_profile` and the repo-local
+`gnss-sdr/install/volk_gnsssdr_profile` (with `--update` when a profile exists).
+
+### Why the bare probe command is missing
+
+In a fresh NADS 2 shell, `type -a uhd_usrp_probe` returns not found. The source
+installation's `bin` directory is not on the shell's PATH. Its library directory
+also needs selecting; adding only the executable path is not the whole fix.
+Launching `setup.sh` or `run_realtime.sh` configures their child environment,
+not the parent terminal. The existing supported activation is:
+
+```bash
+cd /home/qvise/Desktop/qvise/antijamming
+source tools/uhd_runtime_env.sh
+antijamming_activate_uhd_runtime .aj/bin/python
+uhd_usrp_probe --args addr=192.168.40.2
+```
+
+### Logging off does not mean every file is disposable
+
+Laptop and NADS 2 active cleanup profiles both contain `logging_enabled:false`.
+Both GUI and headless entrypoints pass this value to `setup_logging`.
+Backend startup skips `reset_session_logs`; there is no active per-run archive
+session. Launcher sidecar/UHD-file capture and bridge saved console/tracking
+records are gated off. Existing historical archives are not deleted.
+
+Two separate persistence paths remain outside that switch:
+
+- The GNSS-SDR template does not set `PVT.output_enabled` or the individual
+  KML/GPX/GeoJSON/RINEX/XML enables. The bundled `rtklib_pvt.cc:573–580`
+  defaults them to true. `PVT.dump=false` is a different output control.
+  The rendered NADS 2 config confirms this omission; actual files exist.
+  The bridge clears its generated runtime directory on each new bridge start,
+  so these current-run exports must not be conflated with `logs/runs` archives.
+- Tramiq's controller independently opens `tramiq_headless_service.log` in
+  append mode and redirects backend stdout/stderr there. It does not consult
+  the anti-jamming logging flag. This is an integration-owned saved log even
+  though its path is inside the anti-jamming log directory.
+
+Read-only inventory (`du` allocated sizes, rounded):
+
+| Location | Observation |
+| --- | --- |
+| NADS 2 Desktop anti-jamming `logs/` | 1.5 MiB; mostly native position exports; `logs/runs` absent |
+| Old installed `.local/share/tramiqsdr/runtime/antijamming/logs/` | 276 MiB; 60 historical run directories occupy 273 MiB; latest file modification September 10 |
+| Laptop `/home/u/antijamming/logs/` | 5.0 MiB, retained `operator_events.log`; not evidence of a current NADS 2 run |
+
+The current Desktop service log is 3,816 bytes. Example native exports are
+KML 938,994 bytes, GPX 318,026 bytes, observation RINEX 62,937 bytes,
+GeoJSON 55,026 bytes and ephemeris XML 13,845 bytes. The additional `.local`
+`runtime/tramiqsdr/antijamming` directory contains Python integration source,
+not a second 100-KiB log archive. No deletion was performed.
+
+Required working artifacts must remain: the config template and rendered
+`fifo_gps_l1.conf`, sample FIFOs, selected phase-calibration input, and any
+actually enabled assistance inputs. `output_monitor._process_console_record`
+always parses live receiver text before optional persistence; live UDP/PTY
+data likewise feeds PRN/PVT/skyplot state. Disabling their production or
+consumption would break behavior even if disk logging were off. The current
+assistance XML input path is distinct from generated output XML and is disabled
+by this profile. Inspection of the bridge/controller did not identify a live
+KML/GPX/GeoJSON consumer, but that targeted negative search is not authorization
+to delete them or proof that no external analysis tool needs those files.
+
+### Fused plot timing remains separate from the display correction
+
+Reconfirmed NADS 2 Tramiq hashes against the retained display-review snapshot.
+`kalman_fusion_pvt.py` remains `fc6be823a4e95ecaf00e1b0a3e41045661c22f8e9532d30ee774cdb3f6c97491`.
+No new fusion test was needed to claim an unchanged file; this is not a new
+hardware or numerical acceptance run.
+
+- Raw Pocket/AJ and fused LLA plots use each stream's own TOW. They are not
+  restricted to paired points or resampled to common epochs.
+- Receiver-difference cards use GPS week/TOW matching within 40 ms. They
+  compare raw positions, not fused positions, CEP or truth. Both valid-fix
+  flags and two-second arrival/epoch freshness are required. The newest
+  acceptable matched pair can precede either stream's newest unpaired fix;
+  this is not an exact-time interpolation or necessarily the latest two fixes.
+- The unchanged Kalman pairing accepts a 20-ms-older AJ epoch, updates Pocket
+  first, then rejects the AJ update as a rewind. The retained probe changed
+  AJ displacement from 10 to 100 m with the same zero output displacement.
+  Thus the two difference labels can use both fixes while the nominally fused
+  point fails to do so. The GUI label correction did not fix this defect.
+
+Detailed source hashes, tests and other uncorrected fusion defects remain in
+`/home/u/tramiqsdr-start-stop-evidence/20260918/fusion-review.GjORar/review.md`
+and `pvt-difference.K1Rutp/after/python/LIVE_PVT_DISPLAY_REVIEW.md` under the
+same dated evidence root. No timestamps were newly added to the GUI labels.
