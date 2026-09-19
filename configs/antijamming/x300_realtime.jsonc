@@ -158,7 +158,7 @@
   // Release covariance-mode ceiling, dB.
   "lcmv_jammer_release_max_generalized_gain_db": 3.0,
 
-  // Low-evidence hold, seconds; exception gap: see progress_tracker.md.
+  // Continuous low-evidence hold, seconds; invalid evidence restarts the hold.
   "lcmv_jammer_release_hold_s": 2.0,
 
   // ---- 4.3 Measured-vector solve, safety and transitions ----

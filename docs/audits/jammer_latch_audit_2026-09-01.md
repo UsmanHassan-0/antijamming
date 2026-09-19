@@ -124,6 +124,97 @@ software assertion that every invalid update resets the release timer. The
 earlier successful missing-data test supplied a shape mismatch that reached
 the state-update function, unlike this conversion-exception path.
 
+## 2026-09-19 correction — invalid evidence restarts the hold
+
+User explicitly requests this correction in cleanup. Baseline is `01bb0d7`
+with the separate uncommitted system-driver migration; backend SHA-256
+`5c8e29eb1ffd28c6a830ddab8a4461be22ed539ed34ad192029574ac2f0a0072`
+matches the laptop and remote checkout. Main/experimental code is unchanged.
+
+### Mechanism and bounded correction
+
+The exception handler in `_update_lcmv_test_from_music_locked` now clears
+`_lcmv_jammer_release_candidate_since_monotonic_s` under `_results_lock` before
+taking its fallback state snapshot. The existing outer `_lcmv_control_lock`
+still serializes this update against run reset/arming. Type, value, numeric
+conversion overflow and linear-algebra exceptions are covered. It does not
+disable protection, clear historical detection or replace retained measured
+weights. A subsequent valid-low update starts a new full hold.
+
+No activation/release thresholds, hold duration, phase-continuity calculations,
+FIFO layout, calibration, receiver parameters, UHD or Tramiq code are changed.
+The runtime-profile edit only replaces the obsolete exception-gap comment.
+
+### Before/after evidence
+
+`test_failed_evidence_restarts_release_hold_and_preserves_fifo` exercises the
+real update entrypoint and Shared-U1 compensation bank. Nine fault/control
+types run with valid and missing MUSIC targets, for 18 cases: covariance
+string, mapping, ragged array, overflowing conversion, chunk string, chunk
+mapping, non-finite chunk, wrong covariance shape and eigensolver failure.
+
+The final fixture seeds assigned PRN slots and healthy desired vectors before
+activation. The first draft left slots unassigned, for which the product
+intentionally follows common weights; two FIFO assertions were invalid test
+assumptions. That draft's failures remain recorded separately. Correcting the
+fixture, not changing that product behavior, gives:
+
+- Old backend: **14 failed, 4 passed**. Shape/eigensolver controls already reset
+  the timer; conversion/failing producer paths did not.
+- Corrected backend: **18 passed**. Low at 10 s starts the hold; invalid at
+  11 s clears it without removing protection; low at 12.1 s starts a new hold;
+  protection remains active at 14.0 s and releases at 14.11 s.
+- These cases also assert retained measured weights and unchanged tracked-PRN
+  FIFO samples through the fault. Release makes spatial rows uniform while
+  retaining per-PRN complex continuity scalars and desired complex response.
+  Uniform spatial rows need not have scalar exactly one.
+- Isolated full suite: **594 passed, 1 USRP test deselected**; same result with
+  development mode and warnings as errors. Ruff and Vulture at 90% pass.
+
+Commands, run in the isolated remote candidate with the existing test venv:
+
+```bash
+/home/qvise/Desktop/qvise/antijamming/.aj/bin/python -m pytest -q \
+  tests/test_beamforming_output.py -k failed_evidence_restarts --tb=short
+/home/qvise/Desktop/qvise/antijamming/.aj/bin/python -m pytest -q -m 'not usrp'
+PYTHONDEVMODE=1 PYTHONWARNINGS=error \
+  /home/qvise/Desktop/qvise/antijamming/.aj/bin/python -m pytest -q -m 'not usrp'
+/home/qvise/Desktop/qvise/antijamming/.aj/bin/ruff check .
+/home/qvise/Desktop/qvise/antijamming/.aj/bin/vulture src tests --min-confidence 90
+```
+
+Raw baseline/candidate source and results are retained at
+`/home/qvise/antijamming-release-check.EqM2f2/`, mirrored under
+`/home/u/antijamming-release-review.Ovjjgz/`. No receiver/transmitter process
+was started. Historical failures above remain unchanged. This verifies the
+named software contracts, not hardware occurrence, jammer classification,
+PVT recovery, every numerical input or all thread schedules. Other defects
+in the user's third-party calibration/power audit remain separate.
+
+### Separate main desired-source motion probe
+
+A read-only probe of exact main `d8aef5f` (backend SHA-256
+`dd87dd4ff52f5aeb74ca320fe96ca0d8fd7ec587eae0844408416c0bd09d593c`)
+uses its real activation function with a synthetic single desired source and
+white-noise covariance `0.01 I`. No jammer source is present.
+
+| Change from frozen 40-degree reference | Input rise | Generalized gain | Activates |
+| --- | ---: | ---: | --- |
+| Same direction and power | 0 dB | Approximately 0 dB | No |
+| Move source to 150 degrees; same power | Approximately 0 dB | 25.607 dB | No |
+| Move to 150 degrees; source power rises 4 dB | 3.974 dB | 29.600 dB | Yes |
+
+The 3 dB input/6 dB covariance gates do not identify physical source identity.
+Desired-source movement plus increased power can satisfy them without a
+jammer. This demonstrates a classifier limitation, not the proven cause of
+the user's specific hardware event. Angle-only control does not activate.
+Main also distinguishes auto-arming from active protection; an armed GUI
+indicator alone is not proof of nulling. The release-timer fix does not change
+this classifier limitation. Probe source/results are `main_motion_probe.py`
+and `main-motion-probe.log` in the same evidence directory. Hardware attribution
+still needs the failing run's commit, effective configuration, gate values
+and protection state. Main was inspected in an isolated copy, not modified.
+
 ## Pre-correction product state machine
 
 At the inspected commit, the product profile supplied activation thresholds of

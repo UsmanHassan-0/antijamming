@@ -4731,10 +4731,13 @@ class BackendRuntime:
                 raw_power_metrics=raw_power_metrics,
                 cal_power_metrics=cal_power_metrics,
             )
-        except (TypeError, ValueError, np.linalg.LinAlgError):
-            # Missing or malformed evidence must never release active
-            # protection. Full processing validation below reports the fault.
-            activation_payload = self._realtime_preserve_tracker_payload()
+        except (TypeError, ValueError, OverflowError, np.linalg.LinAlgError):
+            # Failed evidence interrupts the continuous low-evidence hold.
+            # Keep protection and its weights; the next valid low update must
+            # start a new hold rather than reuse time from before this fault.
+            with self._results_lock:
+                self._lcmv_jammer_release_candidate_since_monotonic_s = None
+                activation_payload = self._realtime_preserve_tracker_payload_locked()
 
         music_internal = self._finite_metric_float(music_internal_deg)
         music_bearing = self._finite_metric_float(music_bearing_deg)

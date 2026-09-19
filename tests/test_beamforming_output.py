@@ -904,6 +904,128 @@ def test_release_is_evaluated_without_music_target_and_fifo_returns_uniform(
     assert np.allclose(output, np.tile(expected, (cfg.gnss_1c_channel_count, 1)))
 
 
+@pytest.mark.parametrize("music_angle", [float("nan"), 150.0], ids=["no-target", "target"])
+@pytest.mark.parametrize(
+    "invalid_kind",
+    [
+        "covariance-string", "covariance-mapping", "covariance-ragged",
+        "covariance-overflow", "chunk-string", "chunk-mapping",
+        "chunk-nan", "covariance-shape", "eigensolver-failure",
+    ],
+)
+def test_failed_evidence_restarts_release_hold_and_preserves_fifo(
+    monkeypatch, music_angle, invalid_kind,
+) -> None:
+    """An invalid update cannot bridge two otherwise-low intervals."""
+
+    cfg = StreamConfig(
+        lcmv_jammer_release_hold_s=2.0,
+        lcmv_weight_transition_s=0.0,
+        gnss_shared_u1_phase_transition_s=0.0,
+        phase_correction_vector=None,
+    )
+    runtime = BackendRuntime(cfg, _build_loggers())
+    _install_product_fifo_bank(runtime)
+    _prepare_automatic_reference(runtime)
+    clock = [9.0]
+    monkeypatch.setattr("antijamming.runtime.backend.time.monotonic", lambda: clock[0])
+    x = np.tile(np.eye(4, dtype=np.complex64), (1, 8))
+    desired = runtime._realtime_preserve_frozen_vector.copy()
+    runtime._shared_u1_source_satellites_cache = tuple(
+        range(1, cfg.gnss_1c_channel_count + 1)
+    )
+    runtime._shared_u1_desired_vectors_cache = {
+        f"G{prn:02d}": {
+            "desired_spatial_vector": desired,
+            "updated_monotonic": 9.0,
+            "tracking_sample_counter": 1,
+        }
+        for prn in runtime._shared_u1_source_satellites_cache
+    }
+    runtime._last_shared_u1_phase_status_log_ts = 0.0
+    runtime._gnss_shared_u1_phase_output_matrix(x)
+    runtime._lcmv_jammer_activation_evidence(
+        covariance=10.0 * np.eye(4),
+        raw_power_metrics={"raw_avg_channel_power_linear": 10.0},
+        cal_power_metrics={"cal_avg_channel_power_linear": 10.0},
+    )
+    runtime._set_shared_measured_u1_protection_weights(
+        np.asarray([1.0, 0.5j, -0.5, -1.0j], dtype=np.complex128)
+    )
+    clock[0] = 10.0
+
+    def update(chunk=x, covariance=None):
+        runtime._update_lcmv_test_from_music(
+            chunk, music_angle, music_angle,
+            covariance_matrix=np.eye(4) if covariance is None else covariance,
+            raw_power_metrics={"raw_avg_channel_power_linear": 1.0},
+            cal_power_metrics={"cal_avg_channel_power_linear": 1.0},
+            target_selection_source="invalid_evidence_regression",
+        )
+
+    update()
+    assert runtime._lcmv_jammer_release_candidate_since_monotonic_s == 10.0
+    weights_before = runtime._get_shared_measured_u1_protection_weights_copy()
+    fifo_before = runtime._gnss_shared_u1_phase_output_matrix(x)
+    rows_before = runtime._latest_shared_u1_phase_logical_weights.copy()
+    assert not np.allclose(rows_before, rows_before[:, :1])
+    clock[0] = 11.0
+    invalid_covariances = {
+        "covariance-string": "malformed",
+        "covariance-mapping": {},
+        "covariance-ragged": [[1, 0], [1]],
+        "covariance-overflow": [[10**1000]],
+        "covariance-shape": np.eye(3),
+    }
+    if invalid_kind in invalid_covariances:
+        update(covariance=invalid_covariances[invalid_kind])
+    elif invalid_kind == "chunk-string":
+        update(chunk="malformed")
+    elif invalid_kind == "chunk-mapping":
+        update(chunk={})
+    elif invalid_kind == "chunk-nan":
+        # No cached covariance: exercise the actual IQ-to-covariance producer.
+        runtime._update_lcmv_test_from_music(
+            np.full((4, 32), np.nan), music_angle, music_angle,
+            target_selection_source="invalid_evidence_regression",
+        )
+    else:
+        with monkeypatch.context() as failed_solver:
+            def fail_eigh(*args, **kwargs):
+                raise np.linalg.LinAlgError("injected covariance failure")
+            failed_solver.setattr(np.linalg, "eigh", fail_eigh)
+            update()
+
+    assert runtime._lcmv_jammer_release_candidate_since_monotonic_s is None
+    assert runtime._lcmv_jammer_protection_active is True
+    assert runtime._lcmv_jammer_detected_latched is True
+    assert runtime._shared_measured_u1_protection_is_available() is True
+    np.testing.assert_array_equal(
+        runtime._get_shared_measured_u1_protection_weights_copy(), weights_before,
+    )
+    np.testing.assert_allclose(runtime._gnss_shared_u1_phase_output_matrix(x), fifo_before)
+
+    for now in (12.1, 14.0):
+        clock[0] = now
+        update()
+        assert runtime._lcmv_jammer_protection_active is True
+        assert runtime._lcmv_jammer_release_candidate_since_monotonic_s == 12.1
+        assert runtime._shared_measured_u1_protection_is_available() is True
+
+    clock[0] = 14.11
+    update()
+    assert runtime._lcmv_jammer_protection_active is False
+    assert runtime._lcmv_jammer_detected_latched is True
+    assert runtime._lcmv_jammer_release_candidate_since_monotonic_s is None
+    assert runtime._shared_measured_u1_protection_is_available() is False
+    output = runtime._gnss_shared_u1_phase_output_matrix(x)
+    released_rows = runtime._latest_shared_u1_phase_logical_weights
+    # Release is uniform spatially, with the existing per-PRN continuity scalar.
+    np.testing.assert_allclose(released_rows, np.repeat(released_rows[:, :1], 4, axis=1))
+    np.testing.assert_allclose(released_rows.conj() @ desired, rows_before.conj() @ desired)
+    np.testing.assert_allclose(output, released_rows.conj() @ x, atol=1e-6)
+
+
 def test_run_reset_waits_for_inflight_lcmv_update_and_clears_protection(
     monkeypatch,
 ) -> None:
